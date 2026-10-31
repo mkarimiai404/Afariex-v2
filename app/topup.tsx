@@ -11,6 +11,7 @@ import { moneyInputWords, normalizeMoneyInput } from '@/lib/money-input';
 import { useMoneyInput } from '@/hooks/use-money-input';
 import { appColors } from '@/lib/theme';
 import { topupOperatorLabel, TopupReceiptModel } from '@/lib/topup-receipt';
+import { clearPendingTopup, loadPendingTopup, savePendingTopup } from '@/lib/topup-pending';
 
 type Operator = { title: string; min_amount: number; max_amount: number };
 type OperatorsResponse = { data?: { operators?: Record<string, Operator> } };
@@ -79,9 +80,11 @@ export default function TopupScreen() {
   const setAmount = amountInput.setFormattedValue;
   const [step, setStep] = useState<'form' | 'confirm' | 'result'>('form');
   const [loading, setLoading] = useState(true);
+  const [pendingRestoreLoading, setPendingRestoreLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<TopupReceiptModel | null>(null);
   const clientRequestId = useRef<string | null>(null);
+  const resultOwnerId = useRef<string | null>(null);
   const operatorManuallySelected = useRef(false);
   const statusRequestInFlight = useRef(false);
   const pollingWindow = useRef<{ key: string; startedAt: number } | null>(null);
@@ -89,6 +92,32 @@ export default function TopupScreen() {
   useEffect(() => {
     if (isInitialized && !isAuthenticated) router.replace('/login' as any);
   }, [isAuthenticated, isInitialized, router]);
+
+  useEffect(() => {
+    if (!userId || !userToken) return;
+    let active = true;
+    setPendingRestoreLoading(true);
+    resultOwnerId.current = null;
+    setResult(null);
+    setStep('form');
+    clientRequestId.current = null;
+    loadPendingTopup(userId).then((pending) => {
+      if (!active || !pending) return;
+      resultOwnerId.current = userId;
+      clientRequestId.current = pending.clientRequestId || null;
+      setResult(pending);
+      setStep('result');
+    }).catch(() => undefined).finally(() => { if (active) setPendingRestoreLoading(false); });
+    return () => { active = false; };
+  }, [userId, userToken]);
+
+  useEffect(() => {
+    if (!userId || !result || resultOwnerId.current !== userId) return;
+    const storageOperation = result.status === 'pending'
+      ? savePendingTopup(userId, result)
+      : clearPendingTopup(userId);
+    storageOperation.catch(() => undefined);
+  }, [result, userId]);
 
   useEffect(() => {
     if (!userToken) return;
@@ -179,11 +208,22 @@ export default function TopupScreen() {
   };
 
   const submit = async () => {
-    if (!userToken || submitting) return;
+    if (!userToken || !userId || submitting) return;
     setSubmitting(true);
+    resultOwnerId.current = userId;
+    clientRequestId.current ??= createClientRequestId();
+    const requestId = clientRequestId.current;
+    const pendingReceipt: TopupReceiptModel = {
+      transactionId: '', clientRequestId: requestId, mobile: cleanMobile, operator,
+      operatorLabel: topupOperatorLabel(operator), amount: numericAmount,
+      commissionAmount: feePreview?.fee_amount ?? 0,
+      totalAmount: feePreview?.total_amount ?? numericAmount,
+      chargeType, status: 'pending', createdAt: new Date().toISOString(),
+      message: 'پاسخ درخواست هنوز دریافت نشده است؛ وضعیت آن با همین شناسه پیگیری می‌شود.',
+    };
     try {
-      clientRequestId.current ??= createClientRequestId();
-      const requestId = clientRequestId.current;
+      // Store the id before sending; after a disconnect, status lookup is safer than resubmitting.
+      await savePendingTopup(userId, pendingReceipt).catch(() => undefined);
       if (__DEV__) console.log('[AFARIEX-DEBUG] topup submit started', { client_request_id: requestId, operator, charge_type: chargeType, amount: numericAmount });
       const response = await fetchJson<any>('topup-create.php', {
         method: 'POST',
@@ -191,7 +231,7 @@ export default function TopupScreen() {
         body: JSON.stringify({ api_token: userToken, phone: cleanMobile, operator, amount: numericAmount, charge_type: chargeType, client_request_id: requestId }),
       });
       if (__DEV__) console.log('[AFARIEX-DEBUG] topup submit response', { client_request_id: requestId, status: response?.status, code: response?.code });
-      const receipt = toReceipt(response, cleanMobile, operator, numericAmount, requestId, chargeType);
+      const receipt = toReceipt(response, cleanMobile, operator, numericAmount, requestId, chargeType, '', pendingReceipt.createdAt);
       setResult(receipt);
       const updatedBalance = Number(response?.data?.remaining_balance ?? response?.data?.balance);
       if (Number.isFinite(updatedBalance)) setWalletBalance(updatedBalance);
@@ -207,7 +247,7 @@ export default function TopupScreen() {
               headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}` },
               body: JSON.stringify({ api_token: userToken, transaction_id: existingTransactionId }),
             });
-            setResult(toReceipt(existing, cleanMobile, operator, numericAmount, clientRequestId.current, chargeType));
+            setResult(toReceipt(existing, cleanMobile, operator, numericAmount, clientRequestId.current, chargeType, '', pendingReceipt.createdAt));
             setStep('result');
           } catch {
             Alert.alert('درخواست تکراری', 'شناسهٔ این درخواست قبلاً استفاده شده است؛ وضعیت تراکنش موجود را دوباره بررسی کنید.');
@@ -218,13 +258,17 @@ export default function TopupScreen() {
         return;
       }
       if (payload?.status) {
-        setResult(toReceipt(payload, cleanMobile, operator, numericAmount, clientRequestId.current, chargeType));
+        setResult(toReceipt(payload, cleanMobile, operator, numericAmount, clientRequestId.current, chargeType, '', pendingReceipt.createdAt));
         setStep('result');
       } else if (!isApiResponseError(error) || error.status >= 500) {
         if (__DEV__) console.log('[AFARIEX-DEBUG] topup submission outcome uncertain', { client_request_id: clientRequestId.current, error: error instanceof Error ? error.name : 'unknown' });
-        setResult({ transactionId: '', clientRequestId: clientRequestId.current ?? undefined, mobile: cleanMobile, operator, operatorLabel: topupOperatorLabel(operator), amount: numericAmount, commissionAmount: feePreview?.fee_amount ?? 0, totalAmount: feePreview?.total_amount ?? numericAmount, chargeType, status: 'pending', message: 'پاسخ سرور هنوز دریافت نشده است. برای اطمینان، وضعیت را بررسی کنید یا درخواست را با همین شناسه بازیابی کنید.' });
+        const timedOut = error instanceof Error && error.name === 'ApiTimeoutError';
+        setResult({ ...pendingReceipt, message: timedOut
+          ? 'پاسخ نهایی در زمان تعیین‌شده دریافت نشد. ممکن است درخواست همچنان در حال پردازش باشد. برای جلوگیری از خرید تکراری، دوباره پرداخت نکنید و وضعیت تراکنش را بررسی کنید.'
+          : 'پاسخ سرور دریافت نشد و نتیجه درخواست نامشخص است. برای جلوگیری از خرید تکراری، وضعیت تراکنش را با همین شناسه بررسی کنید.' });
         setStep('result');
       } else {
+        clearPendingTopup(userId).catch(() => undefined);
         Alert.alert('خطا', payload?.message || 'خرید شارژ انجام نشد.');
       }
     } finally { setSubmitting(false); }
@@ -242,13 +286,13 @@ export default function TopupScreen() {
         body: JSON.stringify({ api_token: userToken, transaction_id: result.transactionId || undefined, client_request_id: result.clientRequestId || clientRequestId.current || undefined }),
       });
       if (__DEV__) console.log('[AFARIEX-DEBUG] topup status response', { status: response?.status, code: response?.code });
-      const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId);
+      const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
       setResult(updated);
       const updatedBalance = Number(response?.data?.remaining_balance ?? response?.data?.balance);
       if (Number.isFinite(updatedBalance)) setWalletBalance(updatedBalance);
     } catch (error) {
       const payload = isApiResponseError(error) && error.responseData && !Array.isArray(error.responseData) ? error.responseData as Record<string, any> : null;
-      if (payload?.status) setResult(toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId));
+      if (payload?.status) setResult(toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt));
       else if (__DEV__) console.log('[AFARIEX-DEBUG] topup status check unavailable', { error: error instanceof Error ? error.name : 'unknown' });
       if (!payload?.status) Alert.alert('وضعیت نامشخص', 'فعلاً امکان دریافت نتیجه نیست. درخواست همچنان در انتظار بررسی است؛ دوباره تلاش کنید.');
     } finally { statusRequestInFlight.current = false; setSubmitting(false); }
@@ -266,12 +310,12 @@ export default function TopupScreen() {
     const startedAt = pollingWindow.current.startedAt;
     const delays = [3000, 5000, 10000];
     const maxWindowMs = 120000;
-    const maxStatusCallMs = 35000;
+    const maxStatusCallMs = 45000;
 
     const scheduleNext = () => {
       const elapsed = Date.now() - startedAt;
       if (stopped) return;
-      if (elapsed + maxStatusCallMs >= maxWindowMs) {
+        if (elapsed + maxStatusCallMs >= maxWindowMs) {
         setResult((current) => current?.status === 'pending'
           ? { ...current, message: '\u062e\u0631\u06cc\u062f \u0647\u0646\u0648\u0632 \u062f\u0631 \u0627\u0646\u062a\u0638\u0627\u0631 \u067e\u0627\u0633\u062e \u0633\u0631\u0648\u06cc\u0633 \u0627\u0633\u062a. \u0628\u0639\u062f\u0627\u064b \u0648\u0636\u0639\u06cc\u062a \u0631\u0627 \u0628\u0627 \u0647\u0645\u06cc\u0646 \u0634\u0646\u0627\u0633\u0647 \u0628\u0631\u0631\u0633\u06cc \u06a9\u0646\u06cc\u062f.' }
           : current);
@@ -300,7 +344,7 @@ export default function TopupScreen() {
             }),
           });
           if (['success', 'failed', 'pending'].includes(response?.status)) {
-            const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId);
+            const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
             setResult(updated);
             updatedStatus = updated.status;
             const updatedBalance = Number(response?.data?.remaining_balance ?? response?.data?.balance);
@@ -311,7 +355,7 @@ export default function TopupScreen() {
             ? error.responseData as Record<string, any>
             : null;
           if (['success', 'failed', 'pending'].includes(payload?.status)) {
-            const updated = toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId);
+            const updated = toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
             setResult(updated);
             updatedStatus = updated.status;
           }
@@ -328,10 +372,10 @@ export default function TopupScreen() {
       stopped = true;
       if (timer) clearTimeout(timer);
     };
-  }, [step, result?.status, result?.transactionId, result?.clientRequestId, userToken]);
+  }, [step, result?.status, result?.transactionId, result?.clientRequestId, result?.mobile, result?.operator, result?.amount, result?.chargeType, result?.createdAt, userToken]);
 
 
-  if (!isInitialized || loading) return <SafeAreaView style={styles.safe}><ActivityIndicator color={appColors.primary} /></SafeAreaView>;
+  if (!isInitialized || loading || pendingRestoreLoading) return <SafeAreaView style={styles.safe}><ActivityIndicator color={appColors.primary} /></SafeAreaView>;
   return <SafeAreaView style={styles.safe}>
     <Stack.Screen options={{ headerShown: false }} />
     <View style={styles.container}>
@@ -355,7 +399,7 @@ export default function TopupScreen() {
           {!!cleanAmount && <Text style={styles.words}>{moneyInputWords(cleanAmount)}</Text>}
           <TouchableOpacity style={styles.primaryButton} onPress={openConfirmation}><Text style={styles.primaryText}>ادامه و تأیید</Text></TouchableOpacity>
         </>}
-        {step === 'result' && result && <><TopupReceiptView receipt={result} />{result.status === 'pending' && <><TouchableOpacity style={styles.primaryButton} onPress={checkStatus} disabled={submitting}>{submitting ? <ActivityIndicator color={appColors.background} /> : <Text style={styles.primaryText}>بررسی وضعیت تراکنش</Text>}</TouchableOpacity><TouchableOpacity style={styles.secondaryButton} onPress={checkStatus} disabled={submitting}><Text style={styles.secondaryText}>بازیابی درخواست با همان شناسه</Text></TouchableOpacity></>}<TouchableOpacity style={styles.secondaryButton} onPress={() => { clientRequestId.current = null; operatorManuallySelected.current = false; setResult(null); setMobile(''); setAmount(''); setChargeType('normal'); setStep('form'); }}><Text style={styles.secondaryText}>خرید شارژ جدید</Text></TouchableOpacity></>}
+      {step === 'result' && result && <><TopupReceiptView receipt={result} />{result.status === 'pending' && <><TouchableOpacity style={styles.primaryButton} onPress={checkStatus} disabled={submitting}>{submitting ? <ActivityIndicator color={appColors.background} /> : <Text style={styles.primaryText}>بررسی وضعیت تراکنش</Text>}</TouchableOpacity><TouchableOpacity style={styles.secondaryButton} onPress={checkStatus} disabled={submitting}><Text style={styles.secondaryText}>بازیابی درخواست با همان شناسه</Text></TouchableOpacity></>}{result.status !== 'pending' && <TouchableOpacity style={styles.secondaryButton} onPress={() => { clientRequestId.current = null; operatorManuallySelected.current = false; setResult(null); setMobile(''); setAmount(''); setChargeType('normal'); setStep('form'); }}><Text style={styles.secondaryText}>خرید شارژ جدید</Text></TouchableOpacity>}</>}
       </ScrollView>
       <Modal visible={step === 'confirm'} transparent animationType="fade" onRequestClose={() => setStep('form')}>
         <View style={styles.modalBackdrop}>
@@ -387,13 +431,13 @@ export default function TopupScreen() {
   </SafeAreaView>;
 }
 
-function toReceipt(payload: any, mobile: string, operator: string, amount: number, fallbackClientRequestId?: string | null, fallbackChargeType: ChargeType = 'normal', fallbackTransactionId = ''): TopupReceiptModel {
-  const status = (payload?.status === 'success' || payload?.status === 'failed' || payload?.status === 'pending' ? payload.status : 'failed') as TopupStatus;
+function toReceipt(payload: any, mobile: string, operator: string, amount: number, fallbackClientRequestId?: string | null, fallbackChargeType: ChargeType = 'normal', fallbackTransactionId = '', fallbackCreatedAt?: string): TopupReceiptModel {
+  const status = (payload?.status === 'success' || payload?.status === 'failed' || payload?.status === 'pending' ? payload.status : 'pending') as TopupStatus;
   const data = payload?.data || {};
   const reference = data.ref_code ?? data.trans_id ?? data.ref_id;
   const commissionAmount = Number(data.commission_amount || 0);
   const receiptAmount = Number(data.amount || amount);
-  return { transactionId: String(data.transaction_id || fallbackTransactionId), clientRequestId: String(data.client_request_id || fallbackClientRequestId || '') || undefined, mobile: String(data.mobile || data.phone || mobile), operator: String(data.operator || operator), operatorLabel: topupOperatorLabel(String(data.operator || operator)), amount: receiptAmount, commissionAmount, totalAmount: Number(data.total_amount ?? receiptAmount + commissionAmount), chargeType: (data.charge_type === 'amazing' ? 'amazing' : data.charge_type === 'normal' ? 'normal' : fallbackChargeType), status, refCode: reference ? String(reference) : undefined, trackingCode: data.tracking_code ? String(data.tracking_code) : undefined, orderId: data.order_id ? String(data.order_id) : undefined, message: String(payload?.message || ''), createdAt: data.created_at ? String(data.created_at) : undefined };
+  return { transactionId: String(data.transaction_id || fallbackTransactionId), clientRequestId: String(data.client_request_id || fallbackClientRequestId || '') || undefined, mobile: String(data.mobile || data.phone || mobile), operator: String(data.operator || operator), operatorLabel: topupOperatorLabel(String(data.operator || operator)), amount: receiptAmount, commissionAmount, totalAmount: Number(data.total_amount ?? receiptAmount + commissionAmount), chargeType: (data.charge_type === 'amazing' ? 'amazing' : data.charge_type === 'normal' ? 'normal' : fallbackChargeType), status, refCode: reference ? String(reference) : undefined, trackingCode: data.tracking_code ? String(data.tracking_code) : undefined, orderId: data.order_id ? String(data.order_id) : undefined, message: String(payload?.message || ''), createdAt: data.created_at ? String(data.created_at) : fallbackCreatedAt };
 }
 
 function SummaryRow({ label, value, last = false }: { label: string; value: string; last?: boolean }) { return <View style={[styles.summaryRow, last && styles.lastRow]}><Text style={styles.summaryLabel}>{label}</Text><Text style={styles.summaryValue}>{value}</Text></View>; }

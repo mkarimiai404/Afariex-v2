@@ -80,15 +80,11 @@ if ($storedStatus === 'pending') {
             trim((string)($transaction['trans_id'] ?? '')) ?: null
         );
         $providerCode = topup_provider_code($provider);
-        $finalStatus = strtolower(trim((string)($provider['final_status'] ?? '')));
-        $paymentStatus = strtolower(trim((string)($provider['payment_status'] ?? '')));
+        $providerStatus = topup_provider_status_class($provider);
         $providerRefCode = trim((string)($provider['ref_code'] ?? ''));
         if ($providerRefCode !== '') $refCode = $providerRefCode;
         $transId = trim((string)($provider['trans_id'] ?? ''));
-        $isSuccess = $finalStatus === 'succeeded' || $paymentStatus === 'paid';
-        $isFailure = in_array($finalStatus, ['failed', 'refund_provider'], true) || $paymentStatus === 'refund';
-
-        if ($isSuccess) {
+        if ($providerStatus === 'success') {
             $storedStatus = topup_update_records(
                 $pdo,
                 $transactionId,
@@ -103,7 +99,7 @@ if ($storedStatus === 'pending') {
                     'error_msg' => null,
                 ]
             );
-        } elseif ($isFailure) {
+        } elseif ($providerStatus === 'failed') {
             try {
                 topup_refund_transaction(
                     $pdo,

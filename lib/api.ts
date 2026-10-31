@@ -10,7 +10,9 @@ type JsonValue = Record<string, any> | any[];
 const LOCAL_BASE_URL = 'https://afariex.ir/API/';
 const PROD_BASE_URL = 'https://afariex.ir/API/';
 const TIMEOUT_MS = 12000;
-const ENDPOINT_TIMEOUTS: Record<string, number> = { 'topup.php': 35000, 'topup-create.php': 35000, 'topup-status.php': 35000 };
+// Creation outlasts Inax's 30-second provider timeout plus backend finalization; status checks get a smaller margin.
+const ENDPOINT_TIMEOUTS: Record<string, number> = { 'topup.php': 60000, 'topup-create.php': 60000, 'topup-status.php': 45000 };
+// Financial create calls stay single-attempt; status checks reconcile uncertain outcomes without duplicate purchases.
 const MAX_ATTEMPTS = 1;
 let authExpiryHandler: (() => void | Promise<void>) | null = null;
 

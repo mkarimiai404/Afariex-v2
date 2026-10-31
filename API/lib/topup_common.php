@@ -400,11 +400,43 @@ function topup_provider_code(array $response): int
         : -91;
 }
 
+function topup_normalize_provider_code(int $code): int
+{
+    // Only the documented 11, 12, and 77 variants are equivalent across signs.
+    return match ($code) {
+        11 => -11,
+        12 => -12,
+        77 => -77,
+        default => $code,
+    };
+}
+
+function topup_provider_result_class(int $code): string
+{
+    $normalizedCode = topup_normalize_provider_code($code);
+    if ($normalizedCode === 1) return 'success';
+    if (in_array($normalizedCode, [-200, -91, -77], true)) return 'pending';
+    if (in_array($normalizedCode, [-11, -12, -18, -22, -33, -44, -55, -66, -67], true)) return 'failed';
+    return 'pending';
+}
+
+function topup_provider_status_class(array $response): string
+{
+    $finalStatus = strtolower(trim((string)($response['final_status'] ?? '')));
+    $paymentStatus = strtolower(trim((string)($response['payment_status'] ?? '')));
+    $confirmedSuccess = $finalStatus === 'succeeded' || $paymentStatus === 'paid';
+    $confirmedFailure = in_array($finalStatus, ['failed', 'refund_provider'], true) || $paymentStatus === 'refund';
+    if ($confirmedSuccess && $confirmedFailure) return 'pending';
+    if ($confirmedSuccess) return 'success';
+    if ($confirmedFailure) return 'failed';
+    return 'pending';
+}
+
 function topup_provider_message(
     int $code,
     string $providerMessage = ''
 ): string {
-    return match ($code) {
+    return match (topup_normalize_provider_code($code)) {
         -11 => 'پارامترهای سرویس کامل نیست.',
         -12 => 'شماره موبایل یا اپراتور صحیح نیست.',
         -18 => 'این شماره همراه اول دائمی نیست.',

@@ -298,6 +298,8 @@ try {
     // Inax expects amount in Toman (IRT), same as wallet
     $amountProvider = $amountInt;
 
+    // Keep processing after a client disconnect; the provider outcome may still need local finalization.
+    ignore_user_abort(true);
     $providerResponse = (new InaxService())->buyTopup(
         $mobile,
         $amountProvider,
@@ -359,7 +361,8 @@ try {
         ]);
     }
 
-    if (in_array($providerCode, [-200, -91, -77], true)) {
+    // Ambiguous provider replies must remain recoverable; only known explicit failures are refunded below.
+    if (topup_provider_result_class($providerCode) === 'pending') {
         $finalStatus = topup_update_records(
             $pdo,
             $transactionId,
