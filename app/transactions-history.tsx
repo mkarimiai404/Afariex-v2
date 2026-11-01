@@ -328,11 +328,16 @@ export default function TransactionsHistoryScreen() {
     return tx.type === filter;
   });
 
-  const openWithdrawalReceipt = (tx: TransactionItem) => {
-    const withdrawalId = tx.raw_id || tx.id;
-    if (!withdrawalId) return;
-    if (__DEV__) console.log('[RECEIPT_HISTORY] opening withdrawal id =', withdrawalId);
-    router.push({ pathname: '/withdrawal-receipt', params: { id: withdrawalId } } as any);
+  const openReceipt = (tx: TransactionItem) => {
+    if (tx.type === 'remittance') {
+      const remittanceId = tx.id.startsWith('remittance-') ? tx.id : `remittance-${tx.raw_id || tx.id}`;
+      router.push({ pathname: '/remittance-receipt', params: { order: remittanceId } } as any);
+      return;
+    }
+    const id = tx.raw_id || tx.id;
+    if (!/^\d+$/.test(id)) return;
+    if (tx.type === 'withdraw') router.push({ pathname: '/withdrawal-receipt', params: { id } } as any);
+    else router.push({ pathname: '/transaction-receipt', params: { id } } as any);
   };
 
   const tabs: { key: FilterType; label: string }[] = [
@@ -470,12 +475,10 @@ export default function TransactionsHistoryScreen() {
                       </View>
                     </View>
 
-                    {tx.type === 'withdraw' && (
-                      <TouchableOpacity style={styles.receiptButton} onPress={() => openWithdrawalReceipt(tx)} activeOpacity={0.85}>
+                    <TouchableOpacity style={styles.receiptButton} onPress={() => openReceipt(tx)} activeOpacity={0.85} accessibilityRole="button">
                         <Ionicons name="receipt-outline" size={18} color="#0b8f72" />
                         <Text style={styles.receiptButtonText}>مشاهده رسید</Text>
-                      </TouchableOpacity>
-                    )}
+                    </TouchableOpacity>
                   </View>
                 );
               })
@@ -623,7 +626,8 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-end',
     marginTop: 12,
     minHeight: 38,
-    paddingHorizontal: 14,
+    minWidth: 142,
+    paddingHorizontal: 16,
     borderRadius: 10,
     borderWidth: 1,
     borderColor: '#99f6e4',
@@ -635,7 +639,8 @@ const styles = StyleSheet.create({
   },
   receiptButtonText: {
     fontFamily: 'VazirmatnBold',
-    fontSize: 12,
+    fontSize: 11,
+    flexShrink: 0,
     color: appColors.primary,
     textAlign: 'center',
   },
