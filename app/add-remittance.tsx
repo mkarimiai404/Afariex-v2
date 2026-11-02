@@ -1,11 +1,11 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
+import { Picker } from '@react-native-picker/picker';
 import * as Print from 'expo-print';
 import { Stack, useRouter } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Alert,
   ActivityIndicator,
   KeyboardAvoidingView,
   Linking,
@@ -19,7 +19,6 @@ import {
   ScrollView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-
 import { useAuth } from '@/lib/auth-context';
 import { apiUrl } from '@/lib/api';
 import { showError, showSuccess } from '@/lib/toast';
@@ -32,30 +31,14 @@ import { buildVariableRateWhatsAppUrl } from '@/lib/remittance-currency-flow';
 import { moneyInputWords, normalizeMoneyInput } from '@/lib/money-input';
 import { useMoneyInput } from '@/hooks/use-money-input';
 
-type Agency = {
-  id: string | number;
-  name: string;
-  address?: string;
-  phone?: string;
-};
-
-type AgenciesResponse = {
-  success: boolean;
-  data?: Agency[];
-  rows?: Agency[];
-  code?: string;
-  message?: string;
-};
+type Agency = { id: string | number; name: string; address?: string; };
 
 type DestinationCountryGroup = {
   group: 'requested' | 'europe' | 'arab';
   countries: Array<{ code: string; name: string; destination_currencies: CurrencyOption[] }>;
 };
 
-type CurrencyOption = {
-  code: string;
-  name: string;
-};
+type CurrencyOption = { code: string; name: string; };
 
 type RemittanceMetadata = {
   groups: DestinationCountryGroup[];
@@ -68,6 +51,8 @@ type ExchangeRate = {
   id: string | number;
   toman_per_afn: string | number;
   effective_date?: string;
+  is_active?: number | boolean | string;
+  active?: number | boolean | string;
 };
 
 type FeePreview = {
@@ -80,7 +65,7 @@ type FeePreview = {
 
 const toPersianNum = (num: string | number) => {
   if (!num && num !== 0) return '۰';
-  const farsiDigits = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹'];
+  const farsiDigits = ['۰','۱','۲','۳','۴','۵','۶','۷','۸','۹'];
   return num.toString().replace(/\d/g, (x) => farsiDigits[parseInt(x)]);
 };
 
@@ -92,72 +77,47 @@ const formatReceiptDate = (value: string) => {
   }).format(date);
 };
 
-type SelectorKey = 'source' | 'country' | 'destinationCurrency' | 'agency';
-type SelectorOption = { value: string; label: string };
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  value !== null && typeof value === 'object' && !Array.isArray(value);
+const parseRate = (value: string | number): number =>
+  Number(String(value ?? '').replace(/[,\s\u066C]/g, ''));
 
 const calculateAfghaniAmount = (amountToman: string | number, tomanPerAfghani: string | number) => {
   const normalizedToman = normalizeMoneyInput(amountToman);
-  const rate = Number(tomanPerAfghani);
+  const rate = parseRate(tomanPerAfghani);
   if (!normalizedToman || !Number.isFinite(rate) || rate <= 0) return '';
   const calculated = Number(normalizedToman) / rate;
   return Number.isFinite(calculated) ? calculated.toFixed(2) : '';
 };
 
-const normalizeCurrencyOptions = (value: unknown): CurrencyOption[] => {
-  if (!Array.isArray(value)) return [];
-  return value.filter((item): item is CurrencyOption =>
-    isRecord(item)
-    && typeof item.code === 'string' && item.code.trim() !== ''
-    && typeof item.name === 'string'
-  ).map((item) => ({ code: item.code.trim(), name: item.name.trim() }));
+const isRateActive = (rate: any) => {
+  const flag = rate?.is_active ?? rate?.active;
+  return flag === undefined || flag === null || flag === 1 || flag === true || String(flag) === '1' || String(flag).toLowerCase() === 'active';
 };
 
-const normalizeDestinationGroups = (value: unknown): DestinationCountryGroup[] => {
-  if (!Array.isArray(value)) return [];
-  return value.filter(isRecord).map((group) => {
-    const rawGroup = group.group;
-    const groupName: DestinationCountryGroup['group'] = rawGroup === 'europe'
-      ? 'europe'
-      : rawGroup === 'arab'
-        ? 'arab'
-        : 'requested';
-    const rawCountries = Array.isArray(group.countries) ? group.countries : [];
-    const countries = rawCountries.filter((country: unknown): country is Record<string, unknown> =>
-      isRecord(country)
-      && typeof country.code === 'string' && country.code.trim() !== ''
-      && typeof country.name === 'string'
-    ).map((country) => ({
-      code: (country.code as string).trim(),
-      name: (country.name as string).trim(),
-      destination_currencies: normalizeCurrencyOptions(country.destination_currencies),
-    }));
-    return { group: groupName, countries };
-  }).filter((group) => group.countries.length > 0);
-};
+const pickLatestActiveRate = (rates: ExchangeRate[]) =>
+  (rates || []).filter(isRateActive).sort((a, b) => Number(b.id) - Number(a.id))[0] ?? rates[0] ?? null;
 
 export default function AddRemittanceScreen() {
   const router = useRouter();
   const { userId, userToken, userName, userMobile, isInitialized, setUserBalance } = useAuth();
-
+  
   const [agencies, setAgencies] = useState<Agency[]>([]);
   const [destinationCountryGroups, setDestinationCountryGroups] = useState<DestinationCountryGroup[]>([]);
   const [sourceCurrencies, setSourceCurrencies] = useState<CurrencyOption[]>([{ code: 'IRT', name: 'تومان' }]);
   const [destinationCurrencies, setDestinationCurrencies] = useState<CurrencyOption[]>([]);
   const [fixedRatePairs, setFixedRatePairs] = useState<RemittanceMetadata['fixed_rate_pairs']>([]);
+  
   const [selectedSourceCurrency, setSelectedSourceCurrency] = useState('IRT');
   const [selectedDestinationCountry, setSelectedDestinationCountry] = useState('');
   const [selectedDestinationCurrency, setSelectedDestinationCurrency] = useState('AFN');
   const [exchangeRates, setExchangeRates] = useState<ExchangeRate[]>([]);
   const [selectedAgencyId, setSelectedAgencyId] = useState<string | null>(null);
   const [selectedRateId, setSelectedRateId] = useState<number | null>(null);
-  const [activeSelector, setActiveSelector] = useState<SelectorKey | null>(null);
 
   const amountTomanInput = useMoneyInput();
   const amountToman = amountTomanInput.value;
   const setAmountToman = amountTomanInput.setFormattedValue;
   const [amountAfghani, setAmountAfghani] = useState('');
+  
   const [senderName, setSenderName] = useState('');
   const [receiverName, setReceiverName] = useState('');
   const [receiverPhone, setReceiverPhone] = useState('');
@@ -165,8 +125,9 @@ export default function AddRemittanceScreen() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
   const resolvedUserId = userId?.trim() || '';
-  const resolvedApiToken = userToken?.trim() || '';
+  const resolvedUserToken = userToken?.trim() || '';
   const loadInFlight = useRef(false);
   const submitInFlight = useRef(false);
 
@@ -181,123 +142,32 @@ export default function AddRemittanceScreen() {
   const [feePreview, setFeePreview] = useState<FeePreview | null>(null);
 
   const selectedRate = useMemo(
-    () => exchangeRates.find((rate) => Number(rate.id) === selectedRateId) || null,
+    () => exchangeRates.find((rate) => Number(rate.id) === selectedRateId) || pickLatestActiveRate(exchangeRates),
     [exchangeRates, selectedRateId]
   );
 
   const selectedCountry = useMemo(
-    () => destinationCountryGroups.flatMap((group) => group.countries).find((country) => country.code === selectedDestinationCountry) || null,
+    () => destinationCountryGroups.flatMap((g) => g.countries).find((c) => c.code === selectedDestinationCountry) || null,
     [destinationCountryGroups, selectedDestinationCountry]
   );
 
-  const availableDestinationCurrencies = selectedCountry?.destination_currencies?.length
-    ? selectedCountry.destination_currencies
-    : destinationCurrencies;
+  const availableDestinationCurrencies = selectedCountry?.destination_currencies || destinationCurrencies;
 
   const isFixedRatePair = useMemo(
-    () => fixedRatePairs.some(
-      (pair) =>
+    () => fixedRatePairs.some((pair) =>
         pair.source_currency === selectedSourceCurrency
         && pair.destination_currency === selectedDestinationCurrency
-        && pair.country_code === selectedDestinationCountry
-    ),
+        && pair.country_code === selectedDestinationCountry),
     [fixedRatePairs, selectedDestinationCountry, selectedDestinationCurrency, selectedSourceCurrency]
   );
 
-  const selectedSourceCurrencyName = sourceCurrencies.find((currency) => currency.code === selectedSourceCurrency)?.name || selectedSourceCurrency;
-  const selectedDestinationCurrencyName = availableDestinationCurrencies.find((currency) => currency.code === selectedDestinationCurrency)?.name || selectedDestinationCurrency;
-
-  const countries = useMemo(
-    () => destinationCountryGroups.flatMap((group) => group.countries),
-    [destinationCountryGroups]
-  );
-  const selectorOptions = useMemo<SelectorOption[]>(() => {
-    switch (activeSelector) {
-      case 'source':
-        return sourceCurrencies.map((currency) => ({ value: currency.code, label: currency.name + ' (' + currency.code + ')' }));
-      case 'country':
-        return destinationCountryGroups.flatMap((group) => group.countries.map((country) => ({
-          value: country.code,
-          label: (group.group === 'europe' ? 'اروپا' : group.group === 'arab' ? 'کشورهای عربی' : 'مقصدهای درخواستی') + ' — ' + country.name,
-        })));
-      case 'destinationCurrency':
-        return availableDestinationCurrencies.map((currency) => ({ value: currency.code, label: currency.name + ' (' + currency.code + ')' }));
-      case 'agency':
-        return agencies.map((agency) => ({ value: String(agency.id), label: agency.name }));
-      default:
-        return [];
-    }
-  }, [activeSelector, agencies, availableDestinationCurrencies, destinationCountryGroups, sourceCurrencies]);
-
-  const selectorTitle = activeSelector === 'source'
-    ? 'انتخاب ارز مبدا'
-    : activeSelector === 'country'
-      ? 'انتخاب کشور مقصد'
-      : activeSelector === 'destinationCurrency'
-        ? 'انتخاب ارز مقصد'
-        : 'انتخاب نمایندگی مقصد';
-  const selectedSelectorValue = activeSelector === 'source'
-    ? selectedSourceCurrency
-    : activeSelector === 'country'
-      ? selectedDestinationCountry
-      : activeSelector === 'destinationCurrency'
-        ? selectedDestinationCurrency
-        : selectedAgencyId ?? '';
-
-  const handleSelectorChoice = (value: string) => {
-    switch (activeSelector) {
-      case 'source':
-        setSelectedSourceCurrency(value);
-        break;
-      case 'country': {
-        setSelectedDestinationCountry(value);
-        const country = countries.find((item) => item.code === value);
-        const allowedCurrencies = country?.destination_currencies.length
-          ? country.destination_currencies
-          : destinationCurrencies;
-        if (!allowedCurrencies.some((currency) => currency.code === selectedDestinationCurrency)) {
-          setSelectedDestinationCurrency(allowedCurrencies[0]?.code || 'USD');
-        }
-        break;
-      }
-      case 'destinationCurrency':
-        setSelectedDestinationCurrency(value);
-        break;
-      case 'agency':
-        setSelectedAgencyId(value);
-        break;
-      default:
-        break;
-    }
-    setActiveSelector(null);
-  };
-
-  const renderSelectorButton = (value: string, placeholder: string, selector: SelectorKey) => (
-    <TouchableOpacity
-      style={styles.selectorButton}
-      onPress={() => setActiveSelector(selector)}
-      accessibilityRole="button"
-      accessibilityLabel={value || placeholder}>
-      <Ionicons name="chevron-down" size={18} color={appColors.textSecondary} />
-      <Text style={[styles.selectorButtonText, !value && styles.selectorPlaceholder]} numberOfLines={1}>
-        {value || placeholder}
-      </Text>
-    </TouchableOpacity>
-  );
+  const selectedSourceCurrencyName = sourceCurrencies.find((c) => c.code === selectedSourceCurrency)?.name || selectedSourceCurrency;
+  const selectedDestinationCurrencyName = availableDestinationCurrencies.find((c) => c.code === selectedDestinationCurrency)?.name || selectedDestinationCurrency;
 
   const handleOpenVariableRateWhatsApp = async () => {
-    if (!selectedCountry || !selectedSourceCurrency || !selectedDestinationCurrency
-      || !sourceCurrencies.some((currency) => currency.code === selectedSourceCurrency)
-      || !availableDestinationCurrencies.some((currency) => currency.code === selectedDestinationCurrency)) {
-      Alert.alert('انتخاب مقصد', 'لطفاً کشور مقصد، ارز مبدا و ارز مقصد را انتخاب کنید.');
-      return;
-    }
+    if (!selectedCountry) { showError('خطا', 'لطفاً کشور مقصد را انتخاب کنید.'); return; }
     try {
-      await Linking.openURL(buildVariableRateWhatsAppUrl(
-        selectedCountry.name || selectedDestinationCountry,
-        selectedSourceCurrencyName || selectedSourceCurrency,
-        selectedDestinationCurrencyName || selectedDestinationCurrency,
-      ));
+      await Linking.openURL(buildVariableRateWhatsAppUrl(selectedCountry.name, selectedSourceCurrencyName, selectedDestinationCurrencyName));
     } catch {
       showError('خطا', 'امکان باز کردن واتساپ وجود ندارد.');
     }
@@ -310,155 +180,55 @@ export default function AddRemittanceScreen() {
     setReceiverPhone('');
   };
 
-
   useEffect(() => {
     const fallbackName = userName?.trim() || userMobile?.trim() || '';
     setSenderName(fallbackName);
   }, [userName, userMobile]);
-
-
-
-
-
-
-
-
-
 
   const fetchData = useCallback(async () => {
     if (!isInitialized || loadInFlight.current) return;
     loadInFlight.current = true;
     setLoading(true);
     setError(null);
-
-    // هلپر اختصاصی برای ارسال هدرهای ضد کش و ثبت دقیق وضعیت در APK
-    const safeFetch = async (endpoint: string) => {
-      const url = apiUrl(endpoint);
-      try {
-        const res = await fetch(url, {
-          method: 'GET',
-          headers: {
-            'Accept': 'application/json',
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache',
-          },
-        });
-        const rawText = await res.text();
-        if (__DEV__) console.log(`[AFARIEX-DEBUG] Endpoint: ${endpoint} | Status: ${res.status}`);
-        
-        let parsed = null;
-        try {
-          parsed = JSON.parse(rawText || '{}');
-        } catch (jsonErr) {
-          if (__DEV__) console.warn(`[AFARIEX-DEBUG] Invalid JSON from ${endpoint}:`, rawText.slice(0, 200));
-        }
-
-        return {
-          ok: res.ok,
-          status: res.status,
-          contentType: res.headers.get('content-type') || '',
-          data: parsed,
-          raw: rawText,
-        };
-      } catch (netErr: any) {
-        if (__DEV__) console.error(`[AFARIEX-DEBUG] Network error on ${endpoint}:`, netErr?.message || netErr);
-        return { ok: false, status: 0, contentType: '', data: null, raw: '' };
-      }
-    };
-
     try {
-      const [agenciesResult, ratesResult, countriesResult] = await Promise.all([
-        safeFetch('get_agencies.php'),
-        safeFetch('get_exchange_rates.php'),
-        safeFetch('get_remittance_destinations.php'),
+      const [agenciesResRaw, ratesResRaw, countriesResRaw] = await Promise.all([
+        fetch(apiUrl('get_agencies.php')),
+        fetch(apiUrl('get_exchange_rates.php')),
+        fetch(apiUrl('get_remittance_destinations.php')),
       ]);
 
-      const agenciesRes = agenciesResult.data as AgenciesResponse | null;
-      const ratesRes = ratesResult.data;
-      const countriesRes = countriesResult.data;
+      const agenciesRes = JSON.parse((await agenciesResRaw.text()) || '{}');
+      const ratesRes = JSON.parse((await ratesResRaw.text()) || '{}');
+      const countriesRes = JSON.parse((await countriesResRaw.text()) || '{}');
 
       const agenciesList = agenciesRes?.data ?? agenciesRes?.rows ?? [];
       const ratesList = ratesRes?.data ?? ratesRes?.rows ?? [];
 
-      if (__DEV__) {
-        console.log('[AFARIEX-DEBUG] Agencies response', {
-          endpoint: apiUrl('get_agencies.php'),
-          httpStatus: agenciesResult.status,
-          requestSucceeded: agenciesResult.ok,
-          contentType: agenciesResult.contentType,
-          success: agenciesRes?.success ?? null,
-          responseCode: agenciesRes?.code ?? null,
-          dataType: Array.isArray(agenciesList) ? 'array' : typeof agenciesList,
-          agencyCount: Array.isArray(agenciesList) ? agenciesList.length : null,
-          firstAgencyKeys: Array.isArray(agenciesList) && agenciesList[0] && typeof agenciesList[0] === 'object'
-            ? Object.keys(agenciesList[0])
-            : [],
-        });
-      }
-
-      if (agenciesResult.ok && agenciesRes?.success && Array.isArray(agenciesList)) {
-        const validAgencies = agenciesList.filter((agency): agency is Agency =>
-          agency !== null
-          && typeof agency === 'object'
-          && (typeof agency.id === 'string' || typeof agency.id === 'number')
-          && typeof agency.name === 'string'
-          && agency.name.trim() !== ''
-        );
-        setAgencies(validAgencies);
-        if (validAgencies.length > 0) {
-          setSelectedAgencyId(String(validAgencies[0].id));
-        } else {
-          if (__DEV__) console.warn('[AFARIEX-DEBUG] Agencies endpoint returned an empty list.');
-          setError('در حال حاضر نمایندگی‌ای برای انتخاب ثبت نشده است.');
-        }
+      if (agenciesRes?.success && Array.isArray(agenciesList)) {
+        setAgencies(agenciesList);
+        if (agenciesList.length > 0) setSelectedAgencyId(String(agenciesList[0].id));
       } else {
-        if (__DEV__) console.warn('[AFARIEX-DEBUG] Agencies payload could not be used', {
-          httpStatus: agenciesResult.status,
-          response: agenciesResult.raw.slice(0, 300),
-        });
-        setError('دریافت لیست نمایندگی‌ها ناموفق بود. اتصال سرور یا پاسخ API را بررسی کنید.');
+        setError('خطا در دریافت لیست نمایندگی‌ها');
       }
 
       if (ratesRes?.success && Array.isArray(ratesList)) {
-        const validRates = ratesList.filter((rate: unknown): rate is ExchangeRate =>
-          isRecord(rate)
-          && (typeof rate.id === 'string' || typeof rate.id === 'number')
-          && Number.isInteger(Number(rate.id))
-          && Number(rate.id) > 0
-          && (typeof rate.toman_per_afn === 'string' || typeof rate.toman_per_afn === 'number')
-          && Number.isFinite(Number(rate.toman_per_afn))
-          && Number(rate.toman_per_afn) > 0
-        );
-        setExchangeRates(validRates);
-        if (validRates.length > 0) setSelectedRateId(Number(validRates[0].id));
+        setExchangeRates(ratesList);
+        const latestActive = pickLatestActiveRate(ratesList);
+        if (latestActive) setSelectedRateId(Number(latestActive.id));
       } else {
         setError('خطا در دریافت نرخ ارز');
       }
 
       const metadata = countriesRes?.data;
       if (countriesRes?.success && Array.isArray(metadata?.groups)) {
-        const normalizedGroups = normalizeDestinationGroups(metadata.groups);
-        const normalizedDestinationCurrencies = normalizeCurrencyOptions(metadata.destination_currencies);
-        const normalizedSourceCurrencies = normalizeCurrencyOptions(metadata.source_currencies);
-        setDestinationCountryGroups(normalizedGroups);
-        setSourceCurrencies(normalizedSourceCurrencies.length ? normalizedSourceCurrencies : [{ code: 'IRT', name: 'تومان' }]);
-        setDestinationCurrencies(normalizedDestinationCurrencies);
-        setFixedRatePairs(Array.isArray(metadata.fixed_rate_pairs)
-          ? metadata.fixed_rate_pairs.filter((pair: unknown) =>
-            isRecord(pair)
-            && typeof pair.source_currency === 'string'
-            && typeof pair.destination_currency === 'string'
-            && typeof pair.country_code === 'string'
-          )
-          : []);
-        if (normalizedGroups.length === 0) setError('فهرست کشورهای مقصد در دسترس نیست.');
+        setDestinationCountryGroups(metadata.groups);
+        setSourceCurrencies(metadata.source_currencies || [{ code: 'IRT', name: 'تومان' }]);
+        setDestinationCurrencies(metadata.destination_currencies || []);
+        setFixedRatePairs(metadata.fixed_rate_pairs || []);
       } else {
-        // لاگ کمکی برای این که دقیقاً ببینید سرور به APK چه جوابی داده است
-        if (__DEV__) console.warn('[AFARIEX-DEBUG] Destinations payload mismatch:', countriesResult.raw.slice(0, 300));
         setError('خطا در دریافت فهرست کشورهای مقصد');
       }
     } catch (err) {
-      if (__DEV__) console.error('[AFARIEX-DEBUG] Unhandled error in fetchData:', err);
       setError('خطا در ارتباط با سرور. لطفاً اینترنت خود را بررسی کنید.');
     } finally {
       setLoading(false);
@@ -466,57 +236,40 @@ export default function AddRemittanceScreen() {
     }
   }, [isInitialized]);
 
-
-
-
-
-
-
-
-
-
-
-
   useEffect(() => {
     if (isInitialized) void fetchData();
   }, [fetchData, isInitialized]);
 
   useEffect(() => {
-    if (sourceCurrencies.length && !sourceCurrencies.some((currency) => currency.code === selectedSourceCurrency)) {
-      setSelectedSourceCurrency(sourceCurrencies[0].code);
-    }
-  }, [selectedSourceCurrency, sourceCurrencies]);
-
-  useEffect(() => {
     if (!selectedDestinationCountry) return;
-    const country = countries.find((item) => item.code === selectedDestinationCountry);
-    const allowedCurrencies = country?.destination_currencies?.length
-      ? country.destination_currencies
-      : destinationCurrencies;
-    const allowed = allowedCurrencies.map((currency) => currency.code);
+    const country = destinationCountryGroups.flatMap((g) => g.countries).find((i) => i.code === selectedDestinationCountry);
+    if (!country) return;
+    const allowed = country.destination_currencies.map((c) => c.code);
     if (!allowed.includes(selectedDestinationCurrency)) {
       setSelectedDestinationCurrency(allowed[0] || 'USD');
     }
-  }, [countries, destinationCurrencies, selectedDestinationCountry, selectedDestinationCurrency]);
+  }, [destinationCountryGroups, selectedDestinationCountry, selectedDestinationCurrency]);
 
   useEffect(() => {
-    if (!selectedRate || !isFixedRatePair) {
+    const cleanAmountToman = normalizeMoneyInput(amountToman);
+    if (!cleanAmountToman || !selectedRate || !isFixedRatePair) {
       setAmountAfghani('');
       return;
     }
-    setAmountAfghani(calculateAfghaniAmount(amountToman, selectedRate.toman_per_afn));
+    const calculated = calculateAfghaniAmount(cleanAmountToman, selectedRate.toman_per_afn);
+    setAmountAfghani(calculated);
   }, [amountToman, isFixedRatePair, selectedRate]);
 
   useEffect(() => {
     const amount = Number(normalizeMoneyInput(amountToman));
-    if (!isFixedRatePair || !resolvedApiToken || !Number.isFinite(amount) || amount <= 0) {
+    if (!resolvedUserToken || !Number.isFinite(amount) || amount <= 0) {
       setFeePreview(null);
       return;
     }
     const timer = setTimeout(async () => {
       try {
         const payload = new URLSearchParams({
-          api_token: resolvedApiToken,
+          api_token: resolvedUserToken,
           service_code: 'remittance',
           amount: String(Math.round(amount)),
         });
@@ -541,7 +294,7 @@ export default function AddRemittanceScreen() {
       }
     }, 350);
     return () => clearTimeout(timer);
-  }, [amountToman, isFixedRatePair, resolvedApiToken]);
+  }, [amountToman, resolvedUserToken]);
 
   const handleDownloadPdf = async () => {
     if (!completedReceipt || receiptBusyAction) return;
@@ -580,151 +333,147 @@ export default function AddRemittanceScreen() {
   };
 
   const handleSubmit = async () => {
-    if (submitInFlight.current || submitting || completedRemittanceId) return;
+    if (submitting || submitInFlight.current || completedRemittanceId) return;
+    submitInFlight.current = true;
 
     const selectedAgency = agencies.find((a) => String(a.id) === String(selectedAgencyId));
     const cleanAmountToman = normalizeMoneyInput(amountToman);
-    const calculatedAmountAfghani = selectedRate
-      ? calculateAfghaniAmount(cleanAmountToman, selectedRate.toman_per_afn)
-      : '';
 
-    if (!selectedAgency) return showError('خطا', 'لطفاً یک نمایندگی انتخاب کنید.');
-    if (!selectedDestinationCountry) return showError('خطا', 'لطفاً کشور مقصد را انتخاب کنید.');
+    if (!selectedAgency) { submitInFlight.current = false; return showError('خطا', 'لطفاً یک نمایندگی انتخاب کنید.'); }
+    if (!selectedDestinationCountry) { submitInFlight.current = false; return showError('خطا', 'لطفاً کشور مقصد را انتخاب کنید.'); }
     if (!isFixedRatePair) {
+      submitInFlight.current = false;
       await handleOpenVariableRateWhatsApp();
       return;
     }
-    if (!selectedRate || !Number.isFinite(Number(selectedRate.toman_per_afn)) || Number(selectedRate.toman_per_afn) <= 0) return showError('خطا', 'نرخ ارز معتبر یافت نشد.');
-    if (!cleanAmountToman || !Number.isFinite(Number(cleanAmountToman)) || Number(cleanAmountToman) <= 0) return showError('خطا', 'مبلغ تومان را وارد کنید.');
-    if (!resolvedUserId) return showError('خطا', 'شناسه کاربر یافت نشد. دوباره وارد شوید.');
+    if (!selectedRate) { submitInFlight.current = false; return showError('خطا', 'نرخ ارز معتبر یافت نشد.'); }
+    if (!cleanAmountToman || Number(cleanAmountToman) <= 0) { submitInFlight.current = false; return showError('خطا', 'مبلغ تومان را وارد کنید.'); }
+    if (!resolvedUserId) { submitInFlight.current = false; return showError('خطا', 'شناسه کاربر یافت نشد. دوباره وارد شوید.'); }
     if (!senderName.trim() || !receiverName.trim() || !receiverPhone.trim()) {
+      submitInFlight.current = false;
       return showError('خطا', 'نام فرستنده، گیرنده و شماره تماس الزامی است.');
     }
 
-    submitInFlight.current = true;
     setSubmitting(true);
     let commitReceived = false;
+
     try {
-      // استفاده از URLSearchParams برای اطمینان 100% از دریافت در بک‌اند
-      const payload = new URLSearchParams();
-
-      // کلیدهای زیر دقیقاً با فایل بک‌اند همگام شده‌اند
-      payload.append('user_id', resolvedUserId);
-      if (resolvedApiToken) payload.append('api_token', resolvedApiToken);
-      payload.append('agency', selectedAgency.name);
-      payload.append('destination_country', selectedDestinationCountry);
-      payload.append('source_currency', selectedSourceCurrency);
-      payload.append('destination_currency', selectedDestinationCurrency);
+      // تازه‌سازی نرخ پیش از ارسال جهت جلوگیری از انقضای rate_id
       let submissionRate = selectedRate;
-      let submittedAmountAfghani = calculatedAmountAfghani;
-      payload.append('rate_id', String(submissionRate.id));
-      payload.append('sender_name', senderName.trim());
-      payload.append('receiver_name', receiverName.trim());
-      payload.append('receiver_phone', receiverPhone.trim());
-      payload.append('amount_toman', cleanAmountToman);
-      payload.append('amount_afn', submittedAmountAfghani);
+      try {
+        const freshRes = await fetch(`${apiUrl('get_exchange_rates.php')}?cache_bust=${Date.now()}`, {
+          headers: { 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache' },
+          cache: 'no-store',
+        });
+        const freshJson: any = await freshRes.json().catch(() => null);
+        const freshList: any[] = freshJson?.data ?? freshJson?.rows ?? [];
+        if (freshRes.ok && freshJson?.success !== false && freshList.length > 0) {
+          setExchangeRates(freshList);
+          const stillChosen = freshList.find((r: any) => Number(r.id) === Number(selectedRateId) && isRateActive(r));
+          submissionRate = stillChosen || pickLatestActiveRate(freshList) || submissionRate;
+          setSelectedRateId(Number(submissionRate.id));
+        }
+      } catch {
+        // ادامه با نرخ موجود در صورت خطای شبکه
+      }
 
-      const sendRemittance = () => fetch(apiUrl('add_remittance.php'), {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: payload.toString(),
-      });
+      const submittedAmountAfghani = calculateAfghaniAmount(cleanAmountToman, submissionRate.toman_per_afn);
+      if (!submittedAmountAfghani) {
+        setSubmitting(false);
+        submitInFlight.current = false;
+        return showError('خطا', 'محاسبه مبلغ معادل افغانی ناموفق بود.');
+      }
 
-      let response = await sendRemittance();
-      const parseResponse = (responseText: string) => {
-        try { return responseText ? JSON.parse(responseText) : {}; } catch { return null; }
+      const sendRequest = async (rateIdToUse: string | number, afnAmountToUse: string) => {
+        const payload = new URLSearchParams();
+        payload.append('user_id', resolvedUserId);
+        if (resolvedUserToken) payload.append('api_token', resolvedUserToken);
+        payload.append('agency', selectedAgency.name);
+        payload.append('destination_country', selectedDestinationCountry);
+        payload.append('source_currency', selectedSourceCurrency);
+        payload.append('destination_currency', selectedDestinationCurrency);
+        payload.append('rate_id', String(rateIdToUse));
+        payload.append('sender_name', senderName.trim());
+        payload.append('receiver_name', receiverName.trim());
+        payload.append('receiver_phone', receiverPhone.trim());
+        payload.append('amount_toman', cleanAmountToman);
+        payload.append('amount_afn', afnAmountToUse);
+
+        return await fetch(apiUrl('add_remittance.php'), {
+          method: 'POST',
+          headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: payload.toString(),
+        });
       };
-      let result: any = parseResponse(await response.text());
-      if (result === null) {
-        showError('Error', 'Invalid response received from the server.');
-        return;
+
+      let response = await sendRequest(submissionRate.id, submittedAmountAfghani);
+      let responseText = await response.text();
+      let result: any = {};
+      try {
+        result = responseText ? JSON.parse(responseText) : {};
+      } catch {
+        setSubmitting(false);
+        submitInFlight.current = false;
+        return showError('خطا', 'پاسخ معتبری از سرور دریافت نشد.');
       }
 
-      if (result?.code === 'DAILY_TRANSACTION_LIMIT_EXCEEDED') {
-        showError('سقف تراکنش روزانه', `سقف: ${Number(result?.data?.daily_limit || 0).toLocaleString('en-US')} تومان، باقی‌مانده: ${Number(result?.data?.remaining_today || 0).toLocaleString('en-US')} تومان`);
-        router.push('/access-level' as any);
-        return;
-      }
-
-      const firstCode = String(result?.code ?? result?.data?.code ?? '').trim().toUpperCase();
       const isRateConflict = (res: Response, body: any) => {
         const code = String(body?.code ?? body?.data?.code ?? '').trim().toUpperCase();
         return res.status === 409 || ['EXCHANGE_RATE_CHANGED', 'INVALID_CONVERTED_AMOUNT', 'RATE_MISMATCH'].includes(code);
       };
-      if (isRateConflict(response, result) || firstCode === 'EXCHANGE_RATE_CHANGED') {
-        try {
-          const oldRateId = submissionRate.id;
-          if (__DEV__) {
-            console.info('[REMITTANCE] Exchange rate conflict; refreshing before retry', {
-              oldRateId,
-              serverResponse: { status: response.status, body: result },
-            });
-          }
-          const latestRatesUrl = `${apiUrl('get_exchange_rates.php')}?cache_bust=${Date.now()}`;
-          const ratesResponse = await fetch(latestRatesUrl, {
-            method: 'GET',
-            headers: { Accept: 'application/json', 'Cache-Control': 'no-cache, no-store, must-revalidate', Pragma: 'no-cache' },
-            cache: 'no-store',
-          });
-          const ratesData = await ratesResponse.json();
-          const ratesList = ratesData?.data ?? ratesData?.rows ?? [];
-          const refreshedRates = (Array.isArray(ratesList) ? ratesList.filter((rate: unknown): rate is ExchangeRate =>
-            isRecord(rate)
-            && (typeof rate.id === 'string' || typeof rate.id === 'number')
-            && Number.isInteger(Number(rate.id)) && Number(rate.id) > 0
-            && (typeof rate.toman_per_afn === 'string' || typeof rate.toman_per_afn === 'number')
-            && Number.isFinite(Number(rate.toman_per_afn)) && Number(rate.toman_per_afn) > 0
-          ) : []).sort((a, b) => Number(b.id) - Number(a.id));
-          if (!ratesResponse.ok || !ratesData?.success || refreshedRates.length === 0) throw new Error('No usable rate');
 
-          submissionRate = refreshedRates[0];
-          if (__DEV__) {
-            console.info('[REMITTANCE] Latest exchange rate selected for retry', {
-              oldRateId,
-              newRateId: submissionRate.id,
-              newRateValue: submissionRate.toman_per_afn,
-            });
-          }
-          submittedAmountAfghani = calculateAfghaniAmount(cleanAmountToman, submissionRate.toman_per_afn);
-          if (!submittedAmountAfghani) throw new Error('Could not calculate converted amount');
-          setExchangeRates(refreshedRates);
-          setSelectedRateId(Number(submissionRate.id));
-          setAmountAfghani(submittedAmountAfghani);
-          payload.set('rate_id', String(submissionRate.id));
-          payload.set('amount_afn', submittedAmountAfghani);
+      // تلاش مجدد خودکار در صورت تغییر نرخ
+      if (isRateConflict(response, result)) {
+        let retryOk = false;
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const latest = pickLatestActiveRate(exchangeRates);
+          if (!latest) break;
+          const retryAmount = calculateAfghaniAmount(cleanAmountToman, latest.toman_per_afn);
+          if (!retryAmount) break;
+          
+          submissionRate = latest;
+          setSelectedRateId(Number(latest.id));
 
-          response = await sendRemittance();
-          result = parseResponse(await response.text());
-          if (result === null) throw new Error('Invalid retry response');
-          if (__DEV__) {
-            console.info('[REMITTANCE] Exchange rate retry response', {
-              rateId: submissionRate.id,
-              status: response.status,
-              body: result,
-            });
+          response = await sendRequest(latest.id, retryAmount);
+          responseText = await response.text();
+          try { result = responseText ? JSON.parse(responseText) : {}; } catch { break; }
+
+          if (!isRateConflict(response, result)) {
+            retryOk = true;
+            break;
           }
-        } catch {
-          showError('Error', 'The exchange rate could not be refreshed or the remittance retry failed. Please check your connection and try again.');
-          return;
+        }
+        if (!retryOk) {
+          setSubmitting(false);
+          submitInFlight.current = false;
+          return showError('خطا', 'نرخ ارز تغییر کرده است. لطفاً فرم حواله را بازخوانی کنید.');
         }
       }
 
       const responseMessage = typeof result?.message === 'string' ? result.message.trim() : '';
       const normalizedStatus = String(result?.status ?? '').toLowerCase();
       const isErrorResponse = normalizedStatus === 'error' || response.status === 403 || !response.ok;
-      const responseCode = String(result?.code ?? result?.data?.code ?? '').trim();
 
+      if (result?.code === 'DAILY_TRANSACTION_LIMIT_EXCEEDED') {
+        setSubmitting(false);
+        submitInFlight.current = false;
+        showError('سقف تراکنش روزانه', `سقف: ${Number(result?.data?.daily_limit || 0).toLocaleString('en-US')} تومان`);
+        router.push('/access-level' as any);
+        return;
+      }
+
+      const responseCode = String(result?.code ?? result?.data?.code ?? '').trim();
       if (responseCode === 'INSUFFICIENT_BALANCE') {
+        setSubmitting(false);
+        submitInFlight.current = false;
         setInsufficientBalanceVisible(true);
         return;
       }
 
       if (isErrorResponse) {
-        showError('Ø®Ø·Ø§', responseMessage || 'Ø®Ø·Ø§ Ø¯Ø± Ø«Ø¨Øª Ø­ÙˆØ§Ù„Ù‡.');
-        return;
+        setSubmitting(false);
+        submitInFlight.current = false;
+        return showError('خطا', responseMessage || 'خطا در ثبت حواله.');
       }
 
       if (result?.status === 'success' || result?.success) {
@@ -737,13 +486,17 @@ export default function AddRemittanceScreen() {
           result?.tracking_number ??
           ''
         ).trim();
+
         if (!committedRemittanceId) {
-          showError('خطا', 'حواله ثبت شد، اما شناسه رسید از سرور دریافت نشد.');
-          return;
+          setSubmitting(false);
+          submitInFlight.current = false;
+          return showError('خطا', 'حواله ثبت شد، اما شناسه رسید از سرور دریافت نشد.');
         }
+
         setCompletedRemittanceId(committedRemittanceId);
         setLastTrackingCode(committedRemittanceId);
         setLastAgencyName(selectedAgency?.name || '');
+
         const receiptData = result?.data || {};
         setCompletedReceipt({
           trackingNumber: String(receiptData.tracking_number ?? committedRemittanceId),
@@ -760,22 +513,13 @@ export default function AddRemittanceScreen() {
           destinationCountry: String(receiptData.destination_country_name ?? ''),
           status: String(receiptData.status ?? 'pending'),
         });
-        const newBalance =
-          result?.new_balance ??
-          result?.data?.new_balance ??
-          result?.result?.new_balance ??
-          result?.balance ??
-          result?.data?.balance ??
-          result?.result?.balance ??
-          null;
 
+        const newBalance = result?.new_balance ?? result?.data?.new_balance ?? result?.balance ?? result?.data?.balance ?? null;
         const nextBalance = newBalance !== null && newBalance !== '' ? Number(newBalance) : null;
         if (Number.isFinite(nextBalance)) {
           setUserBalance(nextBalance);
         }
 
-        // The committed response is the receipt source; opening it is local UI
-        // state only and must never submit the remittance again.
         setReceiptModalVisible(true);
         showSuccess('موفق', 'حواله با موفقیت ثبت شد.');
       } else {
@@ -788,8 +532,8 @@ export default function AddRemittanceScreen() {
         showError('خطای ارتباط', 'مشکل در ارتباط با سرور رخ داده است.');
       }
     } finally {
-      submitInFlight.current = false;
       setSubmitting(false);
+      submitInFlight.current = false;
     }
   };
 
@@ -819,8 +563,6 @@ export default function AddRemittanceScreen() {
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <View style={styles.outerBackground}>
           <View style={styles.boxedContainer}>
-
-            {/* هدر مشابه صفحه افزایش موجودی */}
             <View style={styles.customHeader}>
               <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
                 <Ionicons name="arrow-forward" size={24} color="#4b5563" />
@@ -830,18 +572,62 @@ export default function AddRemittanceScreen() {
             </View>
 
             <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
-
               <Text style={styles.label}>ارز مبدا</Text>
-              {renderSelectorButton(selectedSourceCurrencyName, 'انتخاب ارز مبدا', 'source')}
+              <View style={styles.pickerContainer}>
+                <Picker
+                  style={styles.picker}
+                  selectedValue={selectedSourceCurrency}
+                  onValueChange={(value) => setSelectedSourceCurrency(String(value))}
+                >
+                  {sourceCurrencies.map((currency) => (
+                    <Picker.Item key={currency.code} label={`${currency.name} (${currency.code})`} value={currency.code} />
+                  ))}
+                </Picker>
+              </View>
 
               <Text style={styles.label}>کشور مقصد</Text>
-              {renderSelectorButton(countries.find((country) => country.code === selectedDestinationCountry)?.name || '', 'انتخاب کشور مقصد', 'country')}
+              <View style={styles.pickerContainer}>
+                <Picker
+                  style={styles.picker}
+                  selectedValue={selectedDestinationCountry}
+                  onValueChange={(value) => setSelectedDestinationCountry(String(value))}
+                >
+                  <Picker.Item label="انتخاب کشور مقصد..." value="" />
+                  {destinationCountryGroups.flatMap((group) => group.countries.map((country) => (
+                    <Picker.Item
+                      key={country.code}
+                      label={`${group.group === 'europe' ? 'اروپا' : group.group === 'arab' ? 'کشورهای عربی' : 'مقصدهای درخواستی'} — ${country.name}`}
+                      value={country.code}
+                    />
+                  )))}
+                </Picker>
+              </View>
 
               <Text style={styles.label}>ارز مقصد</Text>
-              {renderSelectorButton(selectedDestinationCurrencyName, 'انتخاب ارز مقصد', 'destinationCurrency')}
+              <View style={styles.pickerContainer}>
+                <Picker
+                  style={styles.picker}
+                  selectedValue={selectedDestinationCurrency}
+                  onValueChange={(value) => setSelectedDestinationCurrency(String(value))}
+                >
+                  {availableDestinationCurrencies.map((currency) => (
+                    <Picker.Item key={currency.code} label={`${currency.name} (${currency.code})`} value={currency.code} />
+                  ))}
+                </Picker>
+              </View>
 
               <Text style={styles.label}>نمایندگی مقصد</Text>
-              {renderSelectorButton(agencies.find((agency) => String(agency.id) === String(selectedAgencyId))?.name || '', 'انتخاب نمایندگی مقصد', 'agency')}
+              <View style={styles.pickerContainer}>
+                <Picker
+                  style={styles.picker}
+                  selectedValue={selectedAgencyId ?? ''}
+                  onValueChange={(v) => setSelectedAgencyId(String(v))}
+                >
+                  {agencies.map((agency) => (
+                    <Picker.Item key={agency.id} label={agency.name} value={String(agency.id)} />
+                  ))}
+                </Picker>
+              </View>
 
               {isFixedRatePair ? (
                 <>
@@ -857,6 +643,10 @@ export default function AddRemittanceScreen() {
                   <Text style={styles.variableRateText}>
                     نرخ این حواله متغیر است. برای دریافت نرخ روز و اطلاعات پرداخت با پشتیبانی واتساپ در ارتباط باشید.
                   </Text>
+                  <TouchableOpacity style={styles.whatsappBtn} onPress={handleOpenVariableRateWhatsApp}>
+                    <Ionicons name="logo-whatsapp" size={18} color="#fff" />
+                    <Text style={styles.whatsappBtnText}>ارتباط با پشتیبانی واتساپ</Text>
+                  </TouchableOpacity>
                 </View>
               )}
 
@@ -882,7 +672,9 @@ export default function AddRemittanceScreen() {
                       onChangeText={amountTomanInput.onChangeText}
                       placeholder="مثال: 5000000"
                     />
-                    {!!moneyInputWords(amountToman) && <Text style={styles.amountWords}>{moneyInputWords(amountToman)}</Text>}
+                    {!!moneyInputWords(amountToman) && (
+                      <Text style={styles.amountWords}>{moneyInputWords(amountToman)}</Text>
+                    )}
                   </View>
                   <View style={styles.half}>
                     <Text style={styles.label}>معادل (افغانی)</Text>
@@ -913,278 +705,213 @@ export default function AddRemittanceScreen() {
                 placeholder="شماره موبایل گیرنده"
               />
 
-              {isFixedRatePair ? (
+              {isFixedRatePair && (
                 <>
                   <View style={styles.spacer} />
-
                   <View style={styles.feeBox}>
-                    <View style={styles.feeRow}><Text style={styles.feeLabel}>مبلغ حواله</Text><Text style={styles.feeValue}>{toPersianNum(Number(normalizeMoneyInput(amountToman) || 0).toLocaleString('en-US'))} تومان</Text></View>
-                    <View style={styles.feeRow}><Text style={styles.feeLabel}>کارمزد</Text><Text style={styles.feeValue}>{toPersianNum(Number(feePreview?.fee_amount || 0).toLocaleString('en-US'))} تومان</Text></View>
-                    <View style={[styles.feeRow, styles.feeTotalRow]}><Text style={styles.feeTotalLabel}>مبلغ نهایی قابل پرداخت</Text><Text style={styles.feeTotalValue}>{toPersianNum(Number(feePreview?.total_amount || normalizeMoneyInput(amountToman) || 0).toLocaleString('en-US'))} تومان</Text></View>
+                    <View style={styles.feeRow}>
+                      <Text style={styles.feeLabel}>مبلغ حواله:</Text>
+                      <Text style={styles.feeValue}>{amountToman ? toPersianNum(amountToman) : '۰'} تومان</Text>
+                    </View>
+                    <View style={styles.feeRow}>
+                      <Text style={styles.feeLabel}>کارمزد انتقال:</Text>
+                      <Text style={styles.feeValue}>
+                        {feePreview ? `${toPersianNum(feePreview.fee_amount)} تومان` : 'محاسبه...'}
+                      </Text>
+                    </View>
+                    <View style={[styles.feeRow, styles.feeTotalRow]}>
+                      <Text style={styles.feeTotalLabel}>مجموع کسر از کیف پول:</Text>
+                      <Text style={styles.feeTotalValue}>
+                        {feePreview ? `${toPersianNum(feePreview.total_amount)} تومان` : '...'}
+                      </Text>
+                    </View>
                   </View>
-
-                  <TouchableOpacity
-                    style={[styles.submitBtn, submitting && styles.disabledBtn]}
-                    onPress={handleSubmit}
-                    disabled={submitting}>
-                    {submitting ? (
-                      <ActivityIndicator color="#fff" />
-                    ) : (
-                      <Text style={styles.submitBtnText}>ثبت و ارسال حواله</Text>
-                    )}
-                  </TouchableOpacity>
                 </>
-              ) : (
-                <TouchableOpacity
-                  style={styles.whatsappBtn}
-                  onPress={handleOpenVariableRateWhatsApp}>
-                  <Ionicons name="logo-whatsapp" size={20} color="#fff" style={{ marginLeft: 8 }} />
-                  <Text style={styles.submitBtnText}>دریافت نرخ حواله در واتساپ</Text>
-                </TouchableOpacity>
               )}
 
+              <TouchableOpacity
+                style={[styles.submitBtn, (submitting || completedRemittanceId) && styles.disabledBtn]}
+                onPress={handleSubmit}
+                disabled={submitting || !!completedRemittanceId}
+              >
+                {submitting ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <Text style={styles.submitBtnText}>
+                    {isFixedRatePair ? 'ثبت و ارسال حواله' : 'دریافت نرخ از طریق واتساپ'}
+                  </Text>
+                )}
+              </TouchableOpacity>
             </ScrollView>
           </View>
-          <AppBottomNav />
         </View>
       </KeyboardAvoidingView>
 
-      <Modal
-        visible={activeSelector !== null}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setActiveSelector(null)}>
-        <View style={styles.selectorBackdrop}>
-          <View style={styles.selectorModal}>
-            <View style={styles.selectorHeader}>
-              <Text style={styles.selectorTitle}>{selectorTitle}</Text>
-              <TouchableOpacity onPress={() => setActiveSelector(null)} accessibilityRole="button" accessibilityLabel="بستن">
-                <Ionicons name="close" size={22} color={appColors.textSecondary} />
-              </TouchableOpacity>
-            </View>
-            <ScrollView style={styles.selectorOptions} keyboardShouldPersistTaps="handled">
-              {selectorOptions.length ? selectorOptions.map((option) => (
-                <TouchableOpacity
-                  key={option.value}
-                  style={styles.selectorOption}
-                  onPress={() => handleSelectorChoice(option.value)}
-                  accessibilityRole="button">
-                  <Text style={styles.selectorOptionText}>{option.label}</Text>
-                  {option.value === selectedSelectorValue && <Ionicons name="checkmark" size={20} color={appColors.primary} />}
-                </TouchableOpacity>
-              )) : <Text style={styles.selectorEmpty}>گزینه‌ای برای انتخاب وجود ندارد.</Text>}
-            </ScrollView>
-          </View>
-        </View>
-      </Modal>
+      <AppBottomNav />
 
-      <Modal
-        visible={insufficientBalanceVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setInsufficientBalanceVisible(false)}>
-        <View style={styles.modalBackdrop}>
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>موجودی ناکافی</Text>
-            <Text style={styles.modalLine}>موجودی کیف پول شما برای ثبت این حواله کافی نیست.</Text>
-            <View style={styles.modalActions}>
-              <TouchableOpacity
-                style={[styles.modalBtn, styles.pdfBtn]}
-                onPress={() => {
-                  setInsufficientBalanceVisible(false);
-                  router.push('/add-balance' as any);
-                }}>
-                <Text style={styles.modalBtnText}>افزایش موجودی کیف پول</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.modalBtn, styles.homeBtn]}
-                onPress={() => setInsufficientBalanceVisible(false)}>
-                <Text style={[styles.modalBtnText, { color: '#374151' }]}>بازگشت</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
-
-      {/* مدال موفقیت */}
-      <Modal
-        visible={successModalVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setSuccessModalVisible(false)}>
-        <View style={styles.modalBackdrop}>
-          <View style={styles.modalCard}>
-                <Ionicons name="checkmark-circle" size={60} color={appColors.primary} style={{ alignSelf: 'center', marginBottom: 10 }} />
-            <Text style={styles.modalTitle}>حواله با موفقیت ثبت شد</Text>
-            <Text style={styles.modalLine}>کد پیگیری: <Text style={styles.modalCode}>{toPersianNum(customerTrackingNumber(lastTrackingCode))}</Text></Text>
-            <Text style={styles.modalLine}>نمایندگی: {lastAgencyName}</Text>
-
-            <View style={styles.modalActions}>
-              <TouchableOpacity style={[styles.modalBtn, styles.pdfBtn]} onPress={() => { setSuccessModalVisible(false); setReceiptModalVisible(true); }}>
-                <Ionicons name="document-text-outline" size={20} color="#fff" style={{ marginLeft: 8 }} />
-                <Text style={styles.modalBtnText}>مشاهده رسید</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={[styles.modalBtn, styles.homeBtn]}
-                onPress={() => {
-                  setSuccessModalVisible(false);
-                  resetForm();
-                  router.replace('/dashboard');
-                }}>
-                <Text style={styles.modalBtnText}>بازگشت به پیشخوان</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
-
+      {/* مودال رسید پرداخت */}
       <Modal
         visible={receiptModalVisible}
         animationType="slide"
-        onRequestClose={() => setReceiptModalVisible(false)}>
-        <SafeAreaView style={styles.receiptScreen}>
+        transparent={false}
+        onRequestClose={() => {
+          setReceiptModalVisible(false);
+          router.replace('/(tabs)/transactions' as any);
+        }}
+      >
+        <SafeAreaView style={{ flex: 1, backgroundColor: '#f9fafb' }}>
           <View style={styles.receiptHeader}>
-            <TouchableOpacity style={styles.receiptHeaderBack} onPress={() => setReceiptModalVisible(false)}><Ionicons name="arrow-forward" size={22} color="#334155" /></TouchableOpacity>
-            <Text style={styles.receiptHeaderTitle}>رسید حواله</Text><View style={{ width: 42 }} />
+            <Text style={styles.receiptHeaderTitle}>رسید ثبت حواله</Text>
+            <TouchableOpacity
+              onPress={() => {
+                setReceiptModalVisible(false);
+                router.replace('/(tabs)/transactions' as any);
+              }}
+              style={styles.receiptCloseBtn}
+            >
+              <Ionicons name="close" size={24} color="#374151" />
+            </TouchableOpacity>
           </View>
-          <ScrollView contentContainerStyle={styles.receiptContent} showsVerticalScrollIndicator={false}>
+
+          <ScrollView contentContainerStyle={{ padding: 16 }}>
             {completedReceipt && <RemittanceReceiptView receipt={completedReceipt} />}
-            <View style={styles.receiptActions}>
-              <TouchableOpacity style={[styles.receiptAction, styles.receiptSecondary]} onPress={handleCopyReceipt} disabled={receiptBusyAction !== null}>
-                <Ionicons name="copy-outline" size={20} color={appColors.primary} /><Text style={styles.receiptSecondaryText}>کپی رسید</Text>
+
+            <View style={styles.receiptActionsContainer}>
+              <TouchableOpacity
+                style={[styles.receiptActionBtn, styles.receiptPrimaryBtn]}
+                onPress={handleDownloadPdf}
+                disabled={receiptBusyAction !== null}
+              >
+                {receiptBusyAction === 'pdf' ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <>
+                    <Ionicons name="document-text-outline" size={20} color="#fff" style={{ marginLeft: 6 }} />
+                    <Text style={styles.receiptPrimaryBtnText}>دریافت PDF</Text>
+                  </>
+                )}
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.receiptAction, styles.receiptPrimary]} onPress={handleDownloadPdf} disabled={receiptBusyAction !== null}>
-                {receiptBusyAction === 'pdf' ? <ActivityIndicator color="#fff" /> : <><Ionicons name="download-outline" size={20} color="#fff" /><Text style={styles.receiptPrimaryText}>دریافت PDF</Text></>}
+
+              <TouchableOpacity
+                style={[styles.receiptActionBtn, styles.receiptSecondaryBtn]}
+                onPress={handleShareReceipt}
+                disabled={receiptBusyAction !== null}
+              >
+                {receiptBusyAction === 'share' ? (
+                  <ActivityIndicator color="#111827" size="small" />
+                ) : (
+                  <>
+                    <Ionicons name="share-social-outline" size={20} color="#111827" style={{ marginLeft: 6 }} />
+                    <Text style={styles.receiptSecondaryBtnText}>اشتراک‌گذاری</Text>
+                  </>
+                )}
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.receiptAction, styles.receiptSecondary]} onPress={handleShareReceipt} disabled={receiptBusyAction !== null}>
-                {receiptBusyAction === 'share' ? <ActivityIndicator color={appColors.primary} /> : <><Ionicons name="share-social-outline" size={20} color={appColors.primary} /><Text style={styles.receiptSecondaryText}>اشتراک‌گذاری رسید</Text></>}
-              </TouchableOpacity>
-              <TouchableOpacity style={[styles.receiptAction, styles.receiptBack]} onPress={() => setReceiptModalVisible(false)} disabled={receiptBusyAction !== null}><Text style={styles.receiptBackText}>بازگشت</Text></TouchableOpacity>
             </View>
+
+            <TouchableOpacity style={styles.receiptCopyBtn} onPress={handleCopyReceipt}>
+              <Ionicons name="copy-outline" size={18} color="#4b5563" style={{ marginLeft: 6 }} />
+              <Text style={styles.receiptCopyText}>کپی متن رسید</Text>
+            </TouchableOpacity>
           </ScrollView>
         </SafeAreaView>
+      </Modal>
+
+      {/* مودال موجودی ناکافی */}
+      <Modal
+        visible={insufficientBalanceVisible}
+        animationType="fade"
+        transparent={true}
+        onRequestClose={() => setInsufficientBalanceVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalIconBox}>
+              <Ionicons name="wallet-outline" size={36} color="#ef4444" />
+            </View>
+            <Text style={styles.modalTitle}>موجودی ناکافی</Text>
+            <Text style={styles.modalText}>موجودی و اعتبار کیف پول شما برای پرداخت مبلغ حواله و کارمزد کافی نیست.</Text>
+            <View style={styles.modalButtonsRow}>
+              <TouchableOpacity
+                style={[styles.modalBtn, styles.modalSecondaryBtn]}
+                onPress={() => setInsufficientBalanceVisible(false)}
+              >
+                <Text style={styles.modalSecondaryBtnText}>متوجه شدم</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalBtn, styles.modalPrimaryBtn]}
+                onPress={() => {
+                  setInsufficientBalanceVisible(false);
+                  router.push('/deposit' as any);
+                }}
+              >
+                <Text style={styles.modalPrimaryBtnText}>افزایش موجودی</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
       </Modal>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  safeArea: { flex: 1, backgroundColor: appColors.background },
-  receiptScreen: { flex: 1, backgroundColor: appColors.background },
-  receiptHeader: { height: 62, paddingHorizontal: 16, flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between' },
-  receiptHeaderBack: { width: 42, height: 42, borderRadius: 13, backgroundColor: appColors.surface, borderWidth: 1, borderColor: appColors.surfaceRaised, alignItems: 'center', justifyContent: 'center' },
-  receiptHeaderTitle: { fontFamily: 'VazirmatnBold', fontSize: 18, color: appColors.text },
-  receiptContent: { width: '100%', maxWidth: 720, alignSelf: 'center', padding: 16, paddingBottom: 36 },
-  receiptActions: { gap: 10, marginTop: 16 },
-  receiptAction: { minHeight: 50, borderRadius: 13, flexDirection: 'row-reverse', gap: 8, alignItems: 'center', justifyContent: 'center' },
-  receiptPrimary: { backgroundColor: appColors.primary }, receiptPrimaryText: { fontFamily: 'VazirmatnBold', fontSize: 13, color: appColors.background },
-  receiptSecondary: { backgroundColor: appColors.surface, borderWidth: 1, borderColor: appColors.accent }, receiptSecondaryText: { fontFamily: 'VazirmatnBold', fontSize: 13, color: appColors.primary },
-  receiptBack: { backgroundColor: appColors.surface, borderWidth: 1, borderColor: appColors.surfaceRaised }, receiptBackText: { fontFamily: 'Vazirmatn', fontSize: 13, color: appColors.textSecondary },
-  outerBackground: { flex: 1, backgroundColor: appColors.background, paddingHorizontal: 18, paddingTop: 18, paddingBottom: 70 },
-  boxedContainer: {
-    flex: 1,
-    backgroundColor: appColors.background,
-    overflow: 'hidden',
-    shadowOpacity: 0,
-    shadowRadius: 0,
-    elevation: 0
-  },
-  customHeader: {
-    flexDirection: 'row-reverse',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingVertical: 20,
-    borderBottomWidth: 1,
-    borderBottomColor: appColors.surfaceRaised
-  },
-  backBtn: { width: 40, height: 40, borderRadius: 20, backgroundColor: appColors.surfaceRaised, justifyContent: 'center', alignItems: 'center' },
-  headerTitle: { fontSize: 16, fontWeight: 'bold', color: appColors.text, fontFamily: 'Vazirmatn' },
-  scrollContent: { padding: 0, flexGrow: 1, paddingBottom: 70 },
-
-  label: { fontSize: 13, color: appColors.textMuted, marginBottom: 8, marginTop: 15, fontFamily: 'Vazirmatn', textAlign: 'right' },
-  input: {
-    width: '100%',
-    padding: 15,
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
-    borderRadius: 12,
-    backgroundColor: appColors.surfaceRaised,
-    textAlign: 'right',
-    fontSize: 14,
-    color: appColors.text,
-    fontFamily: 'Vazirmatn'
-  },
-  amountWords: { color: appColors.primary, fontSize: 12, fontFamily: 'Vazirmatn', textAlign: 'right', marginTop: 8 },
-  disabledInput: { backgroundColor: appColors.surfaceRaised, color: '#9ca3af' },
-  variableRateBox: { borderWidth: 1, borderColor: '#f59e0b', backgroundColor: '#fffbeb', borderRadius: 14, padding: 14, marginTop: 16 },
-  variableRateText: { color: '#92400e', fontFamily: 'Vazirmatn', fontSize: 12, lineHeight: 21, textAlign: 'right' },
-
-  selectorButton: { minHeight: 50, borderWidth: 1, borderColor: appColors.surfaceRaised, borderRadius: 12, backgroundColor: appColors.surfaceRaised, paddingHorizontal: 14, flexDirection: 'row-reverse', alignItems: 'center', gap: 10 },
-  selectorButtonText: { flex: 1, color: appColors.text, fontFamily: 'Vazirmatn', fontSize: 14, textAlign: 'right' },
-  selectorPlaceholder: { color: appColors.textMuted },
-  selectorBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.62)', justifyContent: 'center', padding: 20 },
-  selectorModal: { width: '100%', maxHeight: '78%', alignSelf: 'center', backgroundColor: appColors.surface, borderRadius: 18, padding: 16 },
-  selectorHeader: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: appColors.surfaceRaised },
-  selectorTitle: { color: appColors.text, fontFamily: 'VazirmatnBold', fontSize: 16 },
-  selectorOptions: { flexGrow: 0, marginTop: 6 },
-  selectorOption: { minHeight: 48, flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 8, borderBottomWidth: 1, borderBottomColor: appColors.surfaceRaised },
-  selectorOptionText: { flex: 1, color: appColors.textSecondary, fontFamily: 'Vazirmatn', fontSize: 14, textAlign: 'right' },
-  selectorEmpty: { color: appColors.textMuted, fontFamily: 'Vazirmatn', textAlign: 'center', paddingVertical: 20 },
-  readonlyBox: {
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
-    borderRadius: 12,
-    padding: 15,
-    backgroundColor: appColors.surfaceRaised
-  },
-  readonlyText: { fontSize: 14, color: appColors.textSecondary, fontFamily: 'Vazirmatn', textAlign: 'right' },
-
-  row: { flexDirection: 'row-reverse', justifyContent: 'space-between', gap: 10 },
+  safeArea: { flex: 1, backgroundColor: '#f3f4f6' },
+  outerBackground: { flex: 1, backgroundColor: '#f3f4f6', paddingBottom: 60 },
+  boxedContainer: { flex: 1, backgroundColor: '#ffffff', marginHorizontal: 0, borderRadius: 0, overflow: 'hidden' },
+  customHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#f3f4f6' },
+  backBtn: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },
+  headerTitle: { fontSize: 16, fontWeight: 'bold', color: '#111827', textAlign: 'center' },
+  scrollContent: { padding: 16, paddingBottom: 40 },
+  label: { fontSize: 13, fontWeight: '600', color: '#374151', marginBottom: 6, marginTop: 12, textAlign: 'right' },
+  pickerContainer: { borderWidth: 1, borderColor: '#d1d5db', borderRadius: 10, backgroundColor: '#f9fafb', overflow: 'hidden' },
+  picker: { height: 50, width: '100%', color: '#111827' },
+  readonlyBox: { backgroundColor: '#f3f4f6', borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 10, padding: 12, alignItems: 'center' },
+  readonlyText: { fontSize: 15, fontWeight: 'bold', color: '#1f2937' },
+  variableRateBox: { backgroundColor: '#eff6ff', borderWidth: 1, borderColor: '#bfdbfe', borderRadius: 10, padding: 12, marginTop: 8, alignItems: 'center' },
+  variableRateText: { fontSize: 13, color: '#1e40af', textAlign: 'center', lineHeight: 20, marginBottom: 10 },
+  whatsappBtn: { flexDirection: 'row-reverse', alignItems: 'center', backgroundColor: '#25d366', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8 },
+  whatsappBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 13, marginRight: 6 },
+  input: { borderWidth: 1, borderColor: '#d1d5db', borderRadius: 10, paddingHorizontal: 14, paddingVertical: 12, fontSize: 15, color: '#111827', backgroundColor: '#fff', textAlign: 'right' },
+  disabledInput: { backgroundColor: '#f9fafb', color: '#6b7280' },
+  amountWords: { fontSize: 11, color: '#6b7280', marginTop: 4, textAlign: 'right' },
+  row: { flexDirection: 'row-reverse', gap: 12 },
   half: { flex: 1 },
-  spacer: { marginTop: 25 },
-  feeBox: { borderWidth: 1, borderColor: appColors.surfaceRaised, backgroundColor: appColors.background, borderRadius: 14, padding: 13, marginBottom: 16 },
-  feeRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 6 },
-  feeLabel: { fontFamily: 'Vazirmatn', fontSize: 12, color: '#64748b', textAlign: 'right' },
-  feeValue: { fontFamily: 'VazirmatnBold', fontSize: 13, color: appColors.text, textAlign: 'left' },
-  feeTotalRow: { borderTopWidth: 1, borderTopColor: '#dce7ef', marginTop: 5, paddingTop: 11 },
-  feeTotalLabel: { fontFamily: 'VazirmatnBold', fontSize: 13, color: appColors.primary, textAlign: 'right' },
-  feeTotalValue: { fontFamily: 'VazirmatnBold', fontSize: 14, color: appColors.primary, textAlign: 'left' },
-
-  submitBtn: {
-    width: '100%',
-    backgroundColor: appColors.primary,
-    padding: 15,
-    borderRadius: 12,
-    alignItems: 'center',
-    shadowColor: appColors.primary,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 10,
-    elevation: 5,
-    marginTop: 10,
-    marginBottom: 20
-  },
-  disabledBtn: { opacity: 0.7 },
-  submitBtnText: { color: '#fff', fontSize: 15, fontWeight: 'bold', fontFamily: 'Vazirmatn' },
-  whatsappBtn: { width: '100%', minHeight: 52, backgroundColor: '#128c7e', padding: 15, borderRadius: 12, flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', marginTop: 16, marginBottom: 20 },
-
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: appColors.background },
-  loadingText: { marginTop: 10, color: appColors.textMuted, fontFamily: 'Vazirmatn' },
-  errorText: { color: '#ef4444', fontFamily: 'Vazirmatn', marginBottom: 15, textAlign: 'center' },
-  retryBtn: { backgroundColor: appColors.primary, paddingHorizontal: 20, paddingVertical: 10, borderRadius: 10 },
-  retryText: { color: '#fff', fontFamily: 'Vazirmatn' },
-
-  // استایل‌های مدال
-  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', padding: 20 },
-  modalCard: { backgroundColor: appColors.surface, borderRadius: 24, padding: 25, width: '100%' },
-  modalTitle: { textAlign: 'center', fontSize: 18, fontWeight: 'bold', color: appColors.text, fontFamily: 'Vazirmatn', marginBottom: 15 },
-  modalLine: { textAlign: 'center', fontSize: 14, color: appColors.textSecondary, fontFamily: 'Vazirmatn', marginBottom: 8 },
-  modalCode: { fontWeight: 'bold', color: appColors.primary, fontSize: 16 },
-  modalActions: { marginTop: 20, gap: 10 },
-  modalBtn: { flexDirection: 'row-reverse', borderRadius: 12, padding: 14, alignItems: 'center', justifyContent: 'center' },
-  pdfBtn: { backgroundColor: appColors.primary },
-  homeBtn: { backgroundColor: appColors.surfaceRaised, borderWidth: 1, borderColor: '#e5e7eb' },
-  modalBtnText: { color: '#fff', fontSize: 14, fontWeight: 'bold', fontFamily: 'Vazirmatn' },
+  spacer: { height: 16 },
+  feeBox: { backgroundColor: '#f9fafb', borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 10, padding: 12, marginBottom: 16 },
+  feeRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', paddingVertical: 4 },
+  feeLabel: { fontSize: 12, color: '#6b7280' },
+  feeValue: { fontSize: 12, fontWeight: '600', color: '#374151' },
+  feeTotalRow: { borderTopWidth: 1, borderTopColor: '#e5e7eb', marginTop: 6, paddingTop: 8 },
+  feeTotalLabel: { fontSize: 13, fontWeight: 'bold', color: '#111827' },
+  feeTotalValue: { fontSize: 13, fontWeight: 'bold', color: appColors.primary },
+  submitBtn: { backgroundColor: appColors.primary, borderRadius: 10, paddingVertical: 14, alignItems: 'center', marginTop: 8 },
+  disabledBtn: { opacity: 0.6 },
+  submitBtnText: { color: '#fff', fontSize: 15, fontWeight: 'bold' },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20, backgroundColor: '#fff' },
+  loadingText: { marginTop: 12, fontSize: 14, color: '#6b7280' },
+  errorText: { fontSize: 14, color: '#ef4444', textAlign: 'center', marginBottom: 16 },
+  retryBtn: { backgroundColor: appColors.primary, paddingHorizontal: 20, paddingVertical: 10, borderRadius: 8 },
+  retryText: { color: '#fff', fontWeight: 'bold' },
+  receiptHeader: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#e5e7eb', backgroundColor: '#fff' },
+  receiptHeaderTitle: { fontSize: 16, fontWeight: 'bold', color: '#111827' },
+  receiptCloseBtn: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },
+  receiptActionsContainer: { flexDirection: 'row-reverse', gap: 12, marginTop: 16 },
+  receiptActionBtn: { flex: 1, flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', paddingVertical: 12, borderRadius: 10 },
+  receiptPrimaryBtn: { backgroundColor: appColors.primary },
+  receiptPrimaryBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 14 },
+  receiptSecondaryBtn: { backgroundColor: '#f3f4f6', borderWidth: 1, borderColor: '#d1d5db' },
+  receiptSecondaryBtnText: { color: '#111827', fontWeight: 'bold', fontSize: 14 },
+  receiptCopyBtn: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', paddingVertical: 12, backgroundColor: '#f9fafb', borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 10, marginTop: 12 },
+  receiptCopyText: { color: '#4b5563', fontWeight: '600', fontSize: 13 },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: 20 },
+  modalContent: { backgroundColor: '#fff', borderRadius: 16, padding: 24, width: '100%', maxWidth: 340, alignItems: 'center' },
+  modalIconBox: { width: 64, height: 64, borderRadius: 32, backgroundColor: '#fee2e2', alignItems: 'center', justifyContent: 'center', marginBottom: 16 },
+  modalTitle: { fontSize: 18, fontWeight: 'bold', color: '#111827', marginBottom: 8 },
+  modalText: { fontSize: 13, color: '#4b5563', textAlign: 'center', lineHeight: 20, marginBottom: 20 },
+  modalButtonsRow: { flexDirection: 'row-reverse', gap: 10, width: '100%' },
+  modalBtn: { flex: 1, paddingVertical: 12, borderRadius: 10, alignItems: 'center' },
+  modalPrimaryBtn: { backgroundColor: appColors.primary },
+  modalPrimaryBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 13 },
+  modalSecondaryBtn: { backgroundColor: '#f3f4f6', borderWidth: 1, borderColor: '#d1d5db' },
+  modalSecondaryBtnText: { color: '#374151', fontWeight: 'bold', fontSize: 13 },
 });
