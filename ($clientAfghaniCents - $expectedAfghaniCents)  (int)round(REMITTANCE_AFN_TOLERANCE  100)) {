@@ -1,0 +1,1498 @@
+[1mdiff --git a/API/add_remittance.php b/API/add_remittance.php[m
+[1mindex b2b54e22..8ea49b99 100644[m
+[1m--- a/API/add_remittance.php[m
+[1m+++ b/API/add_remittance.php[m
+[36m@@ -65,17 +65,27 @@[m [mif (array_key_exists('rate_id', $data)) {[m
+     }[m
+     $requestedRateId = (int)$rateIdValue;[m
+ }[m
+[32m+[m[32m$requestedRateValue = null;[m
+[32m+[m[32mif (array_key_exists('rate_value', $data)) {[m
+[32m+[m[32m    $rateValue = trim((string)$data['rate_value']);[m
+[32m+[m[32m    if ($rateValue === '' || !is_numeric($rateValue) || !is_finite((float)$rateValue) || (float)$rateValue <= 0) {[m
+[32m+[m[32m        json_response(['success' => false, 'code' => 'INVALID_EXCHANGE_RATE', 'message' => 'Invalid exchange rate. Please reload the remittance form.'], 422);[m
+[32m+[m[32m    }[m
+[32m+[m[32m    $requestedRateValue = (float)$rateValue;[m
+[32m+[m[32m}[m
+ $senderName = trim((string)($data['sender_name'] ?? ''));[m
+ $receiverName = trim((string)($data['receiver_name'] ?? ''));[m
+ $receiverPhone = trim((string)($data['receiver_phone'] ?? ''));[m
+[31m-$amountToman = (float)($data['amount_toman'] ?? 0);[m
+[31m-$amountAfghani = (float)($data['amount_afn'] ?? 0);[m
+[32m+[m[32m$amountTomanRaw = trim((string)($data['amount_toman'] ?? '0'));[m
+[32m+[m[32m$amountAfghaniRaw = trim((string)($data['amount_afn'] ?? '0'));[m
+[32m+[m[32m$amountToman = is_numeric($amountTomanRaw) ? (float)$amountTomanRaw : 0.0;[m
+[32m+[m[32m$amountAfghani = is_numeric($amountAfghaniRaw) ? (float)$amountAfghaniRaw : 0.0;[m
+ [m
+ if ($userId <= 0) {[m
+     json_response(['success' => false, 'message' => 'شناسه کاربر نامعتبر است.'], 400);[m
+ }[m
+ [m
+[31m-if ($amountToman <= 0 || $amountAfghani <= 0) {[m
+[32m+[m[32mif (!is_finite($amountToman) || !is_finite($amountAfghani) || $amountToman <= 0 || $amountAfghani <= 0) {[m
+     json_response(['success' => false, 'message' => 'مبلغ حواله معتبر نیست.'], 400);[m
+ }[m
+ [m
+[36m@@ -112,10 +122,13 @@[m [mif ($rateColumn !== null) {[m
+         $activeRateStmt->execute([$requestedRateId]);[m
+         $activeRateRow = $activeRateStmt->fetch();[m
+         if (!$activeRateRow) {[m
+[32m+[m[32m            $latestRateStmt = db()->query("SELECT id, `{$rateColumn}` AS toman_per_afn FROM exchange_rates WHERE is_active = 1 ORDER BY id DESC LIMIT 1");[m
+[32m+[m[32m            $latestActiveRate = $latestRateStmt ? ($latestRateStmt->fetch(PDO::FETCH_ASSOC) ?: null) : null;[m
+             json_response([[m
+                 'success' => false,[m
+                 'code' => 'EXCHANGE_RATE_CHANGED',[m
+                 'message' => 'The exchange rate changed. Please reload the remittance form.',[m
+[32m+[m[32m                'data' => ['active_rate' => $latestActiveRate],[m
+             ], 409);[m
+         }[m
+     } else {[m
+[36m@@ -124,7 +137,7 @@[m [mif ($rateColumn !== null) {[m
+     }[m
+ }[m
+ $activeRate = $activeRateRow ? (float)($activeRateRow['toman_per_afn'] ?? 0) : 0.0;[m
+[31m-if ($activeRate <= 0) {[m
+[32m+[m[32mif (!is_finite($activeRate) || $activeRate <= 0) {[m
+     json_response([[m
+         'success' => false,[m
+         'code' => 'FIXED_RATE_UNAVAILABLE',[m
+[36m@@ -132,12 +145,33 @@[m [mif ($activeRate <= 0) {[m
+     ], 422);[m
+ }[m
+ [m
+[32m+[m[32mif ($requestedRateValue !== null) {[m
+[32m+[m[32m    $rateValueTolerance = max(0.00000001, abs($activeRate) * 0.0000000001);[m
+[32m+[m[32m    if (abs($requestedRateValue - $activeRate) > $rateValueTolerance) {[m
+[32m+[m[32m        json_response([[m
+[32m+[m[32m            'success' => false,[m
+[32m+[m[32m            'code' => 'EXCHANGE_RATE_CHANGED',[m
+[32m+[m[32m            'message' => 'The exchange rate changed. Please reload the remittance form.',[m
+[32m+[m[32m            'data' => [[m
+[32m+[m[32m                'active_rate' => [[m
+[32m+[m[32m                    'id' => (int)($activeRateRow['id'] ?? 0),[m
+[32m+[m[32m                    'toman_per_afn' => $activeRate,[m
+[32m+[m[32m                ],[m
+[32m+[m[32m            ],[m
+[32m+[m[32m        ], 409);[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+ $expectedAfghani = $amountToman / $activeRate;[m
+ $expectedAfghaniCents = (int)round($expectedAfghani * 100, 0, PHP_ROUND_HALF_UP);[m
+ $clientAfghaniCents = (int)round($amountAfghani * 100, 0, PHP_ROUND_HALF_UP);[m
+ $expectedAfghaniRounded = $expectedAfghaniCents / 100;[m
+ [m
+[31m-if (abs($clientAfghaniCents - $expectedAfghaniCents) > (int)round(REMITTANCE_AFN_TOLERANCE * 100)) {[m
+[32m+[m[32m// Both values are rounded to cents before comparison. This mirrors the[m
+[32m+[m[32m// frontend's two-decimal AFN amount and avoids binary float noise while[m
+[32m+[m[32m// retaining the established five-paisa tolerance.[m
+[32m+[m[32m$toleranceCents = (int)round(REMITTANCE_AFN_TOLERANCE * 100, 0, PHP_ROUND_HALF_UP);[m
+[32m+[m[32mif (abs($clientAfghaniCents - $expectedAfghaniCents) > $toleranceCents) {[m
+     json_response([[m
+         'success' => false,[m
+         'code' => 'INVALID_CONVERTED_AMOUNT',[m
+[1mdiff --git a/app/add-remittance.tsx b/app/add-remittance.tsx[m
+[1mindex 7b9c5010..8e471fe7 100644[m
+[1m--- a/app/add-remittance.tsx[m
+[1m+++ b/app/add-remittance.tsx[m
+[36m@@ -1,11 +1,11 @@[m
+ import { Ionicons } from '@expo/vector-icons';[m
+ import * as Clipboard from 'expo-clipboard';[m
+[31m-import { Picker } from '@react-native-picker/picker';[m
+ import * as Print from 'expo-print';[m
+ import { Stack, useRouter } from 'expo-router';[m
+ import * as Sharing from 'expo-sharing';[m
+ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';[m
+ import {[m
+[32m+[m[32m  Alert,[m
+   ActivityIndicator,[m
+   KeyboardAvoidingView,[m
+   Linking,[m
+[36m@@ -19,6 +19,7 @@[m [mimport {[m
+   ScrollView,[m
+ } from 'react-native';[m
+ import { SafeAreaView } from 'react-native-safe-area-context';[m
+[32m+[m
+ import { useAuth } from '@/lib/auth-context';[m
+ import { apiUrl } from '@/lib/api';[m
+ import { showError, showSuccess } from '@/lib/toast';[m
+[36m@@ -31,14 +32,30 @@[m [mimport { buildVariableRateWhatsAppUrl } from '@/lib/remittance-currency-flow';[m
+ import { moneyInputWords, normalizeMoneyInput } from '@/lib/money-input';[m
+ import { useMoneyInput } from '@/hooks/use-money-input';[m
+ [m
+[31m-type Agency = { id: string | number; name: string; address?: string; };[m
+[32m+[m[32mtype Agency = {[m
+[32m+[m[32m  id: string | number;[m
+[32m+[m[32m  name: string;[m
+[32m+[m[32m  address?: string;[m
+[32m+[m[32m  phone?: string;[m
+[32m+[m[32m};[m
+[32m+[m
+[32m+[m[32mtype AgenciesResponse = {[m
+[32m+[m[32m  success: boolean;[m
+[32m+[m[32m  data?: Agency[];[m
+[32m+[m[32m  rows?: Agency[];[m
+[32m+[m[32m  code?: string;[m
+[32m+[m[32m  message?: string;[m
+[32m+[m[32m};[m
+ [m
+ type DestinationCountryGroup = {[m
+   group: 'requested' | 'europe' | 'arab';[m
+   countries: Array<{ code: string; name: string; destination_currencies: CurrencyOption[] }>;[m
+ };[m
+ [m
+[31m-type CurrencyOption = { code: string; name: string; };[m
+[32m+[m[32mtype CurrencyOption = {[m
+[32m+[m[32m  code: string;[m
+[32m+[m[32m  name: string;[m
+[32m+[m[32m};[m
+ [m
+ type RemittanceMetadata = {[m
+   groups: DestinationCountryGroup[];[m
+[36m@@ -51,8 +68,6 @@[m [mtype ExchangeRate = {[m
+   id: string | number;[m
+   toman_per_afn: string | number;[m
+   effective_date?: string;[m
+[31m-  is_active?: number | boolean | string;[m
+[31m-  active?: number | boolean | string;[m
+ };[m
+ [m
+ type FeePreview = {[m
+[36m@@ -65,7 +80,7 @@[m [mtype FeePreview = {[m
+ [m
+ const toPersianNum = (num: string | number) => {[m
+   if (!num && num !== 0) return '۰';[m
+[31m-  const farsiDigits = ['۰','۱','۲','۳','۴','۵','۶','۷','۸','۹'];[m
+[32m+[m[32m  const farsiDigits = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹'];[m
+   return num.toString().replace(/\d/g, (x) => farsiDigits[parseInt(x)]);[m
+ };[m
+ [m
+[36m@@ -77,47 +92,72 @@[m [mconst formatReceiptDate = (value: string) => {[m
+   }).format(date);[m
+ };[m
+ [m
+[31m-const parseRate = (value: string | number): number =>[m
+[31m-  Number(String(value ?? '').replace(/[,\s\u066C]/g, ''));[m
+[32m+[m[32mtype SelectorKey = 'source' | 'country' | 'destinationCurrency' | 'agency';[m
+[32m+[m[32mtype SelectorOption = { value: string; label: string };[m
+[32m+[m[32mconst isRecord = (value: unknown): value is Record<string, unknown> =>[m
+[32m+[m[32m  value !== null && typeof value === 'object' && !Array.isArray(value);[m
+ [m
+ const calculateAfghaniAmount = (amountToman: string | number, tomanPerAfghani: string | number) => {[m
+   const normalizedToman = normalizeMoneyInput(amountToman);[m
+[31m-  const rate = parseRate(tomanPerAfghani);[m
+[32m+[m[32m  const rate = Number(tomanPerAfghani);[m
+   if (!normalizedToman || !Number.isFinite(rate) || rate <= 0) return '';[m
+   const calculated = Number(normalizedToman) / rate;[m
+   return Number.isFinite(calculated) ? calculated.toFixed(2) : '';[m
+ };[m
+ [m
+[31m-const isRateActive = (rate: any) => {[m
+[31m-  const flag = rate?.is_active ?? rate?.active;[m
+[31m-  return flag === undefined || flag === null || flag === 1 || flag === true || String(flag) === '1' || String(flag).toLowerCase() === 'active';[m
+[32m+[m[32mconst normalizeCurrencyOptions = (value: unknown): CurrencyOption[] => {[m
+[32m+[m[32m  if (!Array.isArray(value)) return [];[m
+[32m+[m[32m  return value.filter((item): item is CurrencyOption =>[m
+[32m+[m[32m    isRecord(item)[m
+[32m+[m[32m    && typeof item.code === 'string' && item.code.trim() !== ''[m
+[32m+[m[32m    && typeof item.name === 'string'[m
+[32m+[m[32m  ).map((item) => ({ code: item.code.trim(), name: item.name.trim() }));[m
+ };[m
+ [m
+[31m-const pickLatestActiveRate = (rates: ExchangeRate[]) =>[m
+[31m-  (rates || []).filter(isRateActive).sort((a, b) => Number(b.id) - Number(a.id))[0] ?? rates[0] ?? null;[m
+[32m+[m[32mconst normalizeDestinationGroups = (value: unknown): DestinationCountryGroup[] => {[m
+[32m+[m[32m  if (!Array.isArray(value)) return [];[m
+[32m+[m[32m  return value.filter(isRecord).map((group) => {[m
+[32m+[m[32m    const rawGroup = group.group;[m
+[32m+[m[32m    const groupName: DestinationCountryGroup['group'] = rawGroup === 'europe'[m
+[32m+[m[32m      ? 'europe'[m
+[32m+[m[32m      : rawGroup === 'arab'[m
+[32m+[m[32m        ? 'arab'[m
+[32m+[m[32m        : 'requested';[m
+[32m+[m[32m    const rawCountries = Array.isArray(group.countries) ? group.countries : [];[m
+[32m+[m[32m    const countries = rawCountries.filter((country: unknown): country is Record<string, unknown> =>[m
+[32m+[m[32m      isRecord(country)[m
+[32m+[m[32m      && typeof country.code === 'string' && country.code.trim() !== ''[m
+[32m+[m[32m      && typeof country.name === 'string'[m
+[32m+[m[32m    ).map((country) => ({[m
+[32m+[m[32m      code: (country.code as string).trim(),[m
+[32m+[m[32m      name: (country.name as string).trim(),[m
+[32m+[m[32m      destination_currencies: normalizeCurrencyOptions(country.destination_currencies),[m
+[32m+[m[32m    }));[m
+[32m+[m[32m    return { group: groupName, countries };[m
+[32m+[m[32m  }).filter((group) => group.countries.length > 0);[m
+[32m+[m[32m};[m
+ [m
+ export default function AddRemittanceScreen() {[m
+   const router = useRouter();[m
+   const { userId, userToken, userName, userMobile, isInitialized, setUserBalance } = useAuth();[m
+[31m-  [m
+[32m+[m
+   const [agencies, setAgencies] = useState<Agency[]>([]);[m
+   const [destinationCountryGroups, setDestinationCountryGroups] = useState<DestinationCountryGroup[]>([]);[m
+   const [sourceCurrencies, setSourceCurrencies] = useState<CurrencyOption[]>([{ code: 'IRT', name: 'تومان' }]);[m
+   const [destinationCurrencies, setDestinationCurrencies] = useState<CurrencyOption[]>([]);[m
+   const [fixedRatePairs, setFixedRatePairs] = useState<RemittanceMetadata['fixed_rate_pairs']>([]);[m
+[31m-  [m
+   const [selectedSourceCurrency, setSelectedSourceCurrency] = useState('IRT');[m
+   const [selectedDestinationCountry, setSelectedDestinationCountry] = useState('');[m
+   const [selectedDestinationCurrency, setSelectedDestinationCurrency] = useState('AFN');[m
+   const [exchangeRates, setExchangeRates] = useState<ExchangeRate[]>([]);[m
+   const [selectedAgencyId, setSelectedAgencyId] = useState<string | null>(null);[m
+   const [selectedRateId, setSelectedRateId] = useState<number | null>(null);[m
+[32m+[m[32m  const [activeSelector, setActiveSelector] = useState<SelectorKey | null>(null);[m
+ [m
+   const amountTomanInput = useMoneyInput();[m
+   const amountToman = amountTomanInput.value;[m
+   const setAmountToman = amountTomanInput.setFormattedValue;[m
+   const [amountAfghani, setAmountAfghani] = useState('');[m
+[31m-  [m
+   const [senderName, setSenderName] = useState('');[m
+   const [receiverName, setReceiverName] = useState('');[m
+   const [receiverPhone, setReceiverPhone] = useState('');[m
+[36m@@ -125,9 +165,8 @@[m [mexport default function AddRemittanceScreen() {[m
+   const [loading, setLoading] = useState(true);[m
+   const [submitting, setSubmitting] = useState(false);[m
+   const [error, setError] = useState<string | null>(null);[m
+[31m-[m
+   const resolvedUserId = userId?.trim() || '';[m
+[31m-  const resolvedUserToken = userToken?.trim() || '';[m
+[32m+[m[32m  const resolvedApiToken = userToken?.trim() || '';[m
+   const loadInFlight = useRef(false);[m
+   const submitInFlight = useRef(false);[m
+ [m
+[36m@@ -142,32 +181,123 @@[m [mexport default function AddRemittanceScreen() {[m
+   const [feePreview, setFeePreview] = useState<FeePreview | null>(null);[m
+ [m
+   const selectedRate = useMemo([m
+[31m-    () => exchangeRates.find((rate) => Number(rate.id) === selectedRateId) || pickLatestActiveRate(exchangeRates),[m
+[32m+[m[32m    () => exchangeRates.find((rate) => Number(rate.id) === selectedRateId) || null,[m
+     [exchangeRates, selectedRateId][m
+   );[m
+ [m
+   const selectedCountry = useMemo([m
+[31m-    () => destinationCountryGroups.flatMap((g) => g.countries).find((c) => c.code === selectedDestinationCountry) || null,[m
+[32m+[m[32m    () => destinationCountryGroups.flatMap((group) => group.countries).find((country) => country.code === selectedDestinationCountry) || null,[m
+     [destinationCountryGroups, selectedDestinationCountry][m
+   );[m
+ [m
+[31m-  const availableDestinationCurrencies = selectedCountry?.destination_currencies || destinationCurrencies;[m
+[32m+[m[32m  const availableDestinationCurrencies = selectedCountry?.destination_currencies?.length[m
+[32m+[m[32m    ? selectedCountry.destination_currencies[m
+[32m+[m[32m    : destinationCurrencies;[m
+ [m
+   const isFixedRatePair = useMemo([m
+[31m-    () => fixedRatePairs.some((pair) =>[m
+[32m+[m[32m    () => fixedRatePairs.some([m
+[32m+[m[32m      (pair) =>[m
+         pair.source_currency === selectedSourceCurrency[m
+         && pair.destination_currency === selectedDestinationCurrency[m
+[31m-        && pair.country_code === selectedDestinationCountry),[m
+[32m+[m[32m        && pair.country_code === selectedDestinationCountry[m
+[32m+[m[32m    ),[m
+     [fixedRatePairs, selectedDestinationCountry, selectedDestinationCurrency, selectedSourceCurrency][m
+   );[m
+ [m
+[31m-  const selectedSourceCurrencyName = sourceCurrencies.find((c) => c.code === selectedSourceCurrency)?.name || selectedSourceCurrency;[m
+[31m-  const selectedDestinationCurrencyName = availableDestinationCurrencies.find((c) => c.code === selectedDestinationCurrency)?.name || selectedDestinationCurrency;[m
+[32m+[m[32m  const selectedSourceCurrencyName = sourceCurrencies.find((currency) => currency.code === selectedSourceCurrency)?.name || selectedSourceCurrency;[m
+[32m+[m[32m  const selectedDestinationCurrencyName = availableDestinationCurrencies.find((currency) => currency.code === selectedDestinationCurrency)?.name || selectedDestinationCurrency;[m
+[32m+[m
+[32m+[m[32m  const countries = useMemo([m
+[32m+[m[32m    () => destinationCountryGroups.flatMap((group) => group.countries),[m
+[32m+[m[32m    [destinationCountryGroups][m
+[32m+[m[32m  );[m
+[32m+[m[32m  const selectorOptions = useMemo<SelectorOption[]>(() => {[m
+[32m+[m[32m    switch (activeSelector) {[m
+[32m+[m[32m      case 'source':[m
+[32m+[m[32m        return sourceCurrencies.map((currency) => ({ value: currency.code, label: currency.name + ' (' + currency.code + ')' }));[m
+[32m+[m[32m      case 'country':[m
+[32m+[m[32m        return destinationCountryGroups.flatMap((group) => group.countries.map((country) => ({[m
+[32m+[m[32m          value: country.code,[m
+[32m+[m[32m          label: (group.group === 'europe' ? 'اروپا' : group.group === 'arab' ? 'کشورهای عربی' : 'مقصدهای درخواستی') + ' — ' + country.name,[m
+[32m+[m[32m        })));[m
+[32m+[m[32m      case 'destinationCurrency':[m
+[32m+[m[32m        return availableDestinationCurrencies.map((currency) => ({ value: currency.code, label: currency.name + ' (' + currency.code + ')' }));[m
+[32m+[m[32m      case 'agency':[m
+[32m+[m[32m        return agencies.map((agency) => ({ value: String(agency.id), label: agency.name }));[m
+[32m+[m[32m      default:[m
+[32m+[m[32m        return [];[m
+[32m+[m[32m    }[m
+[32m+[m[32m  }, [activeSelector, agencies, availableDestinationCurrencies, destinationCountryGroups, sourceCurrencies]);[m
+[32m+[m
+[32m+[m[32m  const selectorTitle = activeSelector === 'source'[m
+[32m+[m[32m    ? 'انتخاب ارز مبدا'[m
+[32m+[m[32m    : activeSelector === 'country'[m
+[32m+[m[32m      ? 'انتخاب کشور مقصد'[m
+[32m+[m[32m      : activeSelector === 'destinationCurrency'[m
+[32m+[m[32m        ? 'انتخاب ارز مقصد'[m
+[32m+[m[32m        : 'انتخاب نمایندگی مقصد';[m
+[32m+[m[32m  const selectedSelectorValue = activeSelector === 'source'[m
+[32m+[m[32m    ? selectedSourceCurrency[m
+[32m+[m[32m    : activeSelector === 'country'[m
+[32m+[m[32m      ? selectedDestinationCountry[m
+[32m+[m[32m      : activeSelector === 'destinationCurrency'[m
+[32m+[m[32m        ? selectedDestinationCurrency[m
+[32m+[m[32m        : selectedAgencyId ?? '';[m
+[32m+[m
+[32m+[m[32m  const handleSelectorChoice = (value: string) => {[m
+[32m+[m[32m    switch (activeSelector) {[m
+[32m+[m[32m      case 'source':[m
+[32m+[m[32m        setSelectedSourceCurrency(value);[m
+[32m+[m[32m        break;[m
+[32m+[m[32m      case 'country': {[m
+[32m+[m[32m        setSelectedDestinationCountry(value);[m
+[32m+[m[32m        const country = countries.find((item) => item.code === value);[m
+[32m+[m[32m        const allowedCurrencies = country?.destination_currencies.length[m
+[32m+[m[32m          ? country.destination_currencies[m
+[32m+[m[32m          : destinationCurrencies;[m
+[32m+[m[32m        if (!allowedCurrencies.some((currency) => currency.code === selectedDestinationCurrency)) {[m
+[32m+[m[32m          setSelectedDestinationCurrency(allowedCurrencies[0]?.code || 'USD');[m
+[32m+[m[32m        }[m
+[32m+[m[32m        break;[m
+[32m+[m[32m      }[m
+[32m+[m[32m      case 'destinationCurrency':[m
+[32m+[m[32m        setSelectedDestinationCurrency(value);[m
+[32m+[m[32m        break;[m
+[32m+[m[32m      case 'agency':[m
+[32m+[m[32m        setSelectedAgencyId(value);[m
+[32m+[m[32m        break;[m
+[32m+[m[32m      default:[m
+[32m+[m[32m        break;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    setActiveSelector(null);[m
+[32m+[m[32m  };[m
+[32m+[m
+[32m+[m[32m  const renderSelectorButton = (value: string, placeholder: string, selector: SelectorKey) => ([m
+[32m+[m[32m    <TouchableOpacity[m
+[32m+[m[32m      style={styles.selectorButton}[m
+[32m+[m[32m      onPress={() => setActiveSelector(selector)}[m
+[32m+[m[32m      accessibilityRole="button"[m
+[32m+[m[32m      accessibilityLabel={value || placeholder}>[m
+[32m+[m[32m      <Ionicons name="chevron-down" size={18} color={appColors.textSecondary} />[m
+[32m+[m[32m      <Text style={[styles.selectorButtonText, !value && styles.selectorPlaceholder]} numberOfLines={1}>[m
+[32m+[m[32m        {value || placeholder}[m
+[32m+[m[32m      </Text>[m
+[32m+[m[32m    </TouchableOpacity>[m
+[32m+[m[32m  );[m
+ [m
+   const handleOpenVariableRateWhatsApp = async () => {[m
+[31m-    if (!selectedCountry) { showError('خطا', 'لطفاً کشور مقصد را انتخاب کنید.'); return; }[m
+[32m+[m[32m    if (!selectedCountry || !selectedSourceCurrency || !selectedDestinationCurrency[m
+[32m+[m[32m      || !sourceCurrencies.some((currency) => currency.code === selectedSourceCurrency)[m
+[32m+[m[32m      || !availableDestinationCurrencies.some((currency) => currency.code === selectedDestinationCurrency)) {[m
+[32m+[m[32m      Alert.alert('انتخاب مقصد', 'لطفاً کشور مقصد، ارز مبدا و ارز مقصد را انتخاب کنید.');[m
+[32m+[m[32m      return;[m
+[32m+[m[32m    }[m
+     try {[m
+[31m-      await Linking.openURL(buildVariableRateWhatsAppUrl(selectedCountry.name, selectedSourceCurrencyName, selectedDestinationCurrencyName));[m
+[32m+[m[32m      await Linking.openURL(buildVariableRateWhatsAppUrl([m
+[32m+[m[32m        selectedCountry.name || selectedDestinationCountry,[m
+[32m+[m[32m        selectedSourceCurrencyName || selectedSourceCurrency,[m
+[32m+[m[32m        selectedDestinationCurrencyName || selectedDestinationCurrency,[m
+[32m+[m[32m      ));[m
+     } catch {[m
+       showError('خطا', 'امکان باز کردن واتساپ وجود ندارد.');[m
+     }[m
+[36m@@ -180,55 +310,155 @@[m [mexport default function AddRemittanceScreen() {[m
+     setReceiverPhone('');[m
+   };[m
+ [m
+[32m+[m
+   useEffect(() => {[m
+     const fallbackName = userName?.trim() || userMobile?.trim() || '';[m
+     setSenderName(fallbackName);[m
+   }, [userName, userMobile]);[m
+ [m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+   const fetchData = useCallback(async () => {[m
+     if (!isInitialized || loadInFlight.current) return;[m
+     loadInFlight.current = true;[m
+     setLoading(true);[m
+     setError(null);[m
+[32m+[m
+[32m+[m[32m    // هلپر اختصاصی برای ارسال هدرهای ضد کش و ثبت دقیق وضعیت در APK[m
+[32m+[m[32m    const safeFetch = async (endpoint: string) => {[m
+[32m+[m[32m      const url = apiUrl(endpoint);[m
+[32m+[m[32m      try {[m
+[32m+[m[32m        const res = await fetch(url, {[m
+[32m+[m[32m          method: 'GET',[m
+[32m+[m[32m          headers: {[m
+[32m+[m[32m            'Accept': 'application/json',[m
+[32m+[m[32m            'Cache-Control': 'no-cache, no-store, must-revalidate',[m
+[32m+[m[32m            'Pragma': 'no-cache',[m
+[32m+[m[32m          },[m
+[32m+[m[32m        });[m
+[32m+[m[32m        const rawText = await res.text();[m
+[32m+[m[32m        if (__DEV__) console.log(`[AFARIEX-DEBUG] Endpoint: ${endpoint} | Status: ${res.status}`);[m
+[32m+[m
+[32m+[m[32m        let parsed = null;[m
+[32m+[m[32m        try {[m
+[32m+[m[32m          parsed = JSON.parse(rawText || '{}');[m
+[32m+[m[32m        } catch (jsonErr) {[m
+[32m+[m[32m          if (__DEV__) console.warn(`[AFARIEX-DEBUG] Invalid JSON from ${endpoint}:`, rawText.slice(0, 200));[m
+[32m+[m[32m        }[m
+[32m+[m
+[32m+[m[32m        return {[m
+[32m+[m[32m          ok: res.ok,[m
+[32m+[m[32m          status: res.status,[m
+[32m+[m[32m          contentType: res.headers.get('content-type') || '',[m
+[32m+[m[32m          data: parsed,[m
+[32m+[m[32m          raw: rawText,[m
+[32m+[m[32m        };[m
+[32m+[m[32m      } catch (netErr: any) {[m
+[32m+[m[32m        if (__DEV__) console.error(`[AFARIEX-DEBUG] Network error on ${endpoint}:`, netErr?.message || netErr);[m
+[32m+[m[32m        return { ok: false, status: 0, contentType: '', data: null, raw: '' };[m
+[32m+[m[32m      }[m
+[32m+[m[32m    };[m
+[32m+[m
+     try {[m
+[31m-      const [agenciesResRaw, ratesResRaw, countriesResRaw] = await Promise.all([[m
+[31m-        fetch(apiUrl('get_agencies.php')),[m
+[31m-        fetch(apiUrl('get_exchange_rates.php')),[m
+[31m-        fetch(apiUrl('get_remittance_destinations.php')),[m
+[32m+[m[32m      const [agenciesResult, ratesResult, countriesResult] = await Promise.all([[m
+[32m+[m[32m        safeFetch('get_agencies.php'),[m
+[32m+[m[32m        safeFetch('get_exchange_rates.php'),[m
+[32m+[m[32m        safeFetch('get_remittance_destinations.php'),[m
+       ]);[m
+ [m
+[31m-      const agenciesRes = JSON.parse((await agenciesResRaw.text()) || '{}');[m
+[31m-      const ratesRes = JSON.parse((await ratesResRaw.text()) || '{}');[m
+[31m-      const countriesRes = JSON.parse((await countriesResRaw.text()) || '{}');[m
+[32m+[m[32m      const agenciesRes = agenciesResult.data as AgenciesResponse | null;[m
+[32m+[m[32m      const ratesRes = ratesResult.data;[m
+[32m+[m[32m      const countriesRes = countriesResult.data;[m
+ [m
+       const agenciesList = agenciesRes?.data ?? agenciesRes?.rows ?? [];[m
+       const ratesList = ratesRes?.data ?? ratesRes?.rows ?? [];[m
+ [m
+[31m-      if (agenciesRes?.success && Array.isArray(agenciesList)) {[m
+[31m-        setAgencies(agenciesList);[m
+[31m-        if (agenciesList.length > 0) setSelectedAgencyId(String(agenciesList[0].id));[m
+[32m+[m[32m      if (__DEV__) {[m
+[32m+[m[32m        console.log('[AFARIEX-DEBUG] Agencies response', {[m
+[32m+[m[32m          endpoint: apiUrl('get_agencies.php'),[m
+[32m+[m[32m          httpStatus: agenciesResult.status,[m
+[32m+[m[32m          requestSucceeded: agenciesResult.ok,[m
+[32m+[m[32m          contentType: agenciesResult.contentType,[m
+[32m+[m[32m          success: agenciesRes?.success ?? null,[m
+[32m+[m[32m          responseCode: agenciesRes?.code ?? null,[m
+[32m+[m[32m          dataType: Array.isArray(agenciesList) ? 'array' : typeof agenciesList,[m
+[32m+[m[32m          agencyCount: Array.isArray(agenciesList) ? agenciesList.length : null,[m
+[32m+[m[32m          firstAgencyKeys: Array.isArray(agenciesList) && agenciesList[0] && typeof agenciesList[0] === 'object'[m
+[32m+[m[32m            ? Object.keys(agenciesList[0])[m
+[32m+[m[32m            : [],[m
+[32m+[m[32m        });[m
+[32m+[m[32m      }[m
+[32m+[m
+[32m+[m[32m      if (agenciesResult.ok && agenciesRes?.success && Array.isArray(agenciesList)) {[m
+[32m+[m[32m        const validAgencies = agenciesList.filter((agency): agency is Agency =>[m
+[32m+[m[32m          agency !== null[m
+[32m+[m[32m          && typeof agency === 'object'[m
+[32m+[m[32m          && (typeof agency.id === 'string' || typeof agency.id === 'number')[m
+[32m+[m[32m          && typeof agency.name === 'string'[m
+[32m+[m[32m          && agency.name.trim() !== ''[m
+[32m+[m[32m        );[m
+[32m+[m[32m        setAgencies(validAgencies);[m
+[32m+[m[32m        if (validAgencies.length > 0) {[m
+[32m+[m[32m          setSelectedAgencyId(String(validAgencies[0].id));[m
+[32m+[m[32m        } else {[m
+[32m+[m[32m          if (__DEV__) console.warn('[AFARIEX-DEBUG] Agencies endpoint returned an empty list.');[m
+[32m+[m[32m          setError('در حال حاضر نمایندگی‌ای برای انتخاب ثبت نشده است.');[m
+[32m+[m[32m        }[m
+       } else {[m
+[31m-        setError('خطا در دریافت لیست نمایندگی‌ها');[m
+[32m+[m[32m        if (__DEV__) console.warn('[AFARIEX-DEBUG] Agencies payload could not be used', {[m
+[32m+[m[32m          httpStatus: agenciesResult.status,[m
+[32m+[m[32m          response: agenciesResult.raw.slice(0, 300),[m
+[32m+[m[32m        });[m
+[32m+[m[32m        setError('دریافت لیست نمایندگی‌ها ناموفق بود. اتصال سرور یا پاسخ API را بررسی کنید.');[m
+       }[m
+ [m
+       if (ratesRes?.success && Array.isArray(ratesList)) {[m
+[31m-        setExchangeRates(ratesList);[m
+[31m-        const latestActive = pickLatestActiveRate(ratesList);[m
+[31m-        if (latestActive) setSelectedRateId(Number(latestActive.id));[m
+[32m+[m[32m        const validRates = ratesList.filter((rate: unknown): rate is ExchangeRate =>[m
+[32m+[m[32m          isRecord(rate)[m
+[32m+[m[32m          && (typeof rate.id === 'string' || typeof rate.id === 'number')[m
+[32m+[m[32m          && Number.isInteger(Number(rate.id))[m
+[32m+[m[32m          && Number(rate.id) > 0[m
+[32m+[m[32m          && (typeof rate.toman_per_afn === 'string' || typeof rate.toman_per_afn === 'number')[m
+[32m+[m[32m          && Number.isFinite(Number(rate.toman_per_afn))[m
+[32m+[m[32m          && Number(rate.toman_per_afn) > 0[m
+[32m+[m[32m        );[m
+[32m+[m[32m        setExchangeRates(validRates);[m
+[32m+[m[32m        if (validRates.length > 0) setSelectedRateId(Number(validRates[0].id));[m
+       } else {[m
+         setError('خطا در دریافت نرخ ارز');[m
+       }[m
+ [m
+       const metadata = countriesRes?.data;[m
+       if (countriesRes?.success && Array.isArray(metadata?.groups)) {[m
+[31m-        setDestinationCountryGroups(metadata.groups);[m
+[31m-        setSourceCurrencies(metadata.source_currencies || [{ code: 'IRT', name: 'تومان' }]);[m
+[31m-        setDestinationCurrencies(metadata.destination_currencies || []);[m
+[31m-        setFixedRatePairs(metadata.fixed_rate_pairs || []);[m
+[32m+[m[32m        const normalizedGroups = normalizeDestinationGroups(metadata.groups);[m
+[32m+[m[32m        const normalizedDestinationCurrencies = normalizeCurrencyOptions(metadata.destination_currencies);[m
+[32m+[m[32m        const normalizedSourceCurrencies = normalizeCurrencyOptions(metadata.source_currencies);[m
+[32m+[m[32m        setDestinationCountryGroups(normalizedGroups);[m
+[32m+[m[32m        setSourceCurrencies(normalizedSourceCurrencies.length ? normalizedSourceCurrencies : [{ code: 'IRT', name: 'تومان' }]);[m
+[32m+[m[32m        setDestinationCurrencies(normalizedDestinationCurrencies);[m
+[32m+[m[32m        setFixedRatePairs(Array.isArray(metadata.fixed_rate_pairs)[m
+[32m+[m[32m          ? metadata.fixed_rate_pairs.filter((pair: unknown) =>[m
+[32m+[m[32m            isRecord(pair)[m
+[32m+[m[32m            && typeof pair.source_currency === 'string'[m
+[32m+[m[32m            && typeof pair.destination_currency === 'string'[m
+[32m+[m[32m            && typeof pair.country_code === 'string'[m
+[32m+[m[32m          )[m
+[32m+[m[32m          : []);[m
+[32m+[m[32m        if (normalizedGroups.length === 0) setError('فهرست کشورهای مقصد در دسترس نیست.');[m
+       } else {[m
+[32m+[m[32m        // لاگ کمکی برای این که دقیقاً ببینید سرور به APK چه جوابی داده است[m
+[32m+[m[32m        if (__DEV__) console.warn('[AFARIEX-DEBUG] Destinations payload mismatch:', countriesResult.raw.slice(0, 300));[m
+         setError('خطا در دریافت فهرست کشورهای مقصد');[m
+       }[m
+     } catch (err) {[m
+[32m+[m[32m      if (__DEV__) console.error('[AFARIEX-DEBUG] Unhandled error in fetchData:', err);[m
+       setError('خطا در ارتباط با سرور. لطفاً اینترنت خود را بررسی کنید.');[m
+     } finally {[m
+       setLoading(false);[m
+[36m@@ -236,40 +466,57 @@[m [mexport default function AddRemittanceScreen() {[m
+     }[m
+   }, [isInitialized]);[m
+ [m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+   useEffect(() => {[m
+     if (isInitialized) void fetchData();[m
+   }, [fetchData, isInitialized]);[m
+ [m
+[32m+[m[32m  useEffect(() => {[m
+[32m+[m[32m    if (sourceCurrencies.length && !sourceCurrencies.some((currency) => currency.code === selectedSourceCurrency)) {[m
+[32m+[m[32m      setSelectedSourceCurrency(sourceCurrencies[0].code);[m
+[32m+[m[32m    }[m
+[32m+[m[32m  }, [selectedSourceCurrency, sourceCurrencies]);[m
+[32m+[m
+   useEffect(() => {[m
+     if (!selectedDestinationCountry) return;[m
+[31m-    const country = destinationCountryGroups.flatMap((g) => g.countries).find((i) => i.code === selectedDestinationCountry);[m
+[31m-    if (!country) return;[m
+[31m-    const allowed = country.destination_currencies.map((c) => c.code);[m
+[32m+[m[32m    const country = countries.find((item) => item.code === selectedDestinationCountry);[m
+[32m+[m[32m    const allowedCurrencies = country?.destination_currencies?.length[m
+[32m+[m[32m      ? country.destination_currencies[m
+[32m+[m[32m      : destinationCurrencies;[m
+[32m+[m[32m    const allowed = allowedCurrencies.map((currency) => currency.code);[m
+     if (!allowed.includes(selectedDestinationCurrency)) {[m
+       setSelectedDestinationCurrency(allowed[0] || 'USD');[m
+     }[m
+[31m-  }, [destinationCountryGroups, selectedDestinationCountry, selectedDestinationCurrency]);[m
+[32m+[m[32m  }, [countries, destinationCurrencies, selectedDestinationCountry, selectedDestinationCurrency]);[m
+ [m
+   useEffect(() => {[m
+[31m-    const cleanAmountToman = normalizeMoneyInput(amountToman);[m
+[31m-    if (!cleanAmountToman || !selectedRate || !isFixedRatePair) {[m
+[32m+[m[32m    if (!selectedRate || !isFixedRatePair) {[m
+       setAmountAfghani('');[m
+       return;[m
+     }[m
+[31m-    const calculated = calculateAfghaniAmount(cleanAmountToman, selectedRate.toman_per_afn);[m
+[31m-    setAmountAfghani(calculated);[m
+[32m+[m[32m    setAmountAfghani(calculateAfghaniAmount(amountToman, selectedRate.toman_per_afn));[m
+   }, [amountToman, isFixedRatePair, selectedRate]);[m
+ [m
+   useEffect(() => {[m
+     const amount = Number(normalizeMoneyInput(amountToman));[m
+[31m-    if (!resolvedUserToken || !Number.isFinite(amount) || amount <= 0) {[m
+[32m+[m[32m    if (!isFixedRatePair || !resolvedApiToken || !Number.isFinite(amount) || amount <= 0) {[m
+       setFeePreview(null);[m
+       return;[m
+     }[m
+     const timer = setTimeout(async () => {[m
+       try {[m
+         const payload = new URLSearchParams({[m
+[31m-          api_token: resolvedUserToken,[m
+[32m+[m[32m          api_token: resolvedApiToken,[m
+           service_code: 'remittance',[m
+           amount: String(Math.round(amount)),[m
+         });[m
+[36m@@ -294,7 +541,7 @@[m [mexport default function AddRemittanceScreen() {[m
+       }[m
+     }, 350);[m
+     return () => clearTimeout(timer);[m
+[31m-  }, [amountToman, resolvedUserToken]);[m
+[32m+[m[32m  }, [amountToman, isFixedRatePair, resolvedApiToken]);[m
+ [m
+   const handleDownloadPdf = async () => {[m
+     if (!completedReceipt || receiptBusyAction) return;[m
+[36m@@ -333,147 +580,157 @@[m [mexport default function AddRemittanceScreen() {[m
+   };[m
+ [m
+   const handleSubmit = async () => {[m
+[31m-    if (submitting || submitInFlight.current || completedRemittanceId) return;[m
+[31m-    submitInFlight.current = true;[m
+[32m+[m[32m    if (submitInFlight.current || submitting || completedRemittanceId) return;[m
+ [m
+[31m-    const selectedAgency = agencies.find((a) => String(a.id) === String(selectedAgencyId));[m
+[32m+[m[32m    const selectedAgency = agencies.find((agency) => String(agency.id) === String(selectedAgencyId));[m
+     const cleanAmountToman = normalizeMoneyInput(amountToman);[m
+ [m
+[31m-    if (!selectedAgency) { submitInFlight.current = false; return showError('خطا', 'لطفاً یک نمایندگی انتخاب کنید.'); }[m
+[31m-    if (!selectedDestinationCountry) { submitInFlight.current = false; return showError('خطا', 'لطفاً کشور مقصد را انتخاب کنید.'); }[m
+[32m+[m[32m    if (!selectedAgency) return showError('خطا', 'لطفاً یک نمایندگی انتخاب کنید.');[m
+[32m+[m[32m    if (!selectedDestinationCountry) return showError('خطا', 'لطفاً کشور مقصد را انتخاب کنید.');[m
+     if (!isFixedRatePair) {[m
+[31m-      submitInFlight.current = false;[m
+       await handleOpenVariableRateWhatsApp();[m
+       return;[m
+     }[m
+[31m-    if (!selectedRate) { submitInFlight.current = false; return showError('خطا', 'نرخ ارز معتبر یافت نشد.'); }[m
+[31m-    if (!cleanAmountToman || Number(cleanAmountToman) <= 0) { submitInFlight.current = false; return showError('خطا', 'مبلغ تومان را وارد کنید.'); }[m
+[31m-    if (!resolvedUserId) { submitInFlight.current = false; return showError('خطا', 'شناسه کاربر یافت نشد. دوباره وارد شوید.'); }[m
+[32m+[m[32m    if (!selectedRate || !Number.isFinite(Number(selectedRate.toman_per_afn)) || Number(selectedRate.toman_per_afn) <= 0) {[m
+[32m+[m[32m      return showError('خطا', 'نرخ ارز معتبر یافت نشد.');[m
+[32m+[m[32m    }[m
+[32m+[m[32m    if (!cleanAmountToman || !Number.isFinite(Number(cleanAmountToman)) || Number(cleanAmountToman) <= 0) {[m
+[32m+[m[32m      return showError('خطا', 'مبلغ تومان را وارد کنید.');[m
+[32m+[m[32m    }[m
+[32m+[m[32m    if (!resolvedUserId) return showError('خطا', 'شناسه کاربر یافت نشد. دوباره وارد شوید.');[m
+     if (!senderName.trim() || !receiverName.trim() || !receiverPhone.trim()) {[m
+[31m-      submitInFlight.current = false;[m
+       return showError('خطا', 'نام فرستنده، گیرنده و شماره تماس الزامی است.');[m
+     }[m
+ [m
+[32m+[m[32m    submitInFlight.current = true;[m
+     setSubmitting(true);[m
+     let commitReceived = false;[m
+ [m
+     try {[m
+[31m-      // تازه‌سازی نرخ پیش از ارسال جهت جلوگیری از انقضای rate_id[m
+       let submissionRate = selectedRate;[m
+[31m-      try {[m
+[31m-        const freshRes = await fetch(`${apiUrl('get_exchange_rates.php')}?cache_bust=${Date.now()}`, {[m
+[31m-          headers: { 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache' },[m
+[31m-          cache: 'no-store',[m
+[31m-        });[m
+[31m-        const freshJson: any = await freshRes.json().catch(() => null);[m
+[31m-        const freshList: any[] = freshJson?.data ?? freshJson?.rows ?? [];[m
+[31m-        if (freshRes.ok && freshJson?.success !== false && freshList.length > 0) {[m
+[31m-          setExchangeRates(freshList);[m
+[31m-          const stillChosen = freshList.find((r: any) => Number(r.id) === Number(selectedRateId) && isRateActive(r));[m
+[31m-          submissionRate = stillChosen || pickLatestActiveRate(freshList) || submissionRate;[m
+[31m-          setSelectedRateId(Number(submissionRate.id));[m
+[31m-        }[m
+[31m-      } catch {[m
+[31m-        // ادامه با نرخ موجود در صورت خطای شبکه[m
+[31m-      }[m
+[32m+[m[32m      let submittedAmountAfghani = calculateAfghaniAmount(cleanAmountToman, submissionRate.toman_per_afn);[m
+[32m+[m[32m      if (!submittedAmountAfghani) throw new Error('Could not calculate converted amount');[m
+ [m
+[31m-      const submittedAmountAfghani = calculateAfghaniAmount(cleanAmountToman, submissionRate.toman_per_afn);[m
+[31m-      if (!submittedAmountAfghani) {[m
+[31m-        setSubmitting(false);[m
+[31m-        submitInFlight.current = false;[m
+[31m-        return showError('خطا', 'محاسبه مبلغ معادل افغانی ناموفق بود.');[m
+[31m-      }[m
+[31m-[m
+[31m-      const sendRequest = async (rateIdToUse: string | number, afnAmountToUse: string) => {[m
+[32m+[m[32m      const sendRequest = async (rate: ExchangeRate, amountAfghani: string) => {[m
+         const payload = new URLSearchParams();[m
+         payload.append('user_id', resolvedUserId);[m
+[31m-        if (resolvedUserToken) payload.append('api_token', resolvedUserToken);[m
+[32m+[m[32m        if (resolvedApiToken) payload.append('api_token', resolvedApiToken);[m
+         payload.append('agency', selectedAgency.name);[m
+         payload.append('destination_country', selectedDestinationCountry);[m
+         payload.append('source_currency', selectedSourceCurrency);[m
+         payload.append('destination_currency', selectedDestinationCurrency);[m
+[31m-        payload.append('rate_id', String(rateIdToUse));[m
+[32m+[m[32m        payload.append('rate_id', String(rate.id));[m
+[32m+[m[32m        payload.append('rate_value', String(rate.toman_per_afn));[m
+         payload.append('sender_name', senderName.trim());[m
+         payload.append('receiver_name', receiverName.trim());[m
+         payload.append('receiver_phone', receiverPhone.trim());[m
+         payload.append('amount_toman', cleanAmountToman);[m
+[31m-        payload.append('amount_afn', afnAmountToUse);[m
+[32m+[m[32m        payload.append('amount_afn', amountAfghani);[m
+ [m
+[31m-        return await fetch(apiUrl('add_remittance.php'), {[m
+[32m+[m[32m        const response = await fetch(apiUrl('add_remittance.php'), {[m
+           method: 'POST',[m
+           headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },[m
+           body: payload.toString(),[m
+         });[m
+[32m+[m[32m        const responseText = await response.text();[m
+[32m+[m[32m        let result: any;[m
+[32m+[m[32m        try {[m
+[32m+[m[32m          result = responseText ? JSON.parse(responseText) : {};[m
+[32m+[m[32m        } catch {[m
+[32m+[m[32m          throw new Error('Invalid response received from the server');[m
+[32m+[m[32m        }[m
+[32m+[m[32m        return { response, result };[m
+       };[m
+ [m
+[31m-      let response = await sendRequest(submissionRate.id, submittedAmountAfghani);[m
+[31m-      let responseText = await response.text();[m
+[31m-      let result: any = {};[m
+[31m-      try {[m
+[31m-        result = responseText ? JSON.parse(responseText) : {};[m
+[31m-      } catch {[m
+[31m-        setSubmitting(false);[m
+[31m-        submitInFlight.current = false;[m
+[31m-        return showError('خطا', 'پاسخ معتبری از سرور دریافت نشد.');[m
+[31m-      }[m
+[31m-[m
+[31m-      const isRateConflict = (res: Response, body: any) => {[m
+[31m-        const code = String(body?.code ?? body?.data?.code ?? '').trim().toUpperCase();[m
+[31m-        return res.status === 409 || ['EXCHANGE_RATE_CHANGED', 'INVALID_CONVERTED_AMOUNT', 'RATE_MISMATCH'].includes(code);[m
+[32m+[m[32m      const isRateConflict = (response: Response, result: any) => {[m
+[32m+[m[32m        const code = String(result?.code ?? result?.data?.code ?? '').trim().toUpperCase();[m
+[32m+[m[32m        return response.status === 409 || code === 'EXCHANGE_RATE_CHANGED' || code === 'RATE_MISMATCH';[m
+       };[m
+ [m
+[31m-      // تلاش مجدد خودکار در صورت تغییر نرخ[m
+[32m+[m[32m      let { response, result } = await sendRequest(submissionRate, submittedAmountAfghani);[m
+       if (isRateConflict(response, result)) {[m
+[31m-        let retryOk = false;[m
+[31m-        for (let attempt = 1; attempt <= 2; attempt++) {[m
+[31m-          const latest = pickLatestActiveRate(exchangeRates);[m
+[31m-          if (!latest) break;[m
+[31m-          const retryAmount = calculateAfghaniAmount(cleanAmountToman, latest.toman_per_afn);[m
+[31m-          if (!retryAmount) break;[m
+[31m-          [m
+[31m-          submissionRate = latest;[m
+[31m-          setSelectedRateId(Number(latest.id));[m
+[31m-[m
+[31m-          response = await sendRequest(latest.id, retryAmount);[m
+[31m-          responseText = await response.text();[m
+[31m-          try { result = responseText ? JSON.parse(responseText) : {}; } catch { break; }[m
+[31m-[m
+[31m-          if (!isRateConflict(response, result)) {[m
+[31m-            retryOk = true;[m
+[31m-            break;[m
+[31m-          }[m
+[32m+[m[32m        const oldRateId = submissionRate.id;[m
+[32m+[m[32m        if (__DEV__) {[m
+[32m+[m[32m          console.info('[REMITTANCE] Exchange rate conflict; refreshing before retry', {[m
+[32m+[m[32m            oldRateId,[m
+[32m+[m[32m            serverResponse: { status: response.status, body: result },[m
+[32m+[m[32m          });[m
+[32m+[m[32m        }[m
+[32m+[m
+[32m+[m[32m        const ratesUrl = `${apiUrl('get_exchange_rates.php')}?cache_bust=${Date.now()}`;[m
+[32m+[m[32m        const ratesResponse = await fetch(ratesUrl, {[m
+[32m+[m[32m          method: 'GET',[m
+[32m+[m[32m          headers: {[m
+[32m+[m[32m            Accept: 'application/json',[m
+[32m+[m[32m            'Cache-Control': 'no-cache, no-store, must-revalidate',[m
+[32m+[m[32m            Pragma: 'no-cache',[m
+[32m+[m[32m          },[m
+[32m+[m[32m          cache: 'no-store',[m
+[32m+[m[32m        });[m
+[32m+[m[32m        const ratesData = await ratesResponse.json();[m
+[32m+[m[32m        const ratesList = ratesData?.data ?? ratesData?.rows ?? [];[m
+[32m+[m[32m        const latestRates = (Array.isArray(ratesList) ? ratesList.filter((rate: unknown): rate is ExchangeRate =>[m
+[32m+[m[32m          isRecord(rate)[m
+[32m+[m[32m          && (typeof rate.id === 'string' || typeof rate.id === 'number')[m
+[32m+[m[32m          && Number.isInteger(Number(rate.id))[m
+[32m+[m[32m          && Number(rate.id) > 0[m
+[32m+[m[32m          && (typeof rate.toman_per_afn === 'string' || typeof rate.toman_per_afn === 'number')[m
+[32m+[m[32m          && Number.isFinite(Number(rate.toman_per_afn))[m
+[32m+[m[32m          && Number(rate.toman_per_afn) > 0[m
+[32m+[m[32m        ) : []).sort((a, b) => Number(b.id) - Number(a.id));[m
+[32m+[m
+[32m+[m[32m        if (!ratesResponse.ok || !ratesData?.success || latestRates.length === 0) {[m
+[32m+[m[32m          throw new Error('Could not retrieve the latest exchange rate');[m
+[32m+[m[32m        }[m
+[32m+[m
+[32m+[m[32m        submissionRate = latestRates[0];[m
+[32m+[m[32m        submittedAmountAfghani = calculateAfghaniAmount(cleanAmountToman, submissionRate.toman_per_afn);[m
+[32m+[m[32m        if (!submittedAmountAfghani) throw new Error('Could not calculate converted amount');[m
+[32m+[m
+[32m+[m[32m        if (__DEV__) {[m
+[32m+[m[32m          console.info('[REMITTANCE] Latest exchange rate selected for retry', {[m
+[32m+[m[32m            oldRateId,[m
+[32m+[m[32m            newRateId: submissionRate.id,[m
+[32m+[m[32m            newRateValue: submissionRate.toman_per_afn,[m
+[32m+[m[32m          });[m
+[32m+[m[32m        }[m
+[32m+[m[32m        setExchangeRates(latestRates);[m
+[32m+[m[32m        setSelectedRateId(Number(submissionRate.id));[m
+[32m+[m[32m        setAmountAfghani(submittedAmountAfghani);[m
+[32m+[m
+[32m+[m[32m        ({ response, result } = await sendRequest(submissionRate, submittedAmountAfghani));[m
+[32m+[m[32m        if (__DEV__) {[m
+[32m+[m[32m          console.info('[REMITTANCE] Exchange rate retry response', {[m
+[32m+[m[32m            rateId: submissionRate.id,[m
+[32m+[m[32m            status: response.status,[m
+[32m+[m[32m            body: result,[m
+[32m+[m[32m          });[m
+         }[m
+[31m-        if (!retryOk) {[m
+[31m-          setSubmitting(false);[m
+[31m-          submitInFlight.current = false;[m
+[31m-          return showError('خطا', 'نرخ ارز تغییر کرده است. لطفاً فرم حواله را بازخوانی کنید.');[m
+[32m+[m[32m        if (isRateConflict(response, result)) {[m
+[32m+[m[32m          showError('نرخ ارز تغییر کرد', 'نرخ ارز هنگام ثبت حواله دوباره تغییر کرد. لطفاً چند لحظه بعد دوباره تلاش کنید.');[m
+[32m+[m[32m          return;[m
+         }[m
+       }[m
+ [m
+       const responseMessage = typeof result?.message === 'string' ? result.message.trim() : '';[m
+       const normalizedStatus = String(result?.status ?? '').toLowerCase();[m
+       const isErrorResponse = normalizedStatus === 'error' || response.status === 403 || !response.ok;[m
+[32m+[m[32m      const responseCode = String(result?.code ?? result?.data?.code ?? '').trim();[m
+ [m
+[31m-      if (result?.code === 'DAILY_TRANSACTION_LIMIT_EXCEEDED') {[m
+[31m-        setSubmitting(false);[m
+[31m-        submitInFlight.current = false;[m
+[31m-        showError('سقف تراکنش روزانه', `سقف: ${Number(result?.data?.daily_limit || 0).toLocaleString('en-US')} تومان`);[m
+[32m+[m[32m      if (responseCode === 'DAILY_TRANSACTION_LIMIT_EXCEEDED') {[m
+[32m+[m[32m        showError('سقف تراکنش روزانه', `سقف: ${Number(result?.data?.daily_limit || 0).toLocaleString('en-US')} تومان، باقی‌مانده: ${Number(result?.data?.remaining_today || 0).toLocaleString('en-US')} تومان`);[m
+         router.push('/access-level' as any);[m
+         return;[m
+       }[m
+ [m
+[31m-      const responseCode = String(result?.code ?? result?.data?.code ?? '').trim();[m
+       if (responseCode === 'INSUFFICIENT_BALANCE') {[m
+[31m-        setSubmitting(false);[m
+[31m-        submitInFlight.current = false;[m
+         setInsufficientBalanceVisible(true);[m
+         return;[m
+       }[m
+ [m
+       if (isErrorResponse) {[m
+[31m-        setSubmitting(false);[m
+[31m-        submitInFlight.current = false;[m
+[31m-        return showError('خطا', responseMessage || 'خطا در ثبت حواله.');[m
+[32m+[m[32m        showError('خطا', responseMessage || 'خطا در ثبت حواله.');[m
+[32m+[m[32m        return;[m
+       }[m
+ [m
+       if (result?.status === 'success' || result?.success) {[m
+[36m@@ -486,17 +743,13 @@[m [mexport default function AddRemittanceScreen() {[m
+           result?.tracking_number ??[m
+           ''[m
+         ).trim();[m
+[31m-[m
+         if (!committedRemittanceId) {[m
+[31m-          setSubmitting(false);[m
+[31m-          submitInFlight.current = false;[m
+[31m-          return showError('خطا', 'حواله ثبت شد، اما شناسه رسید از سرور دریافت نشد.');[m
+[32m+[m[32m          showError('خطا', 'حواله ثبت شد، اما شناسه رسید از سرور دریافت نشد.');[m
+[32m+[m[32m          return;[m
+         }[m
+[31m-[m
+         setCompletedRemittanceId(committedRemittanceId);[m
+         setLastTrackingCode(committedRemittanceId);[m
+[31m-        setLastAgencyName(selectedAgency?.name || '');[m
+[31m-[m
+[32m+[m[32m        setLastAgencyName(selectedAgency.name);[m
+         const receiptData = result?.data || {};[m
+         setCompletedReceipt({[m
+           trackingNumber: String(receiptData.tracking_number ?? committedRemittanceId),[m
+[36m@@ -513,27 +766,23 @@[m [mexport default function AddRemittanceScreen() {[m
+           destinationCountry: String(receiptData.destination_country_name ?? ''),[m
+           status: String(receiptData.status ?? 'pending'),[m
+         });[m
+[31m-[m
+[31m-        const newBalance = result?.new_balance ?? result?.data?.new_balance ?? result?.balance ?? result?.data?.balance ?? null;[m
+[32m+[m[32m        const newBalance = result?.data?.new_balance ?? result?.new_balance ?? result?.balance ?? null;[m
+         const nextBalance = newBalance !== null && newBalance !== '' ? Number(newBalance) : null;[m
+[31m-        if (Number.isFinite(nextBalance)) {[m
+[31m-          setUserBalance(nextBalance);[m
+[31m-        }[m
+[31m-[m
+[32m+[m[32m        if (Number.isFinite(nextBalance)) setUserBalance(nextBalance);[m
+         setReceiptModalVisible(true);[m
+         showSuccess('موفق', 'حواله با موفقیت ثبت شد.');[m
+       } else {[m
+[31m-        showError('خطا', result?.message || 'خطا در ثبت حواله.');[m
+[32m+[m[32m        showError('خطا', responseMessage || 'خطا در ثبت حواله.');[m
+       }[m
+[31m-    } catch (err) {[m
+[32m+[m[32m    } catch (error) {[m
+       if (commitReceived) {[m
+         showError('رسید حواله', 'حواله با موفقیت ثبت شد، اما نمایش رسید انجام نشد.');[m
+       } else {[m
+[31m-        showError('خطای ارتباط', 'مشکل در ارتباط با سرور رخ داده است.');[m
+[32m+[m[32m        showError('خطای ارتباط', 'مشکل در ارتباط با سرور یا دریافت نرخ ارز رخ داد. لطفاً دوباره تلاش کنید.');[m
+       }[m
+     } finally {[m
+[31m-      setSubmitting(false);[m
+       submitInFlight.current = false;[m
+[32m+[m[32m      setSubmitting(false);[m
+     }[m
+   };[m
+ [m
+[36m@@ -563,6 +812,8 @@[m [mexport default function AddRemittanceScreen() {[m
+       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>[m
+         <View style={styles.outerBackground}>[m
+           <View style={styles.boxedContainer}>[m
+[32m+[m
+[32m+[m[32m            {/* هدر مشابه صفحه افزایش موجودی */}[m
+             <View style={styles.customHeader}>[m
+               <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>[m
+                 <Ionicons name="arrow-forward" size={24} color="#4b5563" />[m
+[36m@@ -572,62 +823,18 @@[m [mexport default function AddRemittanceScreen() {[m
+             </View>[m
+ [m
+             <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>[m
+[32m+[m
+               <Text style={styles.label}>ارز مبدا</Text>[m
+[31m-              <View style={styles.pickerContainer}>[m
+[31m-                <Picker[m
+[31m-                  style={styles.picker}[m
+[31m-                  selectedValue={selectedSourceCurrency}[m
+[31m-                  onValueChange={(value) => setSelectedSourceCurrency(String(value))}[m
+[31m-                >[m
+[31m-                  {sourceCurrencies.map((currency) => ([m
+[31m-                    <Picker.Item key={currency.code} label={`${currency.name} (${currency.code})`} value={currency.code} />[m
+[31m-                  ))}[m
+[31m-                </Picker>[m
+[31m-              </View>[m
+[32m+[m[32m              {renderSelectorButton(selectedSourceCurrencyName, 'انتخاب ارز مبدا', 'source')}[m
+ [m
+               <Text style={styles.label}>کشور مقصد</Text>[m
+[31m-              <View style={styles.pickerContainer}>[m
+[31m-                <Picker[m
+[31m-                  style={styles.picker}[m
+[31m-                  selectedValue={selectedDestinationCountry}[m
+[31m-                  onValueChange={(value) => setSelectedDestinationCountry(String(value))}[m
+[31m-                >[m
+[31m-                  <Picker.Item label="انتخاب کشور مقصد..." value="" />[m
+[31m-                  {destinationCountryGroups.flatMap((group) => group.countries.map((country) => ([m
+[31m-                    <Picker.Item[m
+[31m-                      key={country.code}[m
+[31m-                      label={`${group.group === 'europe' ? 'اروپا' : group.group === 'arab' ? 'کشورهای عربی' : 'مقصدهای درخواستی'} — ${country.name}`}[m
+[31m-                      value={country.code}[m
+[31m-                    />[m
+[31m-                  )))}[m
+[31m-                </Picker>[m
+[31m-              </View>[m
+[32m+[m[32m              {renderSelectorButton(countries.find((country) => country.code === selectedDestinationCountry)?.name || '', 'انتخاب کشور مقصد', 'country')}[m
+ [m
+               <Text style={styles.label}>ارز مقصد</Text>[m
+[31m-              <View style={styles.pickerContainer}>[m
+[31m-                <Picker[m
+[31m-                  style={styles.picker}[m
+[31m-                  selectedValue={selectedDestinationCurrency}[m
+[31m-                  onValueChange={(value) => setSelectedDestinationCurrency(String(value))}[m
+[31m-                >[m
+[31m-                  {availableDestinationCurrencies.map((currency) => ([m
+[31m-                    <Picker.Item key={currency.code} label={`${currency.name} (${currency.code})`} value={currency.code} />[m
+[31m-                  ))}[m
+[31m-                </Picker>[m
+[31m-              </View>[m
+[32m+[m[32m              {renderSelectorButton(selectedDestinationCurrencyName, 'انتخاب ارز مقصد', 'destinationCurrency')}[m
+ [m
+               <Text style={styles.label}>نمایندگی مقصد</Text>[m
+[31m-              <View style={styles.pickerContainer}>[m
+[31m-                <Picker[m
+[31m-                  style={styles.picker}[m
+[31m-                  selectedValue={selectedAgencyId ?? ''}[m
+[31m-                  onValueChange={(v) => setSelectedAgencyId(String(v))}[m
+[31m-                >[m
+[31m-                  {agencies.map((agency) => ([m
+[31m-                    <Picker.Item key={agency.id} label={agency.name} value={String(agency.id)} />[m
+[31m-                  ))}[m
+[31m-                </Picker>[m
+[31m-              </View>[m
+[32m+[m[32m              {renderSelectorButton(agencies.find((agency) => String(agency.id) === String(selectedAgencyId))?.name || '', 'انتخاب نمایندگی مقصد', 'agency')}[m
+ [m
+               {isFixedRatePair ? ([m
+                 <>[m
+[36m@@ -643,10 +850,6 @@[m [mexport default function AddRemittanceScreen() {[m
+                   <Text style={styles.variableRateText}>[m
+                     نرخ این حواله متغیر است. برای دریافت نرخ روز و اطلاعات پرداخت با پشتیبانی واتساپ در ارتباط باشید.[m
+                   </Text>[m
+[31m-                  <TouchableOpacity style={styles.whatsappBtn} onPress={handleOpenVariableRateWhatsApp}>[m
+[31m-                    <Ionicons name="logo-whatsapp" size={18} color="#fff" />[m
+[31m-                    <Text style={styles.whatsappBtnText}>ارتباط با پشتیبانی واتساپ</Text>[m
+[31m-                  </TouchableOpacity>[m
+                 </View>[m
+               )}[m
+ [m
+[36m@@ -672,9 +875,7 @@[m [mexport default function AddRemittanceScreen() {[m
+                       onChangeText={amountTomanInput.onChangeText}[m
+                       placeholder="مثال: 5000000"[m
+                     />[m
+[31m-                    {!!moneyInputWords(amountToman) && ([m
+[31m-                      <Text style={styles.amountWords}>{moneyInputWords(amountToman)}</Text>[m
+[31m-                    )}[m
+[32m+[m[32m                    {!!moneyInputWords(amountToman) && <Text style={styles.amountWords}>{moneyInputWords(amountToman)}</Text>}[m
+                   </View>[m
+                   <View style={styles.half}>[m
+                     <Text style={styles.label}>معادل (افغانی)</Text>[m
+[36m@@ -705,213 +906,278 @@[m [mexport default function AddRemittanceScreen() {[m
+                 placeholder="شماره موبایل گیرنده"[m
+               />[m
+ [m
+[31m-              {isFixedRatePair && ([m
+[32m+[m[32m              {isFixedRatePair ? ([m
+                 <>[m
+                   <View style={styles.spacer} />[m
+[32m+[m
+                   <View style={styles.feeBox}>[m
+[31m-                    <View style={styles.feeRow}>[m
+[31m-                      <Text style={styles.feeLabel}>مبلغ حواله:</Text>[m
+[31m-                      <Text style={styles.feeValue}>{amountToman ? toPersianNum(amountToman) : '۰'} تومان</Text>[m
+[31m-                    </View>[m
+[31m-                    <View style={styles.feeRow}>[m
+[31m-                      <Text style={styles.feeLabel}>کارمزد انتقال:</Text>[m
+[31m-                      <Text style={styles.feeValue}>[m
+[31m-                        {feePreview ? `${toPersianNum(feePreview.fee_amount)} تومان` : 'محاسبه...'}[m
+[31m-                      </Text>[m
+[31m-                    </View>[m
+[31m-                    <View style={[styles.feeRow, styles.feeTotalRow]}>[m
+[31m-                      <Text style={styles.feeTotalLabel}>مجموع کسر از کیف پول:</Text>[m
+[31m-                      <Text style={styles.feeTotalValue}>[m
+[31m-                        {feePreview ? `${toPersianNum(feePreview.total_amount)} تومان` : '...'}[m
+[31m-                      </Text>[m
+[31m-                    </View>[m
+[32m+[m[32m                    <View style={styles.feeRow}><Text style={styles.feeLabel}>مبلغ حواله</Text><Text style={styles.feeValue}>{toPersianNum(Number(normalizeMoneyInput(amountToman) || 0).toLocaleString('en-US'))} تومان</Text></View>[m
+[32m+[m[32m                    <View style={styles.feeRow}><Text style={styles.feeLabel}>کارمزد</Text><Text style={styles.feeValue}>{toPersianNum(Number(feePreview?.fee_amount || 0).toLocaleString('en-US'))} تومان</Text></View>[m
+[32m+[m[32m                    <View style={[styles.feeRow, styles.feeTotalRow]}><Text style={styles.feeTotalLabel}>مبلغ نهایی قابل پرداخت</Text><Text style={styles.feeTotalValue}>{toPersianNum(Number(feePreview?.total_amount || normalizeMoneyInput(amountToman) || 0).toLocaleString('en-US'))} تومان</Text></View>[m
+                   </View>[m
+[32m+[m
+[32m+[m[32m                  <TouchableOpacity[m
+[32m+[m[32m                    style={[styles.submitBtn, submitting && styles.disabledBtn]}[m
+[32m+[m[32m                    onPress={handleSubmit}[m
+[32m+[m[32m                    disabled={submitting}>[m
+[32m+[m[32m                    {submitting ? ([m
+[32m+[m[32m                      <ActivityIndicator color="#fff" />[m
+[32m+[m[32m                    ) : ([m
+[32m+[m[32m                      <Text style={styles.submitBtnText}>ثبت و ارسال حواله</Text>[m
+[32m+[m[32m                    )}[m
+[32m+[m[32m                  </TouchableOpacity>[m
+                 </>[m
+[32m+[m[32m              ) : ([m
+[32m+[m[32m                <TouchableOpacity[m
+[32m+[m[32m                  style={styles.whatsappBtn}[m
+[32m+[m[32m                  onPress={handleOpenVariableRateWhatsApp}>[m
+[32m+[m[32m                  <Ionicons name="logo-whatsapp" size={20} color="#fff" style={{ marginLeft: 8 }} />[m
+[32m+[m[32m                  <Text style={styles.submitBtnText}>دریافت نرخ حواله در واتساپ</Text>[m
+[32m+[m[32m                </TouchableOpacity>[m
+               )}[m
+ [m
+[31m-              <TouchableOpacity[m
+[31m-                style={[styles.submitBtn, (submitting || completedRemittanceId) && styles.disabledBtn]}[m
+[31m-                onPress={handleSubmit}[m
+[31m-                disabled={submitting || !!completedRemittanceId}[m
+[31m-              >[m
+[31m-                {submitting ? ([m
+[31m-                  <ActivityIndicator color="#fff" />[m
+[31m-                ) : ([m
+[31m-                  <Text style={styles.submitBtnText}>[m
+[31m-                    {isFixedRatePair ? 'ثبت و ارسال حواله' : 'دریافت نرخ از طریق واتساپ'}[m
+[31m-                  </Text>[m
+[31m-                )}[m
+[31m-              </TouchableOpacity>[m
+             </ScrollView>[m
+           </View>[m
+[32m+[m[32m          <AppBottomNav />[m
+         </View>[m
+       </KeyboardAvoidingView>[m
+ [m
+[31m-      <AppBottomNav />[m
+[31m-[m
+[31m-      {/* مودال رسید پرداخت */}[m
+       <Modal[m
+[31m-        visible={receiptModalVisible}[m
+[31m-        animationType="slide"[m
+[31m-        transparent={false}[m
+[31m-        onRequestClose={() => {[m
+[31m-          setReceiptModalVisible(false);[m
+[31m-          router.replace('/(tabs)/transactions' as any);[m
+[31m-        }}[m
+[31m-      >[m
+[31m-        <SafeAreaView style={{ flex: 1, backgroundColor: '#f9fafb' }}>[m
+[31m-          <View style={styles.receiptHeader}>[m
+[31m-            <Text style={styles.receiptHeaderTitle}>رسید ثبت حواله</Text>[m
+[31m-            <TouchableOpacity[m
+[31m-              onPress={() => {[m
+[31m-                setReceiptModalVisible(false);[m
+[31m-                router.replace('/(tabs)/transactions' as any);[m
+[31m-              }}[m
+[31m-              style={styles.receiptCloseBtn}[m
+[31m-            >[m
+[31m-              <Ionicons name="close" size={24} color="#374151" />[m
+[31m-            </TouchableOpacity>[m
+[32m+[m[32m        visible={activeSelector !== null}[m
+[32m+[m[32m        transparent[m
+[32m+[m[32m        animationType="fade"[m
+[32m+[m[32m        onRequestClose={() => setActiveSelector(null)}>[m
+[32m+[m[32m        <View style={styles.selectorBackdrop}>[m
+[32m+[m[32m          <View style={styles.selectorModal}>[m
+[32m+[m[32m            <View style={styles.selectorHeader}>[m
+[32m+[m[32m              <Text style={styles.selectorTitle}>{selectorTitle}</Text>[m
+[32m+[m[32m              <TouchableOpacity onPress={() => setActiveSelector(null)} accessibilityRole="button" accessibilityLabel="بستن">[m
+[32m+[m[32m                <Ionicons name="close" size={22} color={appColors.textSecondary} />[m
+[32m+[m[32m              </TouchableOpacity>[m
+[32m+[m[32m            </View>[m
+[32m+[m[32m            <ScrollView style={styles.selectorOptions} keyboardShouldPersistTaps="handled">[m
+[32m+[m[32m              {selectorOptions.length ? selectorOptions.map((option) => ([m
+[32m+[m[32m                <TouchableOpacity[m
+[32m+[m[32m                  key={option.value}[m
+[32m+[m[32m                  style={styles.selectorOption}[m
+[32m+[m[32m                  onPress={() => handleSelectorChoice(option.value)}[m
+[32m+[m[32m                  accessibilityRole="button">[m
+[32m+[m[32m                  <Text style={styles.selectorOptionText}>{option.label}</Text>[m
+[32m+[m[32m                  {option.value === selectedSelectorValue && <Ionicons name="checkmark" size={20} color={appColors.primary} />}[m
+[32m+[m[32m                </TouchableOpacity>[m
+[32m+[m[32m              )) : <Text style={styles.selectorEmpty}>گزینه‌ای برای انتخاب وجود ندارد.</Text>}[m
+[32m+[m[32m            </ScrollView>[m
+           </View>[m
+[32m+[m[32m        </View>[m
+[32m+[m[32m      </Modal>[m
+ [m
+[31m-          <ScrollView contentContainerStyle={{ padding: 16 }}>[m
+[31m-            {completedReceipt && <RemittanceReceiptView receipt={completedReceipt} />}[m
+[31m-[m
+[31m-            <View style={styles.receiptActionsContainer}>[m
+[32m+[m[32m      <Modal[m
+[32m+[m[32m        visible={insufficientBalanceVisible}[m
+[32m+[m[32m        transparent[m
+[32m+[m[32m        animationType="fade"[m
+[32m+[m[32m        onRequestClose={() => setInsufficientBalanceVisible(false)}>[m
+[32m+[m[32m        <View style={styles.modalBackdrop}>[m
+[32m+[m[32m          <View style={styles.modalCard}>[m
+[32m+[m[32m            <Text style={styles.modalTitle}>موجودی ناکافی</Text>[m
+[32m+[m[32m            <Text style={styles.modalLine}>موجودی کیف پول شما برای ثبت این حواله کافی نیست.</Text>[m
+[32m+[m[32m            <View style={styles.modalActions}>[m
+               <TouchableOpacity[m
+[31m-                style={[styles.receiptActionBtn, styles.receiptPrimaryBtn]}[m
+[31m-                onPress={handleDownloadPdf}[m
+[31m-                disabled={receiptBusyAction !== null}[m
+[31m-              >[m
+[31m-                {receiptBusyAction === 'pdf' ? ([m
+[31m-                  <ActivityIndicator color="#fff" size="small" />[m
+[31m-                ) : ([m
+[31m-                  <>[m
+[31m-                    <Ionicons name="document-text-outline" size={20} color="#fff" style={{ marginLeft: 6 }} />[m
+[31m-                    <Text style={styles.receiptPrimaryBtnText}>دریافت PDF</Text>[m
+[31m-                  </>[m
+[31m-                )}[m
+[32m+[m[32m                style={[styles.modalBtn, styles.pdfBtn]}[m
+[32m+[m[32m                onPress={() => {[m
+[32m+[m[32m                  setInsufficientBalanceVisible(false);[m
+[32m+[m[32m                  router.push('/add-balance' as any);[m
+[32m+[m[32m                }}>[m
+[32m+[m[32m                <Text style={styles.modalBtnText}>افزایش موجودی کیف پول</Text>[m
+               </TouchableOpacity>[m
+[31m-[m
+               <TouchableOpacity[m
+[31m-                style={[styles.receiptActionBtn, styles.receiptSecondaryBtn]}[m
+[31m-                onPress={handleShareReceipt}[m
+[31m-                disabled={receiptBusyAction !== null}[m
+[31m-              >[m
+[31m-                {receiptBusyAction === 'share' ? ([m
+[31m-                  <ActivityIndicator color="#111827" size="small" />[m
+[31m-                ) : ([m
+[31m-                  <>[m
+[31m-                    <Ionicons name="share-social-outline" size={20} color="#111827" style={{ marginLeft: 6 }} />[m
+[31m-                    <Text style={styles.receiptSecondaryBtnText}>اشتراک‌گذاری</Text>[m
+[31m-                  </>[m
+[31m-                )}[m
+[32m+[m[32m                style={[styles.modalBtn, styles.homeBtn]}[m
+[32m+[m[32m                onPress={() => setInsufficientBalanceVisible(false)}>[m
+[32m+[m[32m                <Text style={[styles.modalBtnText, { color: '#374151' }]}>بازگشت</Text>[m
+               </TouchableOpacity>[m
+             </View>[m
+[31m-[m
+[31m-            <TouchableOpacity style={styles.receiptCopyBtn} onPress={handleCopyReceipt}>[m
+[31m-              <Ionicons name="copy-outline" size={18} color="#4b5563" style={{ marginLeft: 6 }} />[m
+[31m-              <Text style={styles.receiptCopyText}>کپی متن رسید</Text>[m
+[31m-            </TouchableOpacity>[m
+[31m-          </ScrollView>[m
+[31m-        </SafeAreaView>[m
+[32m+[m[32m          </View>[m
+[32m+[m[32m        </View>[m
+       </Modal>[m
+ [m
+[31m-      {/* مودال موجودی ناکافی */}[m
+[32m+[m[32m      {/* مدال موفقیت */}[m
+       <Modal[m
+[31m-        visible={insufficientBalanceVisible}[m
+[32m+[m[32m        visible={successModalVisible}[m
+[32m+[m[32m        transparent[m
+         animationType="fade"[m
+[31m-        transparent={true}[m
+[31m-        onRequestClose={() => setInsufficientBalanceVisible(false)}[m
+[31m-      >[m
+[31m-        <View style={styles.modalOverlay}>[m
+[31m-          <View style={styles.modalContent}>[m
+[31m-            <View style={styles.modalIconBox}>[m
+[31m-              <Ionicons name="wallet-outline" size={36} color="#ef4444" />[m
+[31m-            </View>[m
+[31m-            <Text style={styles.modalTitle}>موجودی ناکافی</Text>[m
+[31m-            <Text style={styles.modalText}>موجودی و اعتبار کیف پول شما برای پرداخت مبلغ حواله و کارمزد کافی نیست.</Text>[m
+[31m-            <View style={styles.modalButtonsRow}>[m
+[31m-              <TouchableOpacity[m
+[31m-                style={[styles.modalBtn, styles.modalSecondaryBtn]}[m
+[31m-                onPress={() => setInsufficientBalanceVisible(false)}[m
+[31m-              >[m
+[31m-                <Text style={styles.modalSecondaryBtnText}>متوجه شدم</Text>[m
+[32m+[m[32m        onRequestClose={() => setSuccessModalVisible(false)}>[m
+[32m+[m[32m        <View style={styles.modalBackdrop}>[m
+[32m+[m[32m          <View style={styles.modalCard}>[m
+[32m+[m[32m                <Ionicons name="checkmark-circle" size={60} color={appColors.primary} style={{ alignSelf: 'center', marginBottom: 10 }} />[m
+[32m+[m[32m            <Text style={styles.modalTitle}>حواله با موفقیت ثبت شد</Text>[m
+[32m+[m[32m            <Text style={styles.modalLine}>کد پیگیری: <Text style={styles.modalCode}>{toPersianNum(customerTrackingNumber(lastTrackingCode))}</Text></Text>[m
+[32m+[m[32m            <Text style={styles.modalLine}>نمایندگی: {lastAgencyName}</Text>[m
+[32m+[m
+[32m+[m[32m            <View style={styles.modalActions}>[m
+[32m+[m[32m              <TouchableOpacity style={[styles.modalBtn, styles.pdfBtn]} onPress={() => { setSuccessModalVisible(false); setReceiptModalVisible(true); }}>[m
+[32m+[m[32m                <Ionicons name="document-text-outline" size={20} color="#fff" style={{ marginLeft: 8 }} />[m
+[32m+[m[32m                <Text style={styles.modalBtnText}>مشاهده رسید</Text>[m
+               </TouchableOpacity>[m
+[32m+[m
+               <TouchableOpacity[m
+[31m-                style={[styles.modalBtn, styles.modalPrimaryBtn]}[m
+[32m+[m[32m                style={[styles.modalBtn, styles.homeBtn]}[m
+                 onPress={() => {[m
+[31m-                  setInsufficientBalanceVisible(false);[m
+[31m-                  router.push('/deposit' as any);[m
+[31m-                }}[m
+[31m-              >[m
+[31m-                <Text style={styles.modalPrimaryBtnText}>افزایش موجودی</Text>[m
+[32m+[m[32m                  setSuccessModalVisible(false);[m
+[32m+[m[32m                  resetForm();[m
+[32m+[m[32m                  router.replace('/dashboard');[m
+[32m+[m[32m                }}>[m
+[32m+[m[32m                <Text style={styles.modalBtnText}>بازگشت به پیشخوان</Text>[m
+               </TouchableOpacity>[m
+             </View>[m
+           </View>[m
+         </View>[m
+       </Modal>[m
+[32m+[m
+[32m+[m[32m      <Modal[m
+[32m+[m[32m        visible={receiptModalVisible}[m
+[32m+[m[32m        animationType="slide"[m
+[32m+[m[32m        onRequestClose={() => setReceiptModalVisible(false)}>[m
+[32m+[m[32m        <SafeAreaView style={styles.receiptScreen}>[m
+[32m+[m[32m          <View style={styles.receiptHeader}>[m
+[32m+[m[32m            <TouchableOpacity style={styles.receiptHeaderBack} onPress={() => setReceiptModalVisible(false)}><Ionicons name="arrow-forward" size={22} color="#334155" /></TouchableOpacity>[m
+[32m+[m[32m            <Text style={styles.receiptHeaderTitle}>رسید حواله</Text><View style={{ width: 42 }} />[m
+[32m+[m[32m          </View>[m
+[32m+[m[32m          <ScrollView contentContainerStyle={styles.receiptContent} showsVerticalScrollIndicator={false}>[m
+[32m+[m[32m            {completedReceipt && <RemittanceReceiptView receipt={completedReceipt} />}[m
+[32m+[m[32m            <View style={styles.receiptActions}>[m
+[32m+[m[32m              <TouchableOpacity style={[styles.receiptAction, styles.receiptSecondary]} onPress={handleCopyReceipt} disabled={receiptBusyAction !== null}>[m
+[32m+[m[32m                <Ionicons name="copy-outline" size={20} color={appColors.primary} /><Text style={styles.receiptSecondaryText}>کپی رسید</Text>[m
+[32m+[m[32m              </TouchableOpacity>[m
+[32m+[m[32m              <TouchableOpacity style={[styles.receiptAction, styles.receiptPrimary]} onPress={handleDownloadPdf} disabled={receiptBusyAction !== null}>[m
+[32m+[m[32m                {receiptBusyAction === 'pdf' ? <ActivityIndicator color="#fff" /> : <><Ionicons name="download-outline" size={20} color="#fff" /><Text style={styles.receiptPrimaryText}>دریافت PDF</Text></>}[m
+[32m+[m[32m              </TouchableOpacity>[m
+[32m+[m[32m              <TouchableOpacity style={[styles.receiptAction, styles.receiptSecondary]} onPress={handleShareReceipt} disabled={receiptBusyAction !== null}>[m
+[32m+[m[32m                {receiptBusyAction === 'share' ? <ActivityIndicator color={appColors.primary} /> : <><Ionicons name="share-social-outline" size={20} color={appColors.primary} /><Text style={styles.receiptSecondaryText}>اشتراک‌گذاری رسید</Text></>}[m
+[32m+[m[32m              </TouchableOpacity>[m
+[32m+[m[32m              <TouchableOpacity style={[styles.receiptAction, styles.receiptBack]} onPress={() => setReceiptModalVisible(false)} disabled={receiptBusyAction !== null}><Text style={styles.receiptBackText}>بازگشت</Text></TouchableOpacity>[m
+[32m+[m[32m            </View>[m
+[32m+[m[32m          </ScrollView>[m
+[32m+[m[32m        </SafeAreaView>[m
+[32m+[m[32m      </Modal>[m
+     </SafeAreaView>[m
+   );[m
+ }[m
+ [m
+ const styles = StyleSheet.create({[m
+[31m-  safeArea: { flex: 1, backgroundColor: '#f3f4f6' },[m
+[31m-  outerBackground: { flex: 1, backgroundColor: '#f3f4f6', paddingBottom: 60 },[m
+[31m-  boxedContainer: { flex: 1, backgroundColor: '#ffffff', marginHorizontal: 0, borderRadius: 0, overflow: 'hidden' },[m
+[31m-  customHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#f3f4f6' },[m
+[31m-  backBtn: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },[m
+[31m-  headerTitle: { fontSize: 16, fontWeight: 'bold', color: '#111827', textAlign: 'center' },[m
+[31m-  scrollContent: { padding: 16, paddingBottom: 40 },[m
+[31m-  label: { fontSize: 13, fontWeight: '600', color: '#374151', marginBottom: 6, marginTop: 12, textAlign: 'right' },[m
+[31m-  pickerContainer: { borderWidth: 1, borderColor: '#d1d5db', borderRadius: 10, backgroundColor: '#f9fafb', overflow: 'hidden' },[m
+[31m-  picker: { height: 50, width: '100%', color: '#111827' },[m
+[31m-  readonlyBox: { backgroundColor: '#f3f4f6', borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 10, padding: 12, alignItems: 'center' },[m
+[31m-  readonlyText: { fontSize: 15, fontWeight: 'bold', color: '#1f2937' },[m
+[31m-  variableRateBox: { backgroundColor: '#eff6ff', borderWidth: 1, borderColor: '#bfdbfe', borderRadius: 10, padding: 12, marginTop: 8, alignItems: 'center' },[m
+[31m-  variableRateText: { fontSize: 13, color: '#1e40af', textAlign: 'center', lineHeight: 20, marginBottom: 10 },[m
+[31m-  whatsappBtn: { flexDirection: 'row-reverse', alignItems: 'center', backgroundColor: '#25d366', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8 },[m
+[31m-  whatsappBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 13, marginRight: 6 },[m
+[31m-  input: { borderWidth: 1, borderColor: '#d1d5db', borderRadius: 10, paddingHorizontal: 14, paddingVertical: 12, fontSize: 15, color: '#111827', backgroundColor: '#fff', textAlign: 'right' },[m
+[31m-  disabledInput: { backgroundColor: '#f9fafb', color: '#6b7280' },[m
+[31m-  amountWords: { fontSize: 11, color: '#6b7280', marginTop: 4, textAlign: 'right' },[m
+[31m-  row: { flexDirection: 'row-reverse', gap: 12 },[m
+[32m+[m[32m  safeArea: { flex: 1, backgroundColor: appColors.background },[m
+[32m+[m[32m  receiptScreen: { flex: 1, backgroundColor: appColors.background },[m
+[32m+[m[32m  receiptHeader: { height: 62, paddingHorizontal: 16, flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between' },[m
+[32m+[m[32m  receiptHeaderBack: { width: 42, height: 42, borderRadius: 13, backgroundColor: appColors.surface, borderWidth: 1, borderColor: appColors.surfaceRaised, alignItems: 'center', justifyContent: 'center' },[m
+[32m+[m[32m  receiptHeaderTitle: { fontFamily: 'VazirmatnBold', fontSize: 18, color: appColors.text },[m
+[32m+[m[32m  receiptContent: { width: '100%', maxWidth: 720, alignSelf: 'center', padding: 16, paddingBottom: 36 },[m
+[32m+[m[32m  receiptActions: { gap: 10, marginTop: 16 },[m
+[32m+[m[32m  receiptAction: { minHeight: 50, borderRadius: 13, flexDirection: 'row-reverse', gap: 8, alignItems: 'center', justifyContent: 'center' },[m
+[32m+[m[32m  receiptPrimary: { backgroundColor: appColors.primary }, receiptPrimaryText: { fontFamily: 'VazirmatnBold', fontSize: 13, color: appColors.background },[m
+[32m+[m[32m  receiptSecondary: { backgroundColor: appColors.surface, borderWidth: 1, borderColor: appColors.accent }, receiptSecondaryText: { fontFamily: 'VazirmatnBold', fontSize: 13, color: appColors.primary },[m
+[32m+[m[32m  receiptBack: { backgroundColor: appColors.surface, borderWidth: 1, borderColor: appColors.surfaceRaised }, receiptBackText: { fontFamily: 'Vazirmatn', fontSize: 13, color: appColors.textSecondary },[m
+[32m+[m[32m  outerBackground: { flex: 1, backgroundColor: appColors.background, paddingHorizontal: 18, paddingTop: 18, paddingBottom: 70 },[m
+[32m+[m[32m  boxedContainer: {[m
+[32m+[m[32m    flex: 1,[m
+[32m+[m[32m    backgroundColor: appColors.background,[m
+[32m+[m[32m    overflow: 'hidden',[m
+[32m+[m[32m    shadowOpacity: 0,[m
+[32m+[m[32m    shadowRadius: 0,[m
+[32m+[m[32m    elevation: 0[m
+[32m+[m[32m  },[m
+[32m+[m[32m  customHeader: {[m
+[32m+[m[32m    flexDirection: 'row-reverse',[m
+[32m+[m[32m    alignItems: 'center',[m
+[32m+[m[32m    justifyContent: 'space-between',[m
+[32m+[m[32m    paddingHorizontal: 20,[m
+[32m+[m[32m    paddingVertical: 20,[m
+[32m+[m[32m    borderBottomWidth: 1,[m
+[32m+[m[32m    borderBottomColor: appColors.surfaceRaised[m
+[32m+[m[32m  },[m
+[32m+[m[32m  backBtn: { width: 40, height: 40, borderRadius: 20, backgroundColor: appColors.surfaceRaised, justifyContent: 'center', alignItems: 'center' },[m
+[32m+[m[32m  headerTitle: { fontSize: 16, fontWeight: 'bold', color: appColors.text, fontFamily: 'Vazirmatn' },[m
+[32m+[m[32m  scrollContent: { padding: 0, flexGrow: 1, paddingBottom: 70 },[m
+[32m+[m
+[32m+[m[32m  label: { fontSize: 13, color: appColors.textMuted, marginBottom: 8, marginTop: 15, fontFamily: 'Vazirmatn', textAlign: 'right' },[m
+[32m+[m[32m  input: {[m
+[32m+[m[32m    width: '100%',[m
+[32m+[m[32m    padding: 15,[m
+[32m+[m[32m    borderWidth: 1,[m
+[32m+[m[32m    borderColor: '#e5e7eb',[m
+[32m+[m[32m    borderRadius: 12,[m
+[32m+[m[32m    backgroundColor: appColors.surfaceRaised,[m
+[32m+[m[32m    textAlign: 'right',[m
+[32m+[m[32m    fontSize: 14,[m
+[32m+[m[32m    color: appColors.text,[m
+[32m+[m[32m    fontFamily: 'Vazirmatn'[m
+[32m+[m[32m  },[m
+[32m+[m[32m  amountWords: { color: appColors.primary, fontSize: 12, fontFamily: 'Vazirmatn', textAlign: 'right', marginTop: 8 },[m
+[32m+[m[32m  disabledInput: { backgroundColor: appColors.surfaceRaised, color: '#9ca3af' },[m
+[32m+[m[32m  variableRateBox: { borderWidth: 1, borderColor: '#f59e0b', backgroundColor: '#fffbeb', borderRadius: 14, padding: 14, marginTop: 16 },[m
+[32m+[m[32m  variableRateText: { color: '#92400e', fontFamily: 'Vazirmatn', fontSize: 12, lineHeight: 21, textAlign: 'right' },[m
+[32m+[m
+[32m+[m[32m  selectorButton: { minHeight: 50, borderWidth: 1, borderColor: appColors.surfaceRaised, borderRadius: 12, backgroundColor: appColors.surfaceRaised, paddingHorizontal: 14, flexDirection: 'row-reverse', alignItems: 'center', gap: 10 },[m
+[32m+[m[32m  selectorButtonText: { flex: 1, color: appColors.text, fontFamily: 'Vazirmatn', fontSize: 14, textAlign: 'right' },[m
+[32m+[m[32m  selectorPlaceholder: { color: appColors.textMuted },[m
+[32m+[m[32m  selectorBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.62)', justifyContent: 'center', padding: 20 },[m
+[32m+[m[32m  selectorModal: { width: '100%', maxHeight: '78%', alignSelf: 'center', backgroundColor: appColors.surface, borderRadius: 18, padding: 16 },[m
+[32m+[m[32m  selectorHeader: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: appColors.surfaceRaised },[m
+[32m+[m[32m  selectorTitle: { color: appColors.text, fontFamily: 'VazirmatnBold', fontSize: 16 },[m
+[32m+[m[32m  selectorOptions: { flexGrow: 0, marginTop: 6 },[m
+[32m+[m[32m  selectorOption: { minHeight: 48, flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 8, borderBottomWidth: 1, borderBottomColor: appColors.surfaceRaised },[m
+[32m+[m[32m  selectorOptionText: { flex: 1, color: appColors.textSecondary, fontFamily: 'Vazirmatn', fontSize: 14, textAlign: 'right' },[m
+[32m+[m[32m  selectorEmpty: { color: appColors.textMuted, fontFamily: 'Vazirmatn', textAlign: 'center', paddingVertical: 20 },[m
+[32m+[m[32m  readonlyBox: {[m
+[32m+[m[32m    borderWidth: 1,[m
+[32m+[m[32m    borderColor: '#e5e7eb',[m
+[32m+[m[32m    borderRadius: 12,[m
+[32m+[m[32m    padding: 15,[m
+[32m+[m[32m    backgroundColor: appColors.surfaceRaised[m
+[32m+[m[32m  },[m
+[32m+[m[32m  readonlyText: { fontSize: 14, color: appColors.textSecondary, fontFamily: 'Vazirmatn', textAlign: 'right' },[m
+[32m+[m
+[32m+[m[32m  row: { flexDirection: 'row-reverse', justifyContent: 'space-between', gap: 10 },[m
+   half: { flex: 1 },[m
+[31m-  spacer: { height: 16 },[m
+[31m-  feeBox: { backgroundColor: '#f9fafb', borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 10, padding: 12, marginBottom: 16 },[m
+[31m-  feeRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', paddingVertical: 4 },[m
+[31m-  feeLabel: { fontSize: 12, color: '#6b7280' },[m
+[31m-  feeValue: { fontSize: 12, fontWeight: '600', color: '#374151' },[m
+[31m-  feeTotalRow: { borderTopWidth: 1, borderTopColor: '#e5e7eb', marginTop: 6, paddingTop: 8 },[m
+[31m-  feeTotalLabel: { fontSize: 13, fontWeight: 'bold', color: '#111827' },[m
+[31m-  feeTotalValue: { fontSize: 13, fontWeight: 'bold', color: appColors.primary },[m
+[31m-  submitBtn: { backgroundColor: appColors.primary, borderRadius: 10, paddingVertical: 14, alignItems: 'center', marginTop: 8 },[m
+[31m-  disabledBtn: { opacity: 0.6 },[m
+[31m-  submitBtnText: { color: '#fff', fontSize: 15, fontWeight: 'bold' },[m
+[31m-  center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20, backgroundColor: '#fff' },[m
+[31m-  loadingText: { marginTop: 12, fontSize: 14, color: '#6b7280' },[m
+[31m-  errorText: { fontSize: 14, color: '#ef4444', textAlign: 'center', marginBottom: 16 },[m
+[31m-  retryBtn: { backgroundColor: appColors.primary, paddingHorizontal: 20, paddingVertical: 10, borderRadius: 8 },[m
+[31m-  retryText: { color: '#fff', fontWeight: 'bold' },[m
+[31m-  receiptHeader: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#e5e7eb', backgroundColor: '#fff' },[m
+[31m-  receiptHeaderTitle: { fontSize: 16, fontWeight: 'bold', color: '#111827' },[m
+[31m-  receiptCloseBtn: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },[m
+[31m-  receiptActionsContainer: { flexDirection: 'row-reverse', gap: 12, marginTop: 16 },[m
+[31m-  receiptActionBtn: { flex: 1, flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', paddingVertical: 12, borderRadius: 10 },[m
+[31m-  receiptPrimaryBtn: { backgroundColor: appColors.primary },[m
+[31m-  receiptPrimaryBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 14 },[m
+[31m-  receiptSecondaryBtn: { backgroundColor: '#f3f4f6', borderWidth: 1, borderColor: '#d1d5db' },[m
+[31m-  receiptSecondaryBtnText: { color: '#111827', fontWeight: 'bold', fontSize: 14 },[m
+[31m-  receiptCopyBtn: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', paddingVertical: 12, backgroundColor: '#f9fafb', borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 10, marginTop: 12 },[m
+[31m-  receiptCopyText: { color: '#4b5563', fontWeight: '600', fontSize: 13 },[m
+[31m-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: 20 },[m
+[31m-  modalContent: { backgroundColor: '#fff', borderRadius: 16, padding: 24, width: '100%', maxWidth: 340, alignItems: 'center' },[m
+[31m-  modalIconBox: { width: 64, height: 64, borderRadius: 32, backgroundColor: '#fee2e2', alignItems: 'center', justifyContent: 'center', marginBottom: 16 },[m
+[31m-  modalTitle: { fontSize: 18, fontWeight: 'bold', color: '#111827', marginBottom: 8 },[m
+[31m-  modalText: { fontSize: 13, color: '#4b5563', textAlign: 'center', lineHeight: 20, marginBottom: 20 },[m
+[31m-  modalButtonsRow: { flexDirection: 'row-reverse', gap: 10, width: '100%' },[m
+[31m-  modalBtn: { flex: 1, paddingVertical: 12, borderRadius: 10, alignItems: 'center' },[m
+[31m-  modalPrimaryBtn: { backgroundColor: appColors.primary },[m
+[31m-  modalPrimaryBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 13 },[m
+[31m-  modalSecondaryBtn: { backgroundColor: '#f3f4f6', borderWidth: 1, borderColor: '#d1d5db' },[m
+[31m-  modalSecondaryBtnText: { color: '#374151', fontWeight: 'bold', fontSize: 13 },[m
+[31m-});[m
+\ No newline at end of file[m
+[32m+[m[32m  spacer: { marginTop: 25 },[m
+[32m+[m[32m  feeBox: { borderWidth: 1, borderColor: appColors.surfaceRaised, backgroundColor: appColors.background, borderRadius: 14, padding: 13, marginBottom: 16 },[m
+[32m+[m[32m  feeRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 6 },[m
+[32m+[m[32m  feeLabel: { fontFamily: 'Vazirmatn', fontSize: 12, color: '#64748b', textAlign: 'right' },[m
+[32m+[m[32m  feeValue: { fontFamily: 'VazirmatnBold', fontSize: 13, color: appColors.text, textAlign: 'left' },[m
+[32m+[m[32m  feeTotalRow: { borderTopWidth: 1, borderTopColor: '#dce7ef', marginTop: 5, paddingTop: 11 },[m
+[32m+[m[32m  feeTotalLabel: { fontFamily: 'VazirmatnBold', fontSize: 13, color: appColors.primary, textAlign: 'right' },[m
+[32m+[m[32m  feeTotalValue: { fontFamily: 'VazirmatnBold', fontSize: 14, color: appColors.primary, textAlign: 'left' },[m
+[32m+[m
+[32m+[m[32m  submitBtn: {[m
+[32m+[m[32m    width: '100%',[m
+[32m+[m[32m    backgroundColor: appColors.primary,[m
+[32m+[m[32m    padding: 15,[m
+[32m+[m[32m    borderRadius: 12,[m
+[32m+[m[32m    alignItems: 'center',[m
+[32m+[m[32m    shadowColor: appColors.primary,[m
+[32m+[m[32m    shadowOffset: { width: 0, height: 4 },[m
+[32m+[m[32m    shadowOpacity: 0.3,[m
+[32m+[m[32m    shadowRadius: 10,[m
+[32m+[m[32m    elevation: 5,[m
+[32m+[m[32m    marginTop: 10,[m
+[32m+[m[32m    marginBottom: 20[m
+[32m+[m[32m  },[m
+[32m+[m[32m  disabledBtn: { opacity: 0.7 },[m
+[32m+[m[32m  submitBtnText: { color: '#fff', fontSize: 15, fontWeight: 'bold', fontFamily: 'Vazirmatn' },[m
+[32m+[m[32m  whatsappBtn: { width: '100%', minHeight: 52, backgroundColor: '#128c7e', padding: 15, borderRadius: 12, flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', marginTop: 16, marginBottom: 20 },[m
+[32m+[m
+[32m+[m[32m  center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: appColors.background },[m
+[32m+[m[32m  loadingText: { marginTop: 10, color: appColors.textMuted, fontFamily: 'Vazirmatn' },[m
+[32m+[m[32m  errorText: { color: '#ef4444', fontFamily: 'Vazirmatn', marginBottom: 15, textAlign: 'center' },[m
+[32m+[m[32m  retryBtn: { backgroundColor: appColors.primary, paddingHorizontal: 20, paddingVertical: 10, borderRadius: 10 },[m
+[32m+[m[32m  retryText: { color: '#fff', fontFamily: 'Vazirmatn' },[m
+[32m+[m
+[32m+[m[32m  // استایل‌های مدال[m
+[32m+[m[32m  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', padding: 20 },[m
+[32m+[m[32m  modalCard: { backgroundColor: appColors.surface, borderRadius: 24, padding: 25, width: '100%' },[m
+[32m+[m[32m  modalTitle: { textAlign: 'center', fontSize: 18, fontWeight: 'bold', color: appColors.text, fontFamily: 'Vazirmatn', marginBottom: 15 },[m
+[32m+[m[32m  modalLine: { textAlign: 'center', fontSize: 14, color: appColors.textSecondary, fontFamily: 'Vazirmatn', marginBottom: 8 },[m
+[32m+[m[32m  modalCode: { fontWeight: 'bold', color: appColors.primary, fontSize: 16 },[m
+[32m+[m[32m  modalActions: { marginTop: 20, gap: 10 },[m
+[32m+[m[32m  modalBtn: { flexDirection: 'row-reverse', borderRadius: 12, padding: 14, alignItems: 'center', justifyContent: 'center' },[m
+[32m+[m[32m  pdfBtn: { backgroundColor: appColors.primary },[m
+[32m+[m[32m  homeBtn: { backgroundColor: appColors.surfaceRaised, borderWidth: 1, borderColor: '#e5e7eb' },[m
+[32m+[m[32m  modalBtnText: { color: '#fff', fontSize: 14, fontWeight: 'bold', fontFamily: 'Vazirmatn' },[m
+[32m+[m[32m});[m

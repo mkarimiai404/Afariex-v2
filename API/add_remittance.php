@@ -65,17 +65,27 @@ if (array_key_exists('rate_id', $data)) {
     }
     $requestedRateId = (int)$rateIdValue;
 }
+$requestedRateValue = null;
+if (array_key_exists('rate_value', $data)) {
+    $rateValue = trim((string)$data['rate_value']);
+    if ($rateValue === '' || !is_numeric($rateValue) || !is_finite((float)$rateValue) || (float)$rateValue <= 0) {
+        json_response(['success' => false, 'code' => 'INVALID_EXCHANGE_RATE', 'message' => 'Invalid exchange rate. Please reload the remittance form.'], 422);
+    }
+    $requestedRateValue = (float)$rateValue;
+}
 $senderName = trim((string)($data['sender_name'] ?? ''));
 $receiverName = trim((string)($data['receiver_name'] ?? ''));
 $receiverPhone = trim((string)($data['receiver_phone'] ?? ''));
-$amountToman = (float)($data['amount_toman'] ?? 0);
-$amountAfghani = (float)($data['amount_afn'] ?? 0);
+$amountTomanRaw = trim((string)($data['amount_toman'] ?? '0'));
+$amountAfghaniRaw = trim((string)($data['amount_afn'] ?? '0'));
+$amountToman = is_numeric($amountTomanRaw) ? (float)$amountTomanRaw : 0.0;
+$amountAfghani = is_numeric($amountAfghaniRaw) ? (float)$amountAfghaniRaw : 0.0;
 
 if ($userId <= 0) {
     json_response(['success' => false, 'message' => 'شناسه کاربر نامعتبر است.'], 400);
 }
 
-if ($amountToman <= 0 || $amountAfghani <= 0) {
+if (!is_finite($amountToman) || !is_finite($amountAfghani) || $amountToman <= 0 || $amountAfghani <= 0) {
     json_response(['success' => false, 'message' => 'مبلغ حواله معتبر نیست.'], 400);
 }
 
@@ -112,10 +122,13 @@ if ($rateColumn !== null) {
         $activeRateStmt->execute([$requestedRateId]);
         $activeRateRow = $activeRateStmt->fetch();
         if (!$activeRateRow) {
+            $latestRateStmt = db()->query("SELECT id, `{$rateColumn}` AS toman_per_afn FROM exchange_rates WHERE is_active = 1 ORDER BY id DESC LIMIT 1");
+            $latestActiveRate = $latestRateStmt ? ($latestRateStmt->fetch(PDO::FETCH_ASSOC) ?: null) : null;
             json_response([
                 'success' => false,
                 'code' => 'EXCHANGE_RATE_CHANGED',
                 'message' => 'The exchange rate changed. Please reload the remittance form.',
+                'data' => ['active_rate' => $latestActiveRate],
             ], 409);
         }
     } else {
@@ -124,7 +137,7 @@ if ($rateColumn !== null) {
     }
 }
 $activeRate = $activeRateRow ? (float)($activeRateRow['toman_per_afn'] ?? 0) : 0.0;
-if ($activeRate <= 0) {
+if (!is_finite($activeRate) || $activeRate <= 0) {
     json_response([
         'success' => false,
         'code' => 'FIXED_RATE_UNAVAILABLE',
@@ -132,12 +145,33 @@ if ($activeRate <= 0) {
     ], 422);
 }
 
+if ($requestedRateValue !== null) {
+    $rateValueTolerance = max(0.00000001, abs($activeRate) * 0.0000000001);
+    if (abs($requestedRateValue - $activeRate) > $rateValueTolerance) {
+        json_response([
+            'success' => false,
+            'code' => 'EXCHANGE_RATE_CHANGED',
+            'message' => 'The exchange rate changed. Please reload the remittance form.',
+            'data' => [
+                'active_rate' => [
+                    'id' => (int)($activeRateRow['id'] ?? 0),
+                    'toman_per_afn' => $activeRate,
+                ],
+            ],
+        ], 409);
+    }
+}
+
 $expectedAfghani = $amountToman / $activeRate;
 $expectedAfghaniCents = (int)round($expectedAfghani * 100, 0, PHP_ROUND_HALF_UP);
 $clientAfghaniCents = (int)round($amountAfghani * 100, 0, PHP_ROUND_HALF_UP);
 $expectedAfghaniRounded = $expectedAfghaniCents / 100;
 
-if (abs($clientAfghaniCents - $expectedAfghaniCents) > (int)round(REMITTANCE_AFN_TOLERANCE * 100)) {
+// Both values are rounded to cents before comparison. This mirrors the
+// frontend's two-decimal AFN amount and avoids binary float noise while
+// retaining the established five-paisa tolerance.
+$toleranceCents = (int)round(REMITTANCE_AFN_TOLERANCE * 100, 0, PHP_ROUND_HALF_UP);
+if (abs($clientAfghaniCents - $expectedAfghaniCents) > $toleranceCents) {
     json_response([
         'success' => false,
         'code' => 'INVALID_CONVERTED_AMOUNT',
