@@ -168,6 +168,7 @@ export default function AddRemittanceScreen() {
   const resolvedUserId = userId?.trim() || '';
   const resolvedApiToken = userToken?.trim() || '';
   const loadInFlight = useRef(false);
+  const submitInFlight = useRef(false);
 
   const [successModalVisible, setSuccessModalVisible] = useState(false);
   const [receiptModalVisible, setReceiptModalVisible] = useState(false);
@@ -422,7 +423,11 @@ export default function AddRemittanceScreen() {
         const validRates = ratesList.filter((rate: unknown): rate is ExchangeRate =>
           isRecord(rate)
           && (typeof rate.id === 'string' || typeof rate.id === 'number')
+          && Number.isInteger(Number(rate.id))
+          && Number(rate.id) > 0
           && (typeof rate.toman_per_afn === 'string' || typeof rate.toman_per_afn === 'number')
+          && Number.isFinite(Number(rate.toman_per_afn))
+          && Number(rate.toman_per_afn) > 0
         );
         setExchangeRates(validRates);
         if (validRates.length > 0) setSelectedRateId(Number(validRates[0].id));
@@ -575,7 +580,7 @@ export default function AddRemittanceScreen() {
   };
 
   const handleSubmit = async () => {
-    if (submitting || completedRemittanceId) return;
+    if (submitInFlight.current || submitting || completedRemittanceId) return;
 
     const selectedAgency = agencies.find((a) => String(a.id) === String(selectedAgencyId));
     const cleanAmountToman = normalizeMoneyInput(amountToman);
@@ -589,13 +594,14 @@ export default function AddRemittanceScreen() {
       await handleOpenVariableRateWhatsApp();
       return;
     }
-    if (!selectedRate) return showError('خطا', 'نرخ ارز معتبر یافت نشد.');
-    if (!cleanAmountToman || Number(cleanAmountToman) <= 0) return showError('خطا', 'مبلغ تومان را وارد کنید.');
+    if (!selectedRate || !Number.isFinite(Number(selectedRate.toman_per_afn)) || Number(selectedRate.toman_per_afn) <= 0) return showError('خطا', 'نرخ ارز معتبر یافت نشد.');
+    if (!cleanAmountToman || !Number.isFinite(Number(cleanAmountToman)) || Number(cleanAmountToman) <= 0) return showError('خطا', 'مبلغ تومان را وارد کنید.');
     if (!resolvedUserId) return showError('خطا', 'شناسه کاربر یافت نشد. دوباره وارد شوید.');
     if (!senderName.trim() || !receiverName.trim() || !receiverPhone.trim()) {
       return showError('خطا', 'نام فرستنده، گیرنده و شماره تماس الزامی است.');
     }
 
+    submitInFlight.current = true;
     setSubmitting(true);
     let commitReceived = false;
     try {
@@ -609,14 +615,16 @@ export default function AddRemittanceScreen() {
       payload.append('destination_country', selectedDestinationCountry);
       payload.append('source_currency', selectedSourceCurrency);
       payload.append('destination_currency', selectedDestinationCurrency);
-      payload.append('rate_id', String(selectedRate.id));
+      let submissionRate = selectedRate;
+      let submittedAmountAfghani = calculatedAmountAfghani;
+      payload.append('rate_id', String(submissionRate.id));
       payload.append('sender_name', senderName.trim());
       payload.append('receiver_name', receiverName.trim());
       payload.append('receiver_phone', receiverPhone.trim());
       payload.append('amount_toman', cleanAmountToman);
-      payload.append('amount_afn', calculatedAmountAfghani);
+      payload.append('amount_afn', submittedAmountAfghani);
 
-      const response = await fetch(apiUrl('add_remittance.php'), {
+      const sendRemittance = () => fetch(apiUrl('add_remittance.php'), {
         method: 'POST',
         headers: {
           Accept: 'application/json',
@@ -625,18 +633,15 @@ export default function AddRemittanceScreen() {
         body: payload.toString(),
       });
 
-      const responseText = await response.text();
-      let result: any = {};
-      try {
-        result = responseText ? JSON.parse(responseText) : {};
-      } catch {
-        showError('خطا', 'پاسخ معتبری از سرور دریافت نشد.');
+      let response = await sendRemittance();
+      const parseResponse = (responseText: string) => {
+        try { return responseText ? JSON.parse(responseText) : {}; } catch { return null; }
+      };
+      let result: any = parseResponse(await response.text());
+      if (result === null) {
+        showError('Error', 'Invalid response received from the server.');
         return;
       }
-
-      const responseMessage = typeof result?.message === 'string' ? result.message.trim() : '';
-      const normalizedStatus = String(result?.status ?? '').toLowerCase();
-      const isErrorResponse = normalizedStatus === 'error' || response.status === 403 || !response.ok;
 
       if (result?.code === 'DAILY_TRANSACTION_LIMIT_EXCEEDED') {
         showError('سقف تراکنش روزانه', `سقف: ${Number(result?.data?.daily_limit || 0).toLocaleString('en-US')} تومان، باقی‌مانده: ${Number(result?.data?.remaining_today || 0).toLocaleString('en-US')} تومان`);
@@ -644,59 +649,53 @@ export default function AddRemittanceScreen() {
         return;
       }
 
+      const firstCode = String(result?.code ?? result?.data?.code ?? '').trim().toUpperCase();
+      const isRateConflict = (res: Response, body: any) => {
+        const code = String(body?.code ?? body?.data?.code ?? '').trim().toUpperCase();
+        return res.status === 409 || ['EXCHANGE_RATE_CHANGED', 'INVALID_CONVERTED_AMOUNT', 'RATE_MISMATCH'].includes(code);
+      };
+      if (isRateConflict(response, result) || firstCode === 'EXCHANGE_RATE_CHANGED') {
+        try {
+          const ratesResponse = await fetch(apiUrl('get_exchange_rates.php'), {
+            method: 'GET',
+            headers: { Accept: 'application/json', 'Cache-Control': 'no-cache, no-store, must-revalidate', Pragma: 'no-cache' },
+          });
+          const ratesData = await ratesResponse.json();
+          const ratesList = ratesData?.data ?? ratesData?.rows ?? [];
+          const refreshedRates = Array.isArray(ratesList) ? ratesList.filter((rate: unknown): rate is ExchangeRate =>
+            isRecord(rate)
+            && (typeof rate.id === 'string' || typeof rate.id === 'number')
+            && Number.isInteger(Number(rate.id)) && Number(rate.id) > 0
+            && (typeof rate.toman_per_afn === 'string' || typeof rate.toman_per_afn === 'number')
+            && Number.isFinite(Number(rate.toman_per_afn)) && Number(rate.toman_per_afn) > 0
+          ) : [];
+          if (!ratesResponse.ok || !ratesData?.success || refreshedRates.length === 0) throw new Error('No usable rate');
+
+          submissionRate = refreshedRates[0];
+          submittedAmountAfghani = calculateAfghaniAmount(cleanAmountToman, submissionRate.toman_per_afn);
+          if (!submittedAmountAfghani) throw new Error('Could not calculate converted amount');
+          setExchangeRates(refreshedRates);
+          setSelectedRateId(Number(submissionRate.id));
+          setAmountAfghani(submittedAmountAfghani);
+          payload.set('rate_id', String(submissionRate.id));
+          payload.set('amount_afn', submittedAmountAfghani);
+
+          response = await sendRemittance();
+          result = parseResponse(await response.text());
+          if (result === null) throw new Error('Invalid retry response');
+        } catch {
+          showError('Error', 'The exchange rate could not be refreshed or the remittance retry failed. Please check your connection and try again.');
+          return;
+        }
+      }
+
+      const responseMessage = typeof result?.message === 'string' ? result.message.trim() : '';
+      const normalizedStatus = String(result?.status ?? '').toLowerCase();
+      const isErrorResponse = normalizedStatus === 'error' || response.status === 403 || !response.ok;
       const responseCode = String(result?.code ?? result?.data?.code ?? '').trim();
 
       if (responseCode === 'INSUFFICIENT_BALANCE') {
         setInsufficientBalanceVisible(true);
-        return;
-      }
-
-      if (responseCode === 'EXCHANGE_RATE_CHANGED') {
-        try {
-          const ratesResponse = await fetch(apiUrl('get_exchange_rates.php'), {
-            method: 'GET',
-            headers: {
-              Accept: 'application/json',
-              'Cache-Control': 'no-cache, no-store, must-revalidate',
-              Pragma: 'no-cache',
-            },
-          });
-          const ratesData = await ratesResponse.json();
-          const ratesList = ratesData?.data ?? ratesData?.rows ?? [];
-          const refreshedRates = Array.isArray(ratesList)
-            ? ratesList.filter((rate: unknown): rate is ExchangeRate =>
-              isRecord(rate)
-              && (typeof rate.id === 'string' || typeof rate.id === 'number')
-              && (typeof rate.toman_per_afn === 'string' || typeof rate.toman_per_afn === 'number')
-              && Number.isFinite(Number(rate.toman_per_afn))
-              && Number(rate.toman_per_afn) > 0
-            )
-            : [];
-
-          if (!ratesResponse.ok || !ratesData?.success || refreshedRates.length === 0) {
-            throw new Error('No usable exchange rate returned');
-          }
-
-          const latestRate = refreshedRates[0];
-          const updatedAfghaniAmount = calculateAfghaniAmount(cleanAmountToman, latestRate.toman_per_afn);
-          setExchangeRates(refreshedRates);
-          setSelectedRateId(Number(latestRate.id));
-          setAmountAfghani(updatedAfghaniAmount);
-          Alert.alert(
-            'نرخ ارز به‌روزرسانی شد',
-            `مبلغ معادل افغانی اکنون ${toPersianNum(updatedAfghaniAmount)} افغانی است. لطفاً مبلغ جدید را بررسی کنید؛ برای ادامه، حواله را دوباره ثبت کنید.`,
-            [{ text: 'متوجه شدم' }]
-          );
-        } catch {
-          setExchangeRates([]);
-          setSelectedRateId(null);
-          setAmountAfghani('');
-          Alert.alert(
-            'به‌روزرسانی نرخ ناموفق بود',
-            'دریافت نرخ جدید ممکن نشد. لطفاً اتصال اینترنت را بررسی و دوباره تلاش کنید. مبلغی ثبت نشده است.',
-            [{ text: 'متوجه شدم' }]
-          );
-        }
         return;
       }
 
@@ -728,7 +727,7 @@ export default function AddRemittanceScreen() {
           date: receiptData.created_at ? formatReceiptDate(String(receiptData.created_at)) : '',
           sender: String(receiptData.sender ?? senderName.trim()),
           receiver: String(receiptData.receiver ?? receiverName.trim()),
-          amountAfghani: receiptData.amount_afghani ?? amountAfghani.trim(),
+          amountAfghani: receiptData.amount_afghani ?? submittedAmountAfghani,
           amountToman: receiptData.amount_toman ?? cleanAmountToman,
           feeAmount: receiptData.fee?.fee_amount ?? 0,
           totalCharged: receiptData.fee?.total_amount ?? cleanAmountToman,
@@ -766,6 +765,7 @@ export default function AddRemittanceScreen() {
         showError('خطای ارتباط', 'مشکل در ارتباط با سرور رخ داده است.');
       }
     } finally {
+      submitInFlight.current = false;
       setSubmitting(false);
     }
   };
