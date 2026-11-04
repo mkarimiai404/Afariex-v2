@@ -221,9 +221,10 @@ export const fetchJson = async <T = JsonValue>(
             url,
             method,
             tokenPresent: typeof init?.body === 'string' && init.body.includes('api_token='),
-            details,
+            error: details.message,
+            status: (error as ApiResponseError).status || 'unknown',
+            code: (error as ApiResponseError).responseCode || 'unknown',
           });
-          console.log(`[API] failure method=${method} url=${url} status=${(error as ApiResponseError).status || 'unknown'} code=${(error as ApiResponseError).responseCode || 'unknown'}`);
         }
         lastError = isApiResponseError(error)
           ? error
