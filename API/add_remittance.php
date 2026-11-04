@@ -117,23 +117,17 @@ $rateColumn = in_array('afn_to_toman', $rateColumns, true)
     : (in_array('rate', $rateColumns, true) ? 'rate' : null);
 $activeRateRow = false;
 if ($rateColumn !== null) {
-    if ($requestedRateId !== null) {
-        $activeRateStmt = db()->prepare("SELECT id, `{$rateColumn}` AS toman_per_afn FROM exchange_rates WHERE id = ? AND is_active = 1 LIMIT 1");
-        $activeRateStmt->execute([$requestedRateId]);
-        $activeRateRow = $activeRateStmt->fetch();
-        if (!$activeRateRow) {
-            $latestRateStmt = db()->query("SELECT id, `{$rateColumn}` AS toman_per_afn FROM exchange_rates WHERE is_active = 1 ORDER BY id DESC LIMIT 1");
-            $latestActiveRate = $latestRateStmt ? ($latestRateStmt->fetch(PDO::FETCH_ASSOC) ?: null) : null;
-            json_response([
-                'success' => false,
-                'code' => 'EXCHANGE_RATE_CHANGED',
-                'message' => 'The exchange rate changed. Please reload the remittance form.',
-                'data' => ['active_rate' => $latestActiveRate],
-            ], 409);
-        }
-    } else {
-        $activeRateStmt = db()->query("SELECT id, `{$rateColumn}` AS toman_per_afn FROM exchange_rates WHERE is_active = 1 ORDER BY id DESC LIMIT 1");
-        $activeRateRow = $activeRateStmt ? $activeRateStmt->fetch() : false;
+    // Match submissions against the same newest active rate returned by
+    // get_exchange_rates.php; older rows can remain marked active temporarily.
+    $activeRateStmt = db()->query("SELECT id, `{$rateColumn}` AS toman_per_afn FROM exchange_rates WHERE is_active = 1 ORDER BY id DESC LIMIT 1");
+    $activeRateRow = $activeRateStmt ? $activeRateStmt->fetch(PDO::FETCH_ASSOC) : false;
+    if ($requestedRateId !== null && (!$activeRateRow || (int)$activeRateRow['id'] !== $requestedRateId)) {
+        json_response([
+            'success' => false,
+            'code' => 'EXCHANGE_RATE_CHANGED',
+            'message' => 'The exchange rate changed. The latest rate is included for automatic retry.',
+            'data' => ['active_rate' => $activeRateRow ?: null],
+        ], 409);
     }
 }
 $activeRate = $activeRateRow ? (float)($activeRateRow['toman_per_afn'] ?? 0) : 0.0;
