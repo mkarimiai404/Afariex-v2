@@ -21,7 +21,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAuth } from '@/lib/auth-context';
-import { apiUrl } from '@/lib/api';
+import { ApiResponseError, apiUrl, authenticatedFormBody, fetchJson } from '@/lib/api';
 import { showError, showSuccess } from '@/lib/toast';
 import { appColors } from '@/lib/theme';
 import { AppBottomNav } from '@/components/app-bottom-nav';
@@ -88,10 +88,31 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const calculateAfghaniAmount = (amountToman: string | number, tomanPerAfghani: string | number) => {
   const normalizedToman = normalizeMoneyInput(amountToman);
-  const rate = Number(tomanPerAfghani);
-  if (!normalizedToman || !Number.isFinite(rate) || rate <= 0) return '';
-  const calculated = Number(normalizedToman) / rate;
-  return Number.isFinite(calculated) ? calculated.toFixed(2) : '';
+  const rateText = String(tomanPerAfghani).trim().toLowerCase();
+  const rateParts = rateText.match(/^(\d+)(?:\.(\d*))?(?:e([+-]?\d+))?$/);
+  if (!normalizedToman || !rateParts) return '';
+
+  try {
+    let rateDigits = BigInt(`${rateParts[1]}${rateParts[2] || ''}`);
+    let rateScale = (rateParts[2] || '').length - Number(rateParts[3] || 0);
+    if (rateScale < 0) {
+      rateDigits *= 10n ** BigInt(-rateScale);
+      rateScale = 0;
+    }
+    while (rateScale > 0 && rateDigits % 10n === 0n) {
+      rateDigits /= 10n;
+      rateScale -= 1;
+    }
+    if (rateDigits <= 0n) return '';
+
+    const numerator = BigInt(normalizedToman) * 100n * (10n ** BigInt(rateScale));
+    const wholeCents = numerator / rateDigits;
+    const remainder = numerator % rateDigits;
+    const roundedCents = wholeCents + (remainder * 2n >= rateDigits ? 1n : 0n);
+    return `${roundedCents / 100n}.${String(roundedCents % 100n).padStart(2, '0')}`;
+  } catch {
+    return '';
+  }
 };
 
 export default function AddRemittanceScreen() {
@@ -122,7 +143,7 @@ export default function AddRemittanceScreen() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const resolvedUserId = userId?.trim() || '';
-  const resolvedApiToken = userToken?.trim() || '';
+  const apiToken = userToken?.trim() || '';
   const loadInFlight = useRef(false);
   const submitInFlight = useRef(false);
 
@@ -179,7 +200,6 @@ export default function AddRemittanceScreen() {
     setReceiverName('');
     setReceiverPhone('');
   };
-
 
   useEffect(() => {
     const fallbackName = userName?.trim() || userMobile?.trim() || '';
@@ -269,14 +289,14 @@ export default function AddRemittanceScreen() {
 
   useEffect(() => {
     const amount = Number(normalizeMoneyInput(amountToman));
-    if (!resolvedApiToken || !Number.isFinite(amount) || amount <= 0) {
+    if (!apiToken || !Number.isFinite(amount) || amount <= 0) {
       setFeePreview(null);
       return;
     }
     const timer = setTimeout(async () => {
       try {
         const payload = new URLSearchParams({
-          api_token: resolvedApiToken,
+          api_token: apiToken,
           service_code: 'remittance',
           amount: String(Math.round(amount)),
         });
@@ -301,7 +321,7 @@ export default function AddRemittanceScreen() {
       }
     }, 350);
     return () => clearTimeout(timer);
-  }, [amountToman, resolvedApiToken]);
+  }, [amountToman, apiToken]);
 
   const handleDownloadPdf = async () => {
     if (!completedReceipt || receiptBusyAction) return;
@@ -354,144 +374,122 @@ export default function AddRemittanceScreen() {
       await handleOpenVariableRateWhatsApp();
       return;
     }
-    if (!selectedRate || !Number.isFinite(Number(selectedRate.toman_per_afn)) || Number(selectedRate.toman_per_afn) <= 0) return showError('خطا', 'نرخ ارز معتبر یافت نشد.');
+    if (!selectedRate || !Number.isFinite(Number(selectedRate.toman_per_afn)) || Number(selectedRate.toman_per_afn) <= 0) return showError('خطا', 'نرخ ارز معتبر یافت نشد. لطفاً فرم را دوباره بارگذاری کنید.');
     if (!cleanAmountToman || !Number.isFinite(Number(cleanAmountToman)) || Number(cleanAmountToman) <= 0) return showError('خطا', 'مبلغ تومان را وارد کنید.');
     if (!resolvedUserId) return showError('خطا', 'شناسه کاربر یافت نشد. دوباره وارد شوید.');
+    if (!apiToken) return showError('خطای احراز هویت', 'نشست شما معتبر نیست. لطفاً دوباره وارد شوید.');
     if (!senderName.trim() || !receiverName.trim() || !receiverPhone.trim()) {
       return showError('خطا', 'نام فرستنده، گیرنده و شماره تماس الزامی است.');
     }
+    if (!calculatedAmountAfghani) return showError('خطا', 'محاسبه مبلغ افغانی انجام نشد. نرخ ارز را بررسی کنید.');
 
     submitInFlight.current = true;
     setSubmitting(true);
     let commitReceived = false;
     try {
-      // استفاده از URLSearchParams برای اطمینان 100% از دریافت در بک‌اند
-      const payload = new URLSearchParams();
-
-      // کلیدهای زیر دقیقاً با فایل بک‌اند همگام شده‌اند
-      payload.append('user_id', resolvedUserId);
-      if (resolvedApiToken) payload.append('api_token', resolvedApiToken);
-      payload.append('agency', selectedAgency.name);
-      payload.append('destination_country', selectedDestinationCountry);
-      payload.append('country_code', selectedDestinationCountry);
-      payload.append('source_currency', selectedSourceCurrency);
-      payload.append('destination_currency', selectedDestinationCurrency);
+      const payload = authenticatedFormBody(apiToken, {
+        user_id: resolvedUserId,
+        agency: selectedAgency.name,
+        destination_country: selectedDestinationCountry,
+        source_currency: selectedSourceCurrency,
+        destination_currency: selectedDestinationCurrency,
+        sender_name: senderName.trim(),
+        receiver_name: receiverName.trim(),
+        receiver_phone: receiverPhone.trim(),
+        amount_toman: cleanAmountToman,
+      });
       let submissionRate = selectedRate;
       let submittedAmountAfghani = calculatedAmountAfghani;
-      payload.append('rate_id', String(submissionRate.id));
-      payload.append('sender_name', senderName.trim());
-      payload.append('receiver_name', receiverName.trim());
-      payload.append('receiver_phone', receiverPhone.trim());
-      payload.append('amount_toman', cleanAmountToman);
-      payload.append('amount_afn', submittedAmountAfghani);
 
-      const sendRemittance = () => fetch(apiUrl('add_remittance.php'), {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: payload.toString(),
-      });
-
-      let response = await sendRemittance();
-      const parseResponse = (responseText: string): Record<string, any> | null => {
-        try {
-          const parsed: unknown = responseText ? JSON.parse(responseText) : {};
-          return isRecord(parsed) ? parsed : null;
-        } catch {
-          return null;
-        }
+      const sendRemittance = (rate: ExchangeRate, afnAmount: string) => {
+        const requestPayload = new URLSearchParams(payload);
+        requestPayload.set('rate_id', String(rate.id));
+        requestPayload.set('rate_value', String(rate.toman_per_afn));
+        requestPayload.set('amount_afn', afnAmount);
+        return fetchJson<Record<string, any>>('add_remittance.php', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: requestPayload.toString(),
+        });
       };
-      let result = parseResponse(await response.text());
-      if (result === null) {
-        showError('خطا', 'پاسخ معتبری از سرور دریافت نشد.');
-        return;
-      }
 
-      const responseCodeOf = (body: Record<string, any>) =>
-        String(body.code ?? body.data?.code ?? body.result?.code ?? '').trim().toUpperCase();
-      const isRateConflict = (res: Response, body: Record<string, any>) =>
-        res.status === 409 || responseCodeOf(body) === 'EXCHANGE_RATE_CHANGED'
-        || ['INVALID_CONVERTED_AMOUNT', 'RATE_MISMATCH'].includes(responseCodeOf(body));
+      let result: Record<string, any>;
+      try {
+        result = await sendRemittance(submissionRate, submittedAmountAfghani);
+      } catch (error) {
+        const rateConflict = error instanceof ApiResponseError
+          && error.status === 409
+          && error.responseCode === 'EXCHANGE_RATE_CHANGED';
+        if (!rateConflict) throw error;
 
-      if (responseCodeOf(result) === 'DAILY_TRANSACTION_LIMIT_EXCEEDED') {
-        showError('سقف تراکنش روزانه', `سقف: ${Number(result.data?.daily_limit || 0).toLocaleString('en-US')} تومان، باقی‌مانده: ${Number(result.data?.remaining_today || 0).toLocaleString('en-US')} تومان`);
-        router.push('/access-level' as any);
-        return;
-      }
-
-      // A rate conflict gets exactly one retry, with both rate_id and its recalculated
-      // converted amount updated together. A second conflict is returned as an error.
-      if (isRateConflict(response, result)) {
+        let refreshedRates: ExchangeRate[];
         try {
-          const oldRateId = submissionRate.id;
-          const latestRatesUrl = `${apiUrl('get_exchange_rates.php')}?cache_bust=${Date.now()}`;
-          const ratesResponse = await fetch(latestRatesUrl, {
+          const ratesData = await fetchJson<Record<string, any>>(`get_exchange_rates.php?cache_bust=${Date.now()}`, {
             method: 'GET',
-            headers: {
-              Accept: 'application/json',
-              'Cache-Control': 'no-cache, no-store, must-revalidate',
-              Pragma: 'no-cache',
-            },
+            headers: { 'Cache-Control': 'no-cache, no-store, must-revalidate', Pragma: 'no-cache' },
             cache: 'no-store',
           });
-          const ratesData: unknown = await ratesResponse.json();
-          if (!isRecord(ratesData)) throw new Error('Invalid rates response');
           const ratesList = ratesData.data ?? ratesData.rows ?? [];
-          const refreshedRates = (Array.isArray(ratesList) ? ratesList.filter((rate: unknown): rate is ExchangeRate =>
+          refreshedRates = (Array.isArray(ratesList) ? ratesList.filter((rate: unknown): rate is ExchangeRate =>
             isRecord(rate)
             && (typeof rate.id === 'string' || typeof rate.id === 'number')
             && Number.isInteger(Number(rate.id)) && Number(rate.id) > 0
             && (typeof rate.toman_per_afn === 'string' || typeof rate.toman_per_afn === 'number')
             && Number.isFinite(Number(rate.toman_per_afn)) && Number(rate.toman_per_afn) > 0
           ) : []).sort((left, right) => Number(right.id) - Number(left.id));
-          if (!ratesResponse.ok || ratesData.success !== true || refreshedRates.length === 0) {
-            throw new Error('No usable exchange rate');
-          }
-
-          submissionRate = refreshedRates[0];
-          submittedAmountAfghani = calculateAfghaniAmount(cleanAmountToman, submissionRate.toman_per_afn);
-          if (!submittedAmountAfghani) throw new Error('Could not calculate converted amount');
-
-          setExchangeRates(refreshedRates);
-          setSelectedRateId(Number(submissionRate.id));
-          setAmountAfghani(submittedAmountAfghani);
-          payload.set('rate_id', String(submissionRate.id));
-          payload.set('amount_afn', submittedAmountAfghani);
-
-          if (__DEV__) {
-            console.info('[REMITTANCE] Retrying once with refreshed rate', {
-              oldRateId,
-              newRateId: submissionRate.id,
-              newRateValue: submissionRate.toman_per_afn,
-            });
-          }
-          response = await sendRemittance();
-          result = parseResponse(await response.text());
-          if (result === null) throw new Error('Invalid retry response');
+          if (ratesData.success !== true || refreshedRates.length === 0) throw new Error('No active exchange rate');
         } catch {
-          showError('خطا', 'به‌روزرسانی نرخ ارز یا تلاش مجدد برای ثبت حواله انجام نشد. اتصال اینترنت را بررسی و دوباره تلاش کنید.');
+          showError('نرخ ارز به‌روز شد', 'نرخ حواله تغییر کرد، اما تلاش مجدد انجام نشد. اطلاعات فرم حفظ شده است؛ لطفاً دوباره ثبت را بزنید.');
           return;
         }
+
+        submissionRate = refreshedRates[0];
+        submittedAmountAfghani = calculateAfghaniAmount(cleanAmountToman, submissionRate.toman_per_afn);
+        if (!submittedAmountAfghani) {
+          showError('نرخ ارز به‌روز شد', 'مبلغ افغانی با نرخ جدید محاسبه نشد. اطلاعات فرم حفظ شده است.');
+          return;
+        }
+
+        setExchangeRates(refreshedRates);
+        setSelectedRateId(Number(submissionRate.id));
+        setAmountAfghani(submittedAmountAfghani);
+        result = await sendRemittance(submissionRate, submittedAmountAfghani);
       }
 
-      const responseMessage = typeof result?.message === 'string' ? result.message.trim() : '';
-      const normalizedStatus = String(result.status ?? result.data?.status ?? '').toLowerCase();
-      const isErrorResponse = normalizedStatus === 'error' || response.status === 403 || !response.ok;
-      const responseCode = responseCodeOf(result);
-
-      if (responseCode === 'INSUFFICIENT_BALANCE') {
-        setInsufficientBalanceVisible(true);
+      if (result.success !== true && result.data?.success !== true) {
+        const responseCode = String(result.code ?? result.data?.code ?? '').trim().toUpperCase();
+        if (responseCode === 'INSUFFICIENT_BALANCE') {
+          setInsufficientBalanceVisible(true);
+          return;
+        }
+        if (responseCode === 'DAILY_TRANSACTION_LIMIT_EXCEEDED') {
+          const limit = Number(result.data?.daily_limit || 0).toLocaleString('en-US');
+          const remaining = Number(result.data?.remaining_today || 0).toLocaleString('en-US');
+          showError('سقف تراکنش روزانه', `سقف روزانه شما ${limit} تومان است و ${remaining} تومان باقی مانده است.`);
+          router.push('/access-level' as any);
+          return;
+        }
+        if (responseCode === 'CUSTOM_REMITTANCE_LIMIT_EXCEEDED') {
+          showError('سقف حواله روزانه', 'سقف اختصاصی حواله روزانه شما تکمیل شده است.');
+          return;
+        }
+        if (responseCode === 'EXCHANGE_RATE_CHANGED') {
+          showError('نرخ ارز به‌روز شد', 'نرخ دوباره تغییر کرد. مبلغ و نرخ جدید را بررسی و دوباره ثبت کنید.');
+          return;
+        }
+        if (responseCode === 'SUBCUSTOMER_VERIFICATION_REQUIRED') {
+          showError('تکمیل احراز هویت', 'برای ثبت حواله، ابتدا تأیید تلفن و احراز هویت را تکمیل کنید.');
+          return;
+        }
+        if (responseCode === 'AUTHENTICATION_REQUIRED' || responseCode === 'AUTHENTICATION_FAILED') {
+          showError('نشست منقضی شده', 'لطفاً دوباره وارد حساب خود شوید.');
+          return;
+        }
+        showError('ثبت حواله انجام نشد', 'اطلاعات حواله یا نرخ ارز معتبر نیست. فرم را بررسی و دوباره تلاش کنید.');
         return;
       }
 
-      if (isErrorResponse) {
-        showError('خطا', responseMessage || 'خطا در ثبت حواله.');
-        return;
-      }
-
-      if (normalizedStatus === 'success' || result.success === true || result.data?.success === true) {
+      if (result.success === true || result.data?.success === true) {
         commitReceived = true;
         const committedRemittanceId = String(
           result?.data?.remittance_id ??
@@ -538,20 +536,39 @@ export default function AddRemittanceScreen() {
           setUserBalance(nextBalance);
         }
 
-        // The committed response is the receipt source; opening it is local UI
-        // state only and must never submit the remittance again.
         resetForm();
         setFeePreview(null);
         setReceiptModalVisible(true);
         showSuccess('موفق', 'حواله با موفقیت ثبت شد.');
       } else {
-        showError('خطا', result?.message || 'خطا در ثبت حواله.');
+        showError('ثبت حواله انجام نشد', 'پاسخ موفق از سرور دریافت نشد. لطفاً دوباره تلاش کنید.');
       }
     } catch (err) {
       if (commitReceived) {
         showError('رسید حواله', 'حواله با موفقیت ثبت شد، اما نمایش رسید انجام نشد.');
+      } else if (err instanceof ApiResponseError) {
+        const responseData = isRecord(err.responseData) ? err.responseData : {};
+        const data = isRecord(responseData.data) ? responseData.data : {};
+        if (err.responseCode === 'INSUFFICIENT_BALANCE') {
+          setInsufficientBalanceVisible(true);
+        } else if (err.responseCode === 'DAILY_TRANSACTION_LIMIT_EXCEEDED') {
+          const limit = Number(data.daily_limit || 0).toLocaleString('en-US');
+          const remaining = Number(data.remaining_today || 0).toLocaleString('en-US');
+          showError('سقف تراکنش روزانه', `سقف روزانه شما ${limit} تومان است و ${remaining} تومان باقی مانده است.`);
+          router.push('/access-level' as any);
+        } else if (err.responseCode === 'CUSTOM_REMITTANCE_LIMIT_EXCEEDED') {
+          showError('سقف حواله روزانه', 'سقف اختصاصی حواله روزانه شما تکمیل شده است.');
+        } else if (err.responseCode === 'EXCHANGE_RATE_CHANGED') {
+          showError('نرخ ارز به‌روز شد', 'نرخ دوباره تغییر کرد. مبلغ جدید را بررسی و دوباره ثبت کنید.');
+        } else if (err.responseCode === 'SUBCUSTOMER_VERIFICATION_REQUIRED') {
+          showError('تکمیل احراز هویت', 'برای ثبت حواله، ابتدا تأیید تلفن و احراز هویت را تکمیل کنید.');
+        } else if (err.responseCode === 'AUTHENTICATION_REQUIRED' || err.responseCode === 'AUTHENTICATION_FAILED') {
+          showError('نشست منقضی شده', 'لطفاً دوباره وارد حساب خود شوید.');
+        } else {
+          showError('ثبت حواله انجام نشد', 'اطلاعات حواله یا نرخ ارز معتبر نیست. فرم را بررسی و دوباره تلاش کنید.');
+        }
       } else {
-        showError('خطای ارتباط', 'مشکل در ارتباط با سرور رخ داده است.');
+        showError('خطای ارتباط', 'ارتباط با سرور برقرار نشد یا پاسخ معتبر نبود. اطلاعات فرم حفظ شده است.');
       }
     } finally {
       submitInFlight.current = false;
@@ -586,7 +603,6 @@ export default function AddRemittanceScreen() {
         <View style={styles.outerBackground}>
           <View style={styles.boxedContainer}>
 
-            {/* هدر مشابه صفحه افزایش موجودی */}
             <View style={styles.customHeader}>
               <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
                 <Ionicons name="arrow-forward" size={24} color="#4b5563" />
@@ -784,7 +800,6 @@ export default function AddRemittanceScreen() {
         </View>
       </Modal>
 
-      {/* مدال موفقیت */}
       <Modal
         visible={successModalVisible}
         transparent
@@ -792,7 +807,7 @@ export default function AddRemittanceScreen() {
         onRequestClose={() => setSuccessModalVisible(false)}>
         <View style={styles.modalBackdrop}>
           <View style={styles.modalCard}>
-                <Ionicons name="checkmark-circle" size={60} color={appColors.primary} style={{ alignSelf: 'center', marginBottom: 10 }} />
+            <Ionicons name="checkmark-circle" size={60} color={appColors.primary} style={{ alignSelf: 'center', marginBottom: 10 }} />
             <Text style={styles.modalTitle}>حواله با موفقیت ثبت شد</Text>
             <Text style={styles.modalLine}>کد پیگیری: <Text style={styles.modalCode}>{toPersianNum(customerTrackingNumber(lastTrackingCode))}</Text></Text>
             <Text style={styles.modalLine}>نمایندگی: {lastAgencyName}</Text>
@@ -894,7 +909,6 @@ const styles = StyleSheet.create({
   backBtn: { width: 40, height: 40, borderRadius: 20, backgroundColor: appColors.surfaceRaised, justifyContent: 'center', alignItems: 'center' },
   headerTitle: { fontSize: 16, fontWeight: 'bold', color: appColors.text, fontFamily: 'Vazirmatn' },
   scrollContent: { padding: 0, flexGrow: 1, paddingBottom: 70 },
-
   label: { fontSize: 13, color: appColors.textMuted, marginBottom: 8, marginTop: 15, fontFamily: 'Vazirmatn', textAlign: 'right' },
   input: {
     width: '100%',
@@ -912,7 +926,6 @@ const styles = StyleSheet.create({
   disabledInput: { backgroundColor: appColors.surfaceRaised, color: '#9ca3af' },
   variableRateBox: { borderWidth: 1, borderColor: '#f59e0b', backgroundColor: '#fffbeb', borderRadius: 14, padding: 14, marginTop: 16 },
   variableRateText: { color: '#92400e', fontFamily: 'Vazirmatn', fontSize: 12, lineHeight: 21, textAlign: 'right' },
-
   pickerContainer: {
     borderWidth: 1,
     borderColor: '#e5e7eb',
@@ -934,7 +947,6 @@ const styles = StyleSheet.create({
     backgroundColor: appColors.surfaceRaised
   },
   readonlyText: { fontSize: 14, color: appColors.textSecondary, fontFamily: 'Vazirmatn', textAlign: 'right' },
-
   row: { flexDirection: 'row-reverse', justifyContent: 'space-between', gap: 10 },
   half: { flex: 1 },
   spacer: { marginTop: 25 },
@@ -945,7 +957,6 @@ const styles = StyleSheet.create({
   feeTotalRow: { borderTopWidth: 1, borderTopColor: '#dce7ef', marginTop: 5, paddingTop: 11 },
   feeTotalLabel: { fontFamily: 'VazirmatnBold', fontSize: 13, color: appColors.primary, textAlign: 'right' },
   feeTotalValue: { fontFamily: 'VazirmatnBold', fontSize: 14, color: appColors.primary, textAlign: 'left' },
-
   submitBtn: {
     width: '100%',
     backgroundColor: appColors.primary,
@@ -963,14 +974,11 @@ const styles = StyleSheet.create({
   disabledBtn: { opacity: 0.7 },
   submitBtnText: { color: '#fff', fontSize: 15, fontWeight: 'bold', fontFamily: 'Vazirmatn' },
   whatsappBtn: { width: '100%', minHeight: 52, backgroundColor: '#128c7e', padding: 15, borderRadius: 12, flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', marginTop: 16, marginBottom: 20 },
-
   center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: appColors.background },
   loadingText: { marginTop: 10, color: appColors.textMuted, fontFamily: 'Vazirmatn' },
   errorText: { color: '#ef4444', fontFamily: 'Vazirmatn', marginBottom: 15, textAlign: 'center' },
   retryBtn: { backgroundColor: appColors.primary, paddingHorizontal: 20, paddingVertical: 10, borderRadius: 10 },
   retryText: { color: '#fff', fontFamily: 'Vazirmatn' },
-
-  // استایل‌های مدال
   modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', padding: 20 },
   modalCard: { backgroundColor: appColors.surface, borderRadius: 24, padding: 25, width: '100%' },
   modalTitle: { textAlign: 'center', fontSize: 18, fontWeight: 'bold', color: appColors.text, fontFamily: 'Vazirmatn', marginBottom: 15 },

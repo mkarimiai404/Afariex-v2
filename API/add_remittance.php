@@ -54,7 +54,8 @@ $data = get_request_data();
 $userId = (int)($data['user_id'] ?? $data['id'] ?? $data['uid'] ?? 0);
 $apiToken = trim((string)($data['api_token'] ?? $data['token'] ?? $data['user_token'] ?? ''));
 $agency = trim((string)($data['agency'] ?? $data['agency_name'] ?? $data['agency_id'] ?? ''));
-$destinationCountryInput = strtoupper(trim((string)($data['destination_country'] ?? '')));
+// پشتیبانی همزمان از destination_country و country_code
+$destinationCountryInput = strtoupper(trim((string)($data['destination_country'] ?? $data['country_code'] ?? '')));
 $sourceCurrency = strtoupper(trim((string)($data['source_currency'] ?? 'IRT')));
 $destinationCurrency = strtoupper(trim((string)($data['destination_currency'] ?? 'AFN')));
 $requestedRateId = null;
@@ -80,6 +81,10 @@ $amountTomanRaw = trim((string)($data['amount_toman'] ?? '0'));
 $amountAfghaniRaw = trim((string)($data['amount_afn'] ?? '0'));
 $amountToman = is_numeric($amountTomanRaw) ? (float)$amountTomanRaw : 0.0;
 $amountAfghani = is_numeric($amountAfghaniRaw) ? (float)$amountAfghaniRaw : 0.0;
+
+if ($apiToken === '') {
+    json_response(['success' => false, 'code' => 'AUTHENTICATION_REQUIRED', 'message' => 'احراز هویت کاربر انجام نشد.'], 401);
+}
 
 if ($userId <= 0) {
     json_response(['success' => false, 'message' => 'شناسه کاربر نامعتبر است.'], 400);
@@ -111,14 +116,15 @@ if (!remittance_is_fixed_rate_pair($sourceCurrency, $destinationCurrency)
     ], 422);
 }
 
+if (!table_exists('exchange_rates')) {
+    json_response(['success' => false, 'code' => 'FIXED_RATE_UNAVAILABLE', 'message' => 'نرخ ثابت این حواله در دسترس نیست.'], 503);
+}
 $rateColumns = db()->query('SHOW COLUMNS FROM exchange_rates')->fetchAll(PDO::FETCH_COLUMN, 0);
 $rateColumn = in_array('afn_to_toman', $rateColumns, true)
     ? 'afn_to_toman'
     : (in_array('rate', $rateColumns, true) ? 'rate' : null);
 $activeRateRow = false;
-if ($rateColumn !== null) {
-    // Match submissions against the same newest active rate returned by
-    // get_exchange_rates.php; older rows can remain marked active temporarily.
+if ($rateColumn !== null && in_array('is_active', $rateColumns, true)) {
     $activeRateStmt = db()->query("SELECT id, `{$rateColumn}` AS toman_per_afn FROM exchange_rates WHERE is_active = 1 ORDER BY id DESC LIMIT 1");
     $activeRateRow = $activeRateStmt ? $activeRateStmt->fetch(PDO::FETCH_ASSOC) : false;
     if ($requestedRateId !== null && (!$activeRateRow || (int)$activeRateRow['id'] !== $requestedRateId)) {
@@ -161,9 +167,6 @@ $expectedAfghaniCents = (int)round($expectedAfghani * 100, 0, PHP_ROUND_HALF_UP)
 $clientAfghaniCents = (int)round($amountAfghani * 100, 0, PHP_ROUND_HALF_UP);
 $expectedAfghaniRounded = $expectedAfghaniCents / 100;
 
-// Both values are rounded to cents before comparison. This mirrors the
-// frontend's two-decimal AFN amount and avoids binary float noise while
-// retaining the established five-paisa tolerance.
 $toleranceCents = (int)round(REMITTANCE_AFN_TOLERANCE * 100, 0, PHP_ROUND_HALF_UP);
 if (abs($clientAfghaniCents - $expectedAfghaniCents) > $toleranceCents) {
     json_response([
@@ -177,16 +180,43 @@ try {
     ensure_verification_schema();
     db()->beginTransaction();
 
+    $lockedRateStmt = db()->query("SELECT id, `{$rateColumn}` AS toman_per_afn FROM exchange_rates WHERE is_active = 1 ORDER BY id DESC LIMIT 1 FOR UPDATE");
+    $lockedRateRow = $lockedRateStmt ? $lockedRateStmt->fetch(PDO::FETCH_ASSOC) : false;
+    $lockedRate = $lockedRateRow ? (float)($lockedRateRow['toman_per_afn'] ?? 0) : 0.0;
+    $lockedExpectedCents = is_finite($lockedRate) && $lockedRate > 0
+        ? (int)round(($amountToman / $lockedRate) * 100, 0, PHP_ROUND_HALF_UP)
+        : 0;
+    $lockedRateValueChanged = $requestedRateValue !== null
+        && is_finite($lockedRate)
+        && $lockedRate > 0
+        && abs($requestedRateValue - $lockedRate) > max(0.00000001, abs($lockedRate) * 0.0000000001);
+    $lockedRateChanged = !$lockedRateRow
+        || !is_finite($lockedRate)
+        || $lockedRate <= 0
+        || ($requestedRateId !== null && (int)$lockedRateRow['id'] !== $requestedRateId)
+        || $lockedRateValueChanged
+        || abs($clientAfghaniCents - $lockedExpectedCents) > $toleranceCents;
+    if ($lockedRateChanged) {
+        db()->rollBack();
+        json_response([
+            'success' => false,
+            'code' => 'EXCHANGE_RATE_CHANGED',
+            'message' => 'The exchange rate changed. The latest rate is included for automatic retry.',
+            'data' => ['active_rate' => $lockedRateRow ?: null],
+        ], 409);
+    }
+
     $userStmt = db()->prepare('SELECT id, balance, overdraft_limit FROM users WHERE api_token = ? LIMIT 1 FOR UPDATE');
     $userStmt->execute([$apiToken]);
     $user = $userStmt->fetch();
-    if ($user) {
-        $userId = (int)$user['id'];
-    }
 
     if (!$user) {
         db()->rollBack();
-        json_response(['success' => false, 'message' => 'کاربر یافت نشد.'], 404);
+        json_response(['success' => false, 'code' => 'AUTHENTICATION_FAILED', 'message' => 'اطلاعات احراز هویت معتبر نیست.'], 401);
+    }
+    if ((int)$user['id'] !== $userId) {
+        db()->rollBack();
+        json_response(['success' => false, 'code' => 'AUTHENTICATION_FAILED', 'message' => 'اطلاعات احراز هویت با شناسه کاربر مطابقت ندارد.'], 401);
     }
 
     subcustomer_require_verified(db(), $userId);
