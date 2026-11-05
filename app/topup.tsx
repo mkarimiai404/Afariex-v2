@@ -63,6 +63,23 @@ const createClientRequestId = () => {
   return `${hexadecimal.slice(0, 8)}-${hexadecimal.slice(8, 12)}-${hexadecimal.slice(12, 16)}-${hexadecimal.slice(16, 20)}-${hexadecimal.slice(20)}`;
 };
 
+const requestTopupStatus = (
+  apiToken: string,
+  transactionId?: string | number | null,
+  clientRequestId?: string | null
+) => fetchJson<any>('topup-status.php', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiToken}`,
+  },
+  body: JSON.stringify({
+    api_token: apiToken,
+    transaction_id: transactionId || null,
+    client_request_id: clientRequestId || null,
+  }),
+});
+
 export default function TopupScreen() {
   const router = useRouter();
   const { userId, userToken, isAuthenticated, isInitialized } = useAuth();
@@ -84,6 +101,7 @@ export default function TopupScreen() {
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<TopupReceiptModel | null>(null);
   const clientRequestId = useRef<string | null>(null);
+  const submitInFlight = useRef(false);
   const resultOwnerId = useRef<string | null>(null);
   const operatorManuallySelected = useRef(false);
   const statusRequestInFlight = useRef(false);
@@ -208,7 +226,8 @@ export default function TopupScreen() {
   };
 
   const submit = async () => {
-    if (!userToken || !userId || submitting) return;
+    if (!userToken || !userId || submitting || submitInFlight.current) return;
+    submitInFlight.current = true;
     setSubmitting(true);
     resultOwnerId.current = userId;
     clientRequestId.current ??= createClientRequestId();
@@ -242,11 +261,7 @@ export default function TopupScreen() {
         const existingTransactionId = String((payload?.data as Record<string, unknown> | undefined)?.transaction_id ?? '');
         if (existingTransactionId) {
           try {
-            const existing = await fetchJson<any>('topup-status.php', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}` },
-              body: JSON.stringify({ api_token: userToken, transaction_id: existingTransactionId }),
-            });
+            const existing = await requestTopupStatus(userToken, existingTransactionId, requestId);
             setResult(toReceipt(existing, cleanMobile, operator, numericAmount, clientRequestId.current, chargeType, '', pendingReceipt.createdAt));
             setStep('result');
           } catch {
@@ -271,7 +286,10 @@ export default function TopupScreen() {
         clearPendingTopup(userId).catch(() => undefined);
         Alert.alert('خطا', payload?.message || 'خرید شارژ انجام نشد.');
       }
-    } finally { setSubmitting(false); }
+    } finally {
+      submitInFlight.current = false;
+      setSubmitting(false);
+    }
   };
 
   const checkStatus = async () => {
@@ -280,11 +298,11 @@ export default function TopupScreen() {
     setSubmitting(true);
     try {
       if (__DEV__) console.log('[AFARIEX-DEBUG] topup status check started', { transaction_id: result.transactionId || null, client_request_id: result.clientRequestId || null });
-      const response = await fetchJson<any>('topup-status.php', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}` },
-        body: JSON.stringify({ api_token: userToken, transaction_id: result.transactionId || undefined, client_request_id: result.clientRequestId || clientRequestId.current || undefined }),
-      });
+      const response = await requestTopupStatus(
+        userToken,
+        result.transactionId || null,
+        result.clientRequestId || clientRequestId.current || null
+      );
       if (__DEV__) console.log('[AFARIEX-DEBUG] topup status response', { status: response?.status, code: response?.code });
       const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
       setResult(updated);
@@ -308,14 +326,14 @@ export default function TopupScreen() {
       pollingWindow.current = { key: pollingKey, startedAt: Date.now() };
     }
     const startedAt = pollingWindow.current.startedAt;
-    const delays = [3000, 5000, 10000];
-    const maxWindowMs = 120000;
-    const maxStatusCallMs = 45000;
+    const delays = [3000, 7000, 15000, 30000, 60000];
+    const maxWindowMs = 180000;
+    const maxStatusCallMs = 60000;
 
     const scheduleNext = () => {
       const elapsed = Date.now() - startedAt;
       if (stopped) return;
-        if (elapsed + maxStatusCallMs >= maxWindowMs) {
+      if (elapsed + maxStatusCallMs >= maxWindowMs) {
         setResult((current) => current?.status === 'pending'
           ? { ...current, message: '\u062e\u0631\u06cc\u062f \u0647\u0646\u0648\u0632 \u062f\u0631 \u0627\u0646\u062a\u0638\u0627\u0631 \u067e\u0627\u0633\u062e \u0633\u0631\u0648\u06cc\u0633 \u0627\u0633\u062a. \u0628\u0639\u062f\u0627\u064b \u0648\u0636\u0639\u06cc\u062a \u0631\u0627 \u0628\u0627 \u0647\u0645\u06cc\u0646 \u0634\u0646\u0627\u0633\u0647 \u0628\u0631\u0631\u0633\u06cc \u06a9\u0646\u06cc\u062f.' }
           : current);
@@ -334,15 +352,11 @@ export default function TopupScreen() {
         statusRequestInFlight.current = true;
         let updatedStatus: TopupStatus | null = null;
         try {
-          const response = await fetchJson<any>('topup-status.php', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + userToken },
-            body: JSON.stringify({
-              api_token: userToken,
-              transaction_id: result.transactionId || undefined,
-              client_request_id: result.clientRequestId || undefined,
-            }),
-          });
+          const response = await requestTopupStatus(
+            userToken,
+            result.transactionId || null,
+            result.clientRequestId || clientRequestId.current || null
+          );
           if (['success', 'failed', 'pending'].includes(response?.status)) {
             const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
             setResult(updated);

@@ -14,7 +14,7 @@ const TIMEOUT_MS = 12000;
 const ENDPOINT_TIMEOUTS: Record<string, number> = {
   'topup.php': 60000,
   'topup-create.php': 60000,
-  'topup-status.php': 45000,
+  'topup-status.php': 60000,
   'add_remittance.php': 30000,
 };
 // Financial create calls stay single-attempt; status checks reconcile uncertain outcomes without duplicate purchases.
