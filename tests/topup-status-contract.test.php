@@ -62,6 +62,12 @@ $assert(str_contains($refundBody, 'FOR UPDATE') && str_contains($refundBody, 'to
 $assert(!str_contains($refundBody, "\$updates['balance_after'] = \$credit['balance_after']"), 'refund does not destroy the original debit balance snapshots');
 $assert(str_contains($endpoint, '$finalSnapshot[\'status\']') && str_contains($endpoint, 'topup_refund_transaction('), 'status response is built from persisted state after provider reconciliation');
 $assert(str_contains($endpoint, 'catch (InaxNetworkException $error)') && str_contains($endpoint, "'retryable' => true"), 'provider timeouts and network failures remain non-final and retryable');
+$globalTry = strpos($endpoint, 'ob_start();');
+$globalCatch = strrpos($endpoint, '} catch (Throwable $error) {');
+$assert($globalTry !== false && $globalCatch !== false && $globalTry < $globalCatch
+    && str_contains($endpoint, "'code' => 'INTERNAL_SERVER_ERROR'")
+    && str_contains($endpoint, "'retryable' => true")
+    && str_contains($endpoint, 'ob_end_clean()'), 'uncaught runtime errors are buffered and converted to retryable JSON without leaking output');
 $phaseOneCommit = strpos($endpoint, '$pdo->commit();', strpos($endpoint, '// Phase 1'));
 $disconnect = strpos($endpoint, 'db_disconnect();', strpos($endpoint, '// No transaction or row lock'));
 $phaseTwoTransaction = strpos($endpoint, '$pdo->beginTransaction();', strpos($endpoint, '// Phase 2'));
@@ -86,6 +92,11 @@ $assert(str_contains($client, 'releaseInFlight(submitInFlight);') && str_contain
 $statusLockPosition = strpos($client, 'statusRequestInFlight.current = true;', strpos($client, 'const checkStatus = async () =>'));
 $statusAwaitPosition = strpos($client, 'await requestTopupStatus(', strpos($client, 'const checkStatus = async () =>'));
 $assert($statusLockPosition !== false && $statusAwaitPosition !== false && $statusLockPosition < $statusAwaitPosition, 'manual status checks lock synchronously before awaiting');
+$statusCheckBody = substr($client, strpos($client, 'const checkStatus = async () =>'), strpos($client, 'useEffect(() => {', strpos($client, 'const checkStatus = async () =>')) - strpos($client, 'const checkStatus = async () =>'));
+$assert(str_contains($statusCheckBody, 'describeStatusCheckError(error)')
+    && str_contains($statusCheckBody, 'setResult(updated)')
+    && str_contains($statusCheckBody, 'setPollingRestart((current) => current + 1)')
+    && !str_contains($statusCheckBody, 'Alert.alert(diagnostic.'), 'status check errors stay inline and restart bounded polling instead of opening an alert');
 $assert(str_contains($client, 'maxStatusChecks = 12') && str_contains($client, 'maxWindowMs = 600000') && str_contains($client, 'maxStatusCallMs = 120000'), 'automatic polling has synchronized attempt, call-timeout, and elapsed-time bounds');
 $assert(str_contains($client, 'pollingWindow.current?.key !== pollingKey') && str_contains($client, 'checks: 0'), 'poll start and counter reset only for a different request identifier');
 $assert(str_contains($client, 'onPress={checkStatus}') && str_contains($client, "status: 'pending'"), 'manual retry remains available and unresolved responses remain pending');

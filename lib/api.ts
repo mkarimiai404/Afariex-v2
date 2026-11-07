@@ -11,12 +11,7 @@ const LOCAL_BASE_URL = 'https://afariex.ir/API/';
 const PROD_BASE_URL = 'https://afariex.ir/API/';
 const TIMEOUT_MS = 12000;
 // Creation outlasts Inax's 30-second provider timeout plus backend finalization; status checks get a smaller margin.
-const ENDPOINT_TIMEOUTS: Record<string, number> = {
-  'topup.php': 120000,
-  'topup-create.php': 120000,
-  'topup-status.php': 120000,
-  'add_remittance.php': 30000,
-};
+const ENDPOINT_TIMEOUTS: Record<string, number> = { 'topup.php': 60000, 'topup-create.php': 60000, 'topup-status.php': 45000 };
 // Financial create calls stay single-attempt; status checks reconcile uncertain outcomes without duplicate purchases.
 const MAX_ATTEMPTS = 1;
 let authExpiryHandler: (() => void | Promise<void>) | null = null;
@@ -68,50 +63,14 @@ const withTimeout = async (url: string, init?: RequestInit, timeoutMs = TIMEOUT_
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const mergedHeaders = new Headers(init?.headers);
-    if (!mergedHeaders.has('Accept')) mergedHeaders.set('Accept', 'application/json');
+    const mergedHeaders = {
+      Accept: 'application/json',
+      ...(init?.headers || {}),
+    };
     return await fetch(url, { ...init, headers: mergedHeaders, signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
-};
-
-export const authenticatedFormBody = (
-  token: string,
-  values: Record<string, string | number>
-): string => {
-  const normalizedToken = token.trim();
-  if (!normalizedToken) throw new Error('Authentication is required for this request.');
-  const body = new URLSearchParams();
-  for (const [key, value] of Object.entries(values)) body.set(key, String(value));
-  body.set('api_token', normalizedToken);
-  return body.toString();
-};
-
-const requestIncludesApiToken = (body: RequestInit['body']): boolean => {
-  if (typeof body === 'string') {
-    try {
-      const formToken = new URLSearchParams(body).get('api_token');
-      if (formToken?.trim()) return true;
-    } catch { /* Check whether the string contains JSON. */ }
-    try {
-      const parsed: unknown = JSON.parse(body);
-      return Boolean(
-        parsed
-        && typeof parsed === 'object'
-        && !Array.isArray(parsed)
-        && typeof (parsed as Record<string, unknown>).api_token === 'string'
-        && String((parsed as Record<string, unknown>).api_token).trim()
-      );
-    } catch { return false; }
-  }
-  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
-    return Boolean(body.get('api_token')?.trim());
-  }
-  if (typeof FormData !== 'undefined' && body instanceof FormData) {
-    return Boolean(String(body.get('api_token') || '').trim());
-  }
-  return false;
 };
 
 const getErrorDetails = (error: unknown) => {
@@ -261,7 +220,7 @@ export const fetchJson = async <T = JsonValue>(
             endpoint: normalizedEndpoint,
             url,
             method,
-            tokenPresent: requestIncludesApiToken(init?.body),
+            tokenPresent: typeof init?.body === 'string' && init.body.includes('api_token='),
             error: details.message,
             status: (error as ApiResponseError).status || 'unknown',
             code: (error as ApiResponseError).responseCode || 'unknown',
