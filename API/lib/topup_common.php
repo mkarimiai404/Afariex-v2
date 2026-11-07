@@ -137,6 +137,13 @@ function topup_require_columns(PDO $pdo): void
         'topup_operator',
         'provider_ref_code',
         'client_request_id',
+        'topup_charge_type',
+        'provider_operation_token',
+        'provider_operation_lease_until',
+        'provider_operation_type',
+        'balance_applied',
+        'balance_before',
+        'balance_after',
     ];
 
     foreach ($requiredColumns as $required) {
@@ -253,7 +260,8 @@ function topup_update_records(
     int $transactionId,
     string $orderId,
     array $transactionUpdates,
-    array $rechargeUpdates
+    array $rechargeUpdates,
+    string $providerClaimToken
 ): string {
     // Global recharge FSM: pending -> completed (success) or refunded (failed); terminal states are immutable.
     $ownsTransaction = !$pdo->inTransaction();
@@ -264,7 +272,7 @@ function topup_update_records(
 
     try {
         $transactionLock = $pdo->prepare(
-            "SELECT id
+            "SELECT id, provider_operation_token
              FROM transactions
              WHERE id = ? AND type = 'topup'
              LIMIT 1
@@ -272,7 +280,8 @@ function topup_update_records(
         );
         $transactionLock->execute([$transactionId]);
 
-        if (!$transactionLock->fetchColumn()) {
+        $lockedTransaction = $transactionLock->fetch(PDO::FETCH_ASSOC);
+        if (!$lockedTransaction) {
             throw new RuntimeException('TOPUP_TRANSACTION_NOT_FOUND');
         }
 
@@ -288,7 +297,20 @@ function topup_update_records(
         $currentRechargeStatus = $rechargeLock->fetchColumn();
         $targetRechargeStatus = $rechargeUpdates['status'] ?? null;
 
+        // A provider response may write only while its lease token is still
+        // current. In particular, a delayed purchase response cannot refund
+        // after a status worker has taken over an expired lease.
+        if (!hash_equals((string)($lockedTransaction['provider_operation_token'] ?? ''), $providerClaimToken)) {
+            if ($ownsTransaction) $pdo->commit();
+            return match ($currentRechargeStatus) {
+                'completed' => 'success',
+                'refunded', 'failed' => 'failed',
+                default => 'pending',
+            };
+        }
+
         if (in_array($currentRechargeStatus, ['completed', 'refunded', 'failed'], true)) {
+            topup_clear_provider_claim($pdo, $transactionId, $providerClaimToken);
             if ($ownsTransaction) {
                 $pdo->commit();
             }
@@ -313,6 +335,8 @@ function topup_update_records(
         if (($rechargeUpdates['status'] ?? null) === 'completed') {
             service_fee_update_status($pdo, 'topup', $transactionId, 'collected');
         }
+
+        topup_clear_provider_claim($pdo, $transactionId, $providerClaimToken);
 
         if ($ownsTransaction) {
             $pdo->commit();
@@ -505,6 +529,160 @@ function topup_recharge_status(PDO $pdo, string $orderId): ?string
     return $status === false ? null : (string)$status;
 }
 
+function topup_status_snapshot(array $transaction): array
+{
+    $transactionStatus = strtolower(trim((string)($transaction['status'] ?? '')));
+    $rechargeStatus = strtolower(trim((string)($transaction['recharge_status'] ?? '')));
+
+    if ($rechargeStatus === '') {
+        return ['status' => 'pending', 'reconciliation_required' => true];
+    }
+
+    $transactionFinal = match ($transactionStatus) {
+        'success' => 'success',
+        'failed' => 'failed',
+        'pending' => 'pending',
+        default => null,
+    };
+    $rechargeFinal = match ($rechargeStatus) {
+        'completed' => 'success',
+        'refunded' => 'failed',
+        'pending' => 'pending',
+        default => null,
+    };
+
+    if ($transactionFinal === null || $rechargeFinal === null || $transactionFinal !== $rechargeFinal) {
+        return ['status' => 'pending', 'reconciliation_required' => true];
+    }
+
+    return ['status' => $transactionFinal, 'reconciliation_required' => false];
+}
+
+function topup_refund_already_finalized(array $transaction, ?array $recharge): bool
+{
+    return ((int)($transaction['refund_applied'] ?? 0) === 1)
+        || ($recharge !== null && in_array((string)($recharge['status'] ?? ''), ['refunded', 'completed', 'failed'], true));
+}
+
+/** Convert a database decimal amount to hundredths without floating-point rounding. */
+function topup_money_minor_units(mixed $value): ?int
+{
+    $value = trim((string)$value);
+    if (!preg_match('/\A(-?)(\d+)(?:\.(\d{1,2}))?\z/', $value, $matches)) {
+        return null;
+    }
+    $fraction = str_pad($matches[3] ?? '', 2, '0');
+    $minor = ((int)$matches[2] * 100) + (int)$fraction;
+    return ($matches[1] ?? '') === '-' ? -$minor : $minor;
+}
+
+/**
+ * Verify the complete debit chain before any automated refund or provider status call.
+ * Wallet balance snapshots and service_fee_transactions are recorded in Toman; wallet
+ * balances are DECIMAL(20,2), so comparisons are made in hundredths of a Toman.
+ */
+function topup_refund_evidence(array $row, string $expectedState = 'pending'): array
+{
+    $required = [
+        'id', 'user_id', 'amount', 'status', 'refund_applied', 'topup_mobile', 'topup_operator', 'topup_charge_type',
+        'balance_before', 'balance_after', 'balance_applied', 'recharge_user_id', 'mobile', 'operator',
+        'charge_type', 'recharge_amount', 'total_cost', 'order_id', 'recharge_client_request_id', 'recharge_status',
+        'fee_user_id', 'fee_source_type', 'fee_source_id', 'fee_service_code', 'fee_original_amount', 'fee_amount', 'fee_status',
+        'fee_total_amount', 'client_request_id', 'idempotency_key',
+    ];
+    foreach ($required as $key) {
+        if (!array_key_exists($key, $row) || $row[$key] === null || $row[$key] === '') {
+            return ['valid' => false, 'code' => 'TOPUP_FINANCIAL_EVIDENCE_MISSING'];
+        }
+    }
+
+    $transactionId = (int)$row['id'];
+    $userId = (int)$row['user_id'];
+    $amount = (int)$row['amount'];
+    $debitMinor = topup_money_minor_units($row['balance_before']);
+    $afterMinor = topup_money_minor_units($row['balance_after']);
+    if ($debitMinor === null || $afterMinor === null) {
+        return ['valid' => false, 'code' => 'TOPUP_FINANCIAL_EVIDENCE_INVALID'];
+    }
+    $debitMinor -= $afterMinor;
+    $feeAmount = (int)$row['fee_amount'];
+    $feeTotal = (int)$row['fee_total_amount'];
+    $rechargeTotal = (int)$row['total_cost'];
+    $expectedTotal = $amount + $feeAmount;
+    $stateIsConsistent = match ($expectedState) {
+        'pending' => (string)$row['status'] === 'pending'
+            && (string)$row['recharge_status'] === 'pending'
+            && (string)$row['fee_status'] === 'pending'
+            && (int)$row['refund_applied'] === 0,
+        'success' => (string)$row['status'] === 'success'
+            && (string)$row['recharge_status'] === 'completed'
+            && (string)$row['fee_status'] === 'collected'
+            && (int)$row['refund_applied'] === 0,
+        'refunded' => (string)$row['status'] === 'failed'
+            && (string)$row['recharge_status'] === 'refunded'
+            && (string)$row['fee_status'] === 'refunded'
+            && (int)$row['refund_applied'] === 1,
+        default => false,
+    };
+
+    $consistent = $transactionId > 0
+        && $userId > 0
+        && $amount > 0
+        && (int)$row['balance_applied'] === 1
+        && (int)$row['recharge_user_id'] === $userId
+        && (int)$row['fee_user_id'] === $userId
+        && (int)$row['fee_source_id'] === $transactionId
+        && (string)$row['fee_source_type'] === 'topup'
+        && (string)$row['fee_service_code'] === 'mobile_recharge'
+        && $stateIsConsistent
+        && (string)$row['order_id'] === (string)$row['idempotency_key']
+        && (string)$row['mobile'] === (string)$row['topup_mobile']
+        && (string)$row['operator'] === (string)$row['topup_operator']
+        && (string)$row['charge_type'] === (string)$row['topup_charge_type']
+        && (int)$row['recharge_amount'] === $amount
+        && (int)$row['fee_original_amount'] === $amount
+        && (string)$row['recharge_client_request_id'] === (string)$row['client_request_id']
+        && $feeAmount >= 0
+        && $feeTotal === $expectedTotal
+        && $rechargeTotal === $expectedTotal
+        && $debitMinor === ($expectedTotal * 100);
+
+    return $consistent
+        ? ['valid' => true, 'amount_toman' => $expectedTotal]
+        : ['valid' => false, 'code' => 'TOPUP_FINANCIAL_EVIDENCE_CONFLICT'];
+}
+
+function topup_provider_claim_token(): string
+{
+    return bin2hex(random_bytes(16));
+}
+
+function topup_provider_claim_lease_seconds(): int
+{
+    $configuredTimeout = min(90, max(1, (int)(getenv('INAX_TIMEOUT') ?: 30)));
+    return max(90, $configuredTimeout + 60);
+}
+
+function topup_clear_provider_claim(PDO $pdo, int $transactionId, string $claimToken): void
+{
+    $ownsTransaction = !$pdo->inTransaction();
+    if ($ownsTransaction) $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare(
+            "UPDATE transactions
+             SET provider_operation_token = NULL,
+                 provider_operation_lease_until = NULL,
+                 provider_operation_type = NULL
+             WHERE id = ? AND type = 'topup' AND provider_operation_token = ?"
+        );
+        $stmt->execute([$transactionId, $claimToken]);
+        if ($ownsTransaction) $pdo->commit();
+    } catch (Throwable $error) {
+        if ($ownsTransaction && $pdo->inTransaction()) $pdo->rollBack();
+        throw $error;
+    }
+}
+
 function topup_commission_data(PDO $pdo, int $transactionId, int $baseAmount): array
 {
     $fee = service_fee_for_source('topup', $transactionId, $pdo);
@@ -593,6 +771,12 @@ function topup_update_transaction(
         }
     }
 
+    if (isset($updates['status'])) {
+        $parts[] = 'provider_operation_token = NULL';
+        $parts[] = 'provider_operation_lease_until = NULL';
+        $parts[] = 'provider_operation_type = NULL';
+    }
+
     if ($parts === []) {
         return;
     }
@@ -673,6 +857,7 @@ function topup_refund_transaction(
     PDO $pdo,
     int $transactionId,
     string $reason,
+    string $providerClaimToken,
     array $rechargeDetails = []
 ): array {
     $ownsTransaction = !$pdo->inTransaction();
@@ -692,8 +877,12 @@ function topup_refund_transaction(
             true
         );
 
-        $select = 'id, user_id, amount, status, idempotency_key'
-            . ($hasRefundApplied ? ', refund_applied' : '');
+        $select = 'id, user_id, amount, status, idempotency_key, topup_mobile, topup_operator, topup_charge_type, client_request_id, balance_before, balance_after, provider_operation_token'
+            . ($hasRefundApplied ? ', refund_applied' : ', 0 AS refund_applied');
+        if (!in_array('balance_applied', $columns, true)) {
+            throw new RuntimeException('TOPUP_FINANCIAL_EVIDENCE_MISSING');
+        }
+        $select .= ', balance_applied';
 
         $stmt = $pdo->prepare(
             "SELECT $select
@@ -710,7 +899,7 @@ function topup_refund_transaction(
         }
 
         $rechargeStmt = $pdo->prepare(
-            'SELECT status, total_cost
+            'SELECT user_id, mobile, operator, charge_type, amount, total_cost, order_id, client_request_id, status
              FROM mobile_recharges
              WHERE order_id = ?
              LIMIT 1
@@ -721,20 +910,19 @@ function topup_refund_transaction(
         ]);
         $recharge = $rechargeStmt->fetch();
 
-        if (
-            (
-                $hasRefundApplied
-                && (int)$transaction['refund_applied'] === 1
-            )
-            || (
-                $recharge
-                && in_array(
-                    (string)$recharge['status'],
-                    ['refunded', 'completed', 'failed'],
-                    true
-                )
-            )
-        ) {
+        $feeStmt = $pdo->prepare(
+            "SELECT user_id, source_type, source_id, service_code, original_amount, fee_amount, total_amount, status
+             FROM service_fee_transactions
+             WHERE source_type = 'topup' AND source_id = ?
+             LIMIT 1 FOR UPDATE"
+        );
+        $feeStmt->execute([$transactionId]);
+        $fee = $feeStmt->fetch();
+
+        if (topup_refund_already_finalized($transaction, $recharge ?: null)) {
+            if (hash_equals((string)($transaction['provider_operation_token'] ?? ''), $providerClaimToken)) {
+                topup_clear_provider_claim($pdo, $transactionId, $providerClaimToken);
+            }
             if ($ownsTransaction) {
                 $pdo->commit();
             }
@@ -749,10 +937,39 @@ function topup_refund_transaction(
             throw new RuntimeException('TOPUP_ALREADY_SUCCESS');
         }
 
-        $debitedAmount = (int)($recharge['total_cost'] ?? 0);
-        if ($debitedAmount <= 0) {
-            throw new RuntimeException('TOPUP_DEBIT_AMOUNT_MISSING');
+        if ((string)$transaction['status'] !== 'pending' || !$recharge || !$fee) {
+            throw new RuntimeException('TOPUP_FINANCIAL_EVIDENCE_MISSING');
         }
+
+        if (!hash_equals((string)($transaction['provider_operation_token'] ?? ''), $providerClaimToken)) {
+            throw new RuntimeException('TOPUP_PROVIDER_CLAIM_LOST');
+        }
+
+        $evidence = topup_refund_evidence([
+            ...$transaction,
+            'recharge_user_id' => $recharge['user_id'],
+            'mobile' => $recharge['mobile'],
+            'operator' => $recharge['operator'],
+            'charge_type' => $recharge['charge_type'],
+            'recharge_amount' => $recharge['amount'],
+            'total_cost' => $recharge['total_cost'],
+            'order_id' => $recharge['order_id'],
+            'recharge_client_request_id' => $recharge['client_request_id'],
+            'recharge_status' => $recharge['status'],
+            'fee_user_id' => $fee['user_id'],
+            'fee_source_type' => $fee['source_type'],
+            'fee_source_id' => $fee['source_id'],
+            'fee_service_code' => $fee['service_code'],
+            'fee_original_amount' => $fee['original_amount'],
+            'fee_amount' => $fee['fee_amount'],
+            'fee_total_amount' => $fee['total_amount'],
+            'fee_status' => $fee['status'],
+        ]);
+        if (!$evidence['valid']) {
+            throw new RuntimeException((string)$evidence['code']);
+        }
+
+        $debitedAmount = (int)$evidence['amount_toman'];
 
         $credit = wallet_credit(
             $pdo,
@@ -770,10 +987,6 @@ function topup_refund_transaction(
 
         if ($hasRefundApplied) {
             $updates['refund_applied'] = 1;
-        }
-
-        if (in_array('balance_after', $columns, true)) {
-            $updates['balance_after'] = $credit['balance_after'];
         }
 
         topup_update_transaction(
@@ -795,6 +1008,8 @@ function topup_refund_transaction(
         );
 
         service_fee_update_status($pdo, 'topup', $transactionId, 'refunded');
+
+        topup_clear_provider_claim($pdo, $transactionId, $providerClaimToken);
 
         if ($ownsTransaction) {
             $pdo->commit();

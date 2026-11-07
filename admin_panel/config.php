@@ -81,9 +81,15 @@ function normalize_verification_level(string $level): string
     };
 }
 
-function db(): PDO
+function &db_connection_slot(): ?PDO
 {
     static $pdo = null;
+    return $pdo;
+}
+
+function db(): PDO
+{
+    $pdo =& db_connection_slot();
     if ($pdo instanceof PDO) {
         return $pdo;
     }
@@ -96,6 +102,15 @@ function db(): PDO
     ]);
 
     return $pdo;
+}
+
+function db_disconnect(): void
+{
+    $pdo =& db_connection_slot();
+    if ($pdo instanceof PDO && $pdo->inTransaction()) {
+        throw new LogicException('Cannot disconnect a database connection during a transaction.');
+    }
+    $pdo = null;
 }
 
 function ensure_verification_schema(): void

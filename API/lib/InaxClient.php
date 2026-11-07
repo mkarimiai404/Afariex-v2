@@ -10,6 +10,7 @@ final class InaxClient
     private string $username;
     private string $password;
     private int $timeout;
+    private bool $mockGateway;
 
     public function __construct()
     {
@@ -18,6 +19,16 @@ final class InaxClient
         $this->username = (string)$config['username'];
         $this->password = (string)$config['password'];
         $this->timeout = (int)$config['timeout'];
+        $mockToggle = strtolower(trim((string)(getenv('TOPUP_MOCK_GATEWAY') ?: '')));
+        $applicationEnvironment = strtolower(trim((string)(getenv('APP_ENV') ?: 'production')));
+        if (!in_array($mockToggle, ['', '0', '1', 'false', 'true'], true)) {
+            throw new InaxConfigurationException('TOPUP_MOCK_GATEWAY_INVALID');
+        }
+        $this->mockGateway = in_array($mockToggle, ['1', 'true'], true);
+        if ($this->mockGateway && !in_array($applicationEnvironment, ['local', 'development', 'test', 'staging'], true)) {
+            throw new InaxConfigurationException('TOPUP_MOCK_GATEWAY_FORBIDDEN_IN_ENVIRONMENT');
+        }
+        if ($this->mockGateway) return;
         if ($this->username === '' || $this->password === '') throw new InaxConfigurationException('INAX_CONFIGURATION_MISSING');
         if (!function_exists('curl_init')) throw new InaxConfigurationException('INAX_CURL_EXTENSION_MISSING');
     }
@@ -29,6 +40,11 @@ final class InaxClient
 
     public function topupWithOptions(string $operator, int $amount, string $mobile, string $orderId, string $chargeType, ?int $mnp = null): array
     {
+        if ($this->mockGateway) {
+            return ['code' => 1, 'msg' => 'Deterministic top-up mock success', 'final_status' => 'succeeded',
+                'payment_status' => 'paid', 'trans_id' => 'MOCK-' . $orderId, 'ref_code' => 'MOCK-' . $orderId,
+                'mock' => true];
+        }
         $configuredMnp = getenv('INAX_MNP');
         if ($mnp === null) {
             $configuredMnp = $configuredMnp === false || trim($configuredMnp) === '' ? '0' : trim($configuredMnp);
@@ -42,6 +58,11 @@ final class InaxClient
 
     public function transStatus(string $orderId, ?string $transId = null): array
     {
+        if ($this->mockGateway) {
+            return ['code' => 1, 'msg' => 'Deterministic top-up mock status', 'final_status' => 'succeeded',
+                'payment_status' => 'paid', 'trans_id' => $transId ?: 'MOCK-' . $orderId,
+                'ref_code' => 'MOCK-' . $orderId, 'mock' => true];
+        }
         $parameters = ['method' => 'trans_status', 'order_id' => $orderId];
         if ($transId !== null && trim($transId) !== '') $parameters['trans_id'] = trim($transId);
         return $this->request($parameters);

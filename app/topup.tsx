@@ -8,6 +8,7 @@ import { AppBottomNav } from '@/components/app-bottom-nav';
 import { fetchJson, isApiResponseError } from '@/lib/api';
 import { useAuth } from '@/lib/auth-context';
 import { moneyInputWords, normalizeMoneyInput } from '@/lib/money-input';
+import { releaseInFlight, tryAcquireInFlight } from '@/lib/inflight-lock';
 import { useMoneyInput } from '@/hooks/use-money-input';
 import { appColors } from '@/lib/theme';
 import { topupOperatorLabel, TopupReceiptModel } from '@/lib/topup-receipt';
@@ -105,7 +106,7 @@ export default function TopupScreen() {
   const resultOwnerId = useRef<string | null>(null);
   const operatorManuallySelected = useRef(false);
   const statusRequestInFlight = useRef(false);
-  const pollingWindow = useRef<{ key: string; startedAt: number } | null>(null);
+  const pollingWindow = useRef<{ key: string; startedAt: number; checks: number } | null>(null);
 
   useEffect(() => {
     if (isInitialized && !isAuthenticated) router.replace('/login' as any);
@@ -226,8 +227,7 @@ export default function TopupScreen() {
   };
 
   const submit = async () => {
-    if (!userToken || !userId || submitting || submitInFlight.current) return;
-    submitInFlight.current = true;
+    if (!userToken || !userId || submitting || !tryAcquireInFlight(submitInFlight)) return;
     setSubmitting(true);
     resultOwnerId.current = userId;
     clientRequestId.current ??= createClientRequestId();
@@ -287,7 +287,7 @@ export default function TopupScreen() {
         Alert.alert('خطا', payload?.message || 'خرید شارژ انجام نشد.');
       }
     } finally {
-      submitInFlight.current = false;
+      releaseInFlight(submitInFlight);
       setSubmitting(false);
     }
   };
@@ -310,7 +310,15 @@ export default function TopupScreen() {
       if (Number.isFinite(updatedBalance)) setWalletBalance(updatedBalance);
     } catch (error) {
       const payload = isApiResponseError(error) && error.responseData && !Array.isArray(error.responseData) ? error.responseData as Record<string, any> : null;
-      if (payload?.status) setResult(toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt));
+      if (isApiResponseError(error) && error.status === 404) {
+        const notVisible = {
+          ...(payload || {}),
+          status: 'pending',
+          code: payload?.code || 'TOPUP_TRANSACTION_NOT_VISIBLE_YET',
+          message: payload?.message || 'درخواست هنوز قابل مشاهده نیست؛ وضعیت نامشخص است. بعداً با همین شناسه دوباره بررسی کنید.',
+        };
+        setResult(toReceipt(notVisible, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt));
+      } else if (payload?.status) setResult(toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt));
       else if (__DEV__) console.log('[AFARIEX-DEBUG] topup status check unavailable', { error: error instanceof Error ? error.name : 'unknown' });
       if (!payload?.status) Alert.alert('وضعیت نامشخص', 'فعلاً امکان دریافت نتیجه نیست. درخواست همچنان در انتظار بررسی است؛ دوباره تلاش کنید.');
     } finally { statusRequestInFlight.current = false; setSubmitting(false); }
@@ -320,28 +328,29 @@ export default function TopupScreen() {
 
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    let pollIndex = 0;
     const pollingKey = result.clientRequestId || result.transactionId;
     if (pollingWindow.current?.key !== pollingKey) {
-      pollingWindow.current = { key: pollingKey, startedAt: Date.now() };
+      pollingWindow.current = { key: pollingKey, startedAt: Date.now(), checks: 0 };
     }
-    const startedAt = pollingWindow.current.startedAt;
-    const delays = [3000, 7000, 15000, 30000, 60000];
-    const maxWindowMs = 180000;
-    const maxStatusCallMs = 60000;
+    const activePollingWindow = pollingWindow.current;
+    const startedAt = activePollingWindow.startedAt;
+    const delays = [3000, 5000, 10000];
+    // Backend caps Inax at 90s; allow 30s for DB finalization and transport.
+    const maxWindowMs = 600000;
+    const maxStatusCallMs = 120000;
+    const maxStatusChecks = 12;
 
     const scheduleNext = () => {
       const elapsed = Date.now() - startedAt;
       if (stopped) return;
-      if (elapsed + maxStatusCallMs >= maxWindowMs) {
+      if (activePollingWindow.checks >= maxStatusChecks || elapsed + maxStatusCallMs >= maxWindowMs) {
         setResult((current) => current?.status === 'pending'
-          ? { ...current, message: '\u062e\u0631\u06cc\u062f \u0647\u0646\u0648\u0632 \u062f\u0631 \u0627\u0646\u062a\u0638\u0627\u0631 \u067e\u0627\u0633\u062e \u0633\u0631\u0648\u06cc\u0633 \u0627\u0633\u062a. \u0628\u0639\u062f\u0627\u064b \u0648\u0636\u0639\u06cc\u062a \u0631\u0627 \u0628\u0627 \u0647\u0645\u06cc\u0646 \u0634\u0646\u0627\u0633\u0647 \u0628\u0631\u0631\u0633\u06cc \u06a9\u0646\u06cc\u062f.' }
+          ? { ...current, message: 'بررسی خودکار پس از پایان مهلت متوقف شد و نتیجه نهایی سرویس هنوز نرسیده است. برای جلوگیری از خرید تکراری، پرداخت را تکرار نکنید؛ با همین شناسه دوباره وضعیت را بررسی کنید یا با پشتیبانی تماس بگیرید.' }
           : current);
         return;
       }
 
-      const delay = Math.min(delays[Math.min(pollIndex, delays.length - 1)], maxWindowMs - maxStatusCallMs - elapsed);
-      pollIndex += 1;
+      const delay = Math.min(delays[Math.min(activePollingWindow.checks, delays.length - 1)], maxWindowMs - maxStatusCallMs - elapsed);
       timer = setTimeout(async () => {
         if (stopped) return;
         if (statusRequestInFlight.current) {
@@ -350,7 +359,9 @@ export default function TopupScreen() {
         }
 
         statusRequestInFlight.current = true;
+        activePollingWindow.checks += 1;
         let updatedStatus: TopupStatus | null = null;
+        let stopPolling = false;
         try {
           const response = await requestTopupStatus(
             userToken,
@@ -368,7 +379,13 @@ export default function TopupScreen() {
           const payload = isApiResponseError(error) && error.responseData && !Array.isArray(error.responseData)
             ? error.responseData as Record<string, any>
             : null;
-          if (['success', 'failed', 'pending'].includes(payload?.status)) {
+          if (payload?.retryable === false) stopPolling = true;
+          if (isApiResponseError(error) && error.status === 404) {
+            const notVisible = { ...(payload || {}), success: false, status: 'pending', code: payload?.code || 'TOPUP_TRANSACTION_NOT_VISIBLE_YET', message: payload?.message || 'درخواست هنوز قابل مشاهده نیست؛ وضعیت نامشخص است و دوباره بررسی می‌شود.' };
+            const updated = toReceipt(notVisible, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
+            setResult(updated);
+            updatedStatus = updated.status;
+          } else if (['success', 'failed', 'pending'].includes(payload?.status)) {
             const updated = toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
             setResult(updated);
             updatedStatus = updated.status;
@@ -377,7 +394,7 @@ export default function TopupScreen() {
           statusRequestInFlight.current = false;
         }
 
-        if (!stopped && (updatedStatus === 'pending' || updatedStatus === null)) scheduleNext();
+        if (!stopped && !stopPolling && (updatedStatus === 'pending' || updatedStatus === null)) scheduleNext();
       }, delay);
     };
 

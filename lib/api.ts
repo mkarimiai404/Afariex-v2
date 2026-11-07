@@ -12,9 +12,9 @@ const PROD_BASE_URL = 'https://afariex.ir/API/';
 const TIMEOUT_MS = 12000;
 // Creation outlasts Inax's 30-second provider timeout plus backend finalization; status checks get a smaller margin.
 const ENDPOINT_TIMEOUTS: Record<string, number> = {
-  'topup.php': 60000,
-  'topup-create.php': 60000,
-  'topup-status.php': 60000,
+  'topup.php': 120000,
+  'topup-create.php': 120000,
+  'topup-status.php': 120000,
   'add_remittance.php': 30000,
 };
 // Financial create calls stay single-attempt; status checks reconcile uncertain outcomes without duplicate purchases.

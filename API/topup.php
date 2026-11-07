@@ -124,6 +124,8 @@ $transactionId = 0;
 $wallet = null;
 $commissionAmount = 0;
 $totalCost = $amountInt;
+$providerClaimToken = topup_provider_claim_token();
+$providerClaimLeaseSeconds = topup_provider_claim_lease_seconds();
 
 try {
     $pdo->beginTransaction();
@@ -177,7 +179,12 @@ try {
         'idempotency_key',
         'topup_mobile',
         'topup_operator',
-        'client_request_id'
+        'topup_charge_type',
+        'client_request_id',
+        'provider_operation_token',
+        'provider_operation_lease_until',
+        'provider_operation_type',
+        'balance_applied',
     ];
 
     $insertValues = [
@@ -188,10 +195,12 @@ try {
         $orderId,
         $mobile,
         $operator,
-        $clientRequestId
+        $chargeType,
+        $clientRequestId,
+        $providerClaimToken,
     ];
 
-    $placeholders = ['?', '?', '?', '?', '?', '?', '?', '?'];
+    $placeholders = ['?', '?', '?', '?', '?', '?', '?', '?', '?', '?', 'DATE_ADD(UTC_TIMESTAMP(), INTERVAL ' . $providerClaimLeaseSeconds . ' SECOND)', "'purchase'"];
 
     if (in_array('description', $columns, true)) {
         $insertColumns[] = 'description';
@@ -211,10 +220,8 @@ try {
         $insertValues[] = $wallet['balance_after'];
     }
 
-    if (in_array('balance_applied', $columns, true)) {
-        $insertColumns[] = 'balance_applied';
-        $placeholders[] = '1';
-    }
+    $insertColumns[] = 'balance_applied';
+    $placeholders[] = '1';
 
     $insertColumns[] = 'created_at';
     $placeholders[] = 'NOW()';
@@ -300,6 +307,10 @@ try {
 
     // Keep processing after a client disconnect; the provider outcome may still need local finalization.
     ignore_user_abort(true);
+    // The debit and purchase lease are committed; release the idle DB session
+    // while Inax is doing network work, then reconnect for local finalization.
+    db_disconnect();
+    $pdo = null;
     $providerResponse = (new InaxService())->buyTopup(
         $mobile,
         $amountProvider,
@@ -308,6 +319,7 @@ try {
         $orderId,
         null
     );
+    $pdo = db();
 
     $providerCode = topup_provider_code($providerResponse);
     $providerMessage = trim((string)($providerResponse['msg'] ?? ''));
@@ -330,7 +342,8 @@ try {
                 'raw_response' => $providerResponse,
                 'error_code' => null,
                 'error_msg' => null
-            ]
+            ],
+            $providerClaimToken
         );
         topup_log_lifecycle('provider_result', $orderId, $transactionId, $providerCode, $finalStatus);
         $responseBalance = topup_current_balance($pdo, (int)$user['id']) ?? $wallet['balance_after'];
@@ -378,7 +391,8 @@ try {
                     $providerMessage
                 ),
                 'raw_response' => $providerResponse
-            ]
+            ],
+            $providerClaimToken
         );
         topup_log_lifecycle('provider_result', $orderId, $transactionId, $providerCode, $finalStatus);
         $responseBalance = topup_current_balance($pdo, (int)$user['id']) ?? $wallet['balance_after'];
@@ -416,6 +430,7 @@ try {
             $pdo,
             $transactionId,
             $reason,
+            $providerClaimToken,
             [
                 'error_code' => $providerCode,
                 'raw_response' => $providerResponse,
@@ -476,12 +491,14 @@ try {
         ]
     ], 422);
 } catch (InaxConfigurationException $error) {
+    $pdo = db();
     $configRefund = null;
     try {
         $configRefund = topup_refund_transaction(
             $pdo,
             $transactionId,
-            'تنظیمات سرویس خرید شارژ روی سرور کامل نیست.'
+            'تنظیمات سرویس خرید شارژ روی سرور کامل نیست.',
+            $providerClaimToken
         );
     } catch (Throwable $refundError) {
         error_log(
@@ -514,6 +531,7 @@ try {
         ],
     ], 503);
 } catch (InaxNetworkException $error) {
+    $pdo = db();
     $finalStatus = 'pending';
     try {
         $finalStatus = topup_update_records(
@@ -521,7 +539,8 @@ try {
             $transactionId,
             $orderId,
             ['status' => 'pending', 'description' => 'پاسخ سرویس نامشخص است و وضعیت خرید در حال پیگیری است.'],
-            ['status' => 'pending', 'error_msg' => 'پاسخ سرویس دریافت نشد؛ وضعیت با همان شناسه سفارش پیگیری شود.']
+            ['status' => 'pending', 'error_msg' => 'پاسخ سرویس دریافت نشد؛ وضعیت با همان شناسه سفارش پیگیری شود.'],
+            $providerClaimToken
         );
     } catch (Throwable $updateError) {
         error_log('Top-up pending-state update failed transaction=' . $transactionId . ' error=' . $updateError->getMessage());
@@ -551,6 +570,7 @@ try {
         ],
     ], 503);
 } catch (Throwable $error) {
+    $pdo = db();
     if (
         isset($providerResponse)
         && in_array(topup_provider_code($providerResponse), [1, -200], true)
@@ -600,7 +620,8 @@ try {
             $transactionId,
             $orderId,
             ['status' => 'pending', 'description' => 'خطای داخلی پس از ثبت سفارش؛ نتیجه سرویس باید پیگیری شود.'],
-            ['status' => 'pending', 'error_msg' => 'خطای داخلی پس از ارسال درخواست؛ نتیجه سرویس نامشخص است.']
+            ['status' => 'pending', 'error_msg' => 'خطای داخلی پس از ارسال درخواست؛ نتیجه سرویس نامشخص است.'],
+            $providerClaimToken
         );
     } catch (Throwable $updateError) {
         error_log('Top-up error-state update failed transaction=' . $transactionId . ' error=' . $updateError->getMessage());
