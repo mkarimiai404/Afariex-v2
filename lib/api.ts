@@ -9,12 +9,27 @@ type JsonValue = Record<string, any> | any[];
 
 const LOCAL_BASE_URL = 'https://afariex.ir/API/';
 const PROD_BASE_URL = 'https://afariex.ir/API/';
-const TIMEOUT_MS = 12000;
+const TIMEOUT_MS = 18000;
 // Creation outlasts Inax's 30-second provider timeout plus backend finalization; status checks get a smaller margin.
 const ENDPOINT_TIMEOUTS: Record<string, number> = { 'topup.php': 60000, 'topup-create.php': 60000, 'topup-status.php': 45000 };
 // Financial create calls stay single-attempt; status checks reconcile uncertain outcomes without duplicate purchases.
 const MAX_ATTEMPTS = 1;
 let authExpiryHandler: (() => void | Promise<void>) | null = null;
+
+export class ApiTimeoutError extends Error {
+  endpoint: string;
+  timeoutMs: number;
+  requestMayHaveCompleted: boolean;
+  isNetworkError = true;
+
+  constructor(endpoint: string, timeoutMs: number, requestMayHaveCompleted: boolean) {
+    super(`Request to ${endpoint} exceeded ${timeoutMs}ms.`);
+    this.name = 'ApiTimeoutError';
+    this.endpoint = endpoint;
+    this.timeoutMs = timeoutMs;
+    this.requestMayHaveCompleted = requestMayHaveCompleted;
+  }
+}
 
 export const registerAuthExpiryHandler = (handler: () => void | Promise<void>) => {
   authExpiryHandler = handler;
@@ -118,10 +133,17 @@ const toNetworkError = (endpoint: string, finalUrl: string, error: unknown) => {
       : lowerMessage.includes('invalid json response')
         ? 'invalid_json'
         : 'network';
+  if (responseKind === 'timeout') {
+    const timeoutError = new ApiTimeoutError(
+      endpoint,
+      ENDPOINT_TIMEOUTS[endpoint] || TIMEOUT_MS,
+      ['topup.php', 'topup-create.php'].includes(endpoint)
+    );
+    (timeoutError as Error & { cause?: unknown }).cause = details.cause ?? error;
+    return timeoutError;
+  }
   const wrappedError = new Error(`Request failed for ${endpoint} at ${finalUrl}: ${details.message}`);
-  wrappedError.name = responseKind === 'timeout'
-    ? 'ApiTimeoutError'
-    : responseKind === 'html'
+  wrappedError.name = responseKind === 'html'
       ? 'ApiHtmlResponseError'
       : responseKind === 'invalid_json'
         ? 'ApiInvalidResponseError'
@@ -142,6 +164,18 @@ export const getApiBaseUrl = () => getBaseCandidates()[0];
 
 export const apiUrl = (endpoint: string) =>
   `${getApiBaseUrl()}${endpoint.replace(/^\/+/, '')}`;
+
+export const authenticatedFormBody = (
+  token: string,
+  values: Record<string, string | number | boolean | null | undefined>
+) => {
+  const body = new URLSearchParams();
+  body.set('api_token', token);
+  for (const [key, value] of Object.entries(values)) {
+    if (value !== null && value !== undefined) body.set(key, String(value));
+  }
+  return body;
+};
 
 export const fetchJson = async <T = JsonValue>(
   endpoint: string,
@@ -176,7 +210,7 @@ export const fetchJson = async <T = JsonValue>(
           parsedResponse = JSON.parse(text) as JsonValue;
           const parsed = parsedResponse as { code?: unknown; data?: { code?: unknown } };
           const parsedCode = parsed?.code ?? parsed?.data?.code;
-          responseCode = typeof parsedCode === 'string' ? parsedCode : 'none';
+          responseCode = typeof parsedCode === 'string' || typeof parsedCode === 'number' ? String(parsedCode) : 'none';
         } catch { /* handled below */ }
         if (__DEV__) console.log(`[API] response status=${response.status} code=${responseCode} method=${method} url=${url}`);
 

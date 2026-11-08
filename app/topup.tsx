@@ -1,11 +1,12 @@
 import { Ionicons } from '@expo/vector-icons';
 import { Stack, useRouter } from 'expo-router';
+import * as WebBrowser from 'expo-web-browser';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { TopupReceiptView } from '@/components/topup-receipt-view';
 import { AppBottomNav } from '@/components/app-bottom-nav';
-import { fetchJson, isApiResponseError } from '@/lib/api';
+import { ApiTimeoutError, fetchJson, isApiResponseError } from '@/lib/api';
 import { useAuth } from '@/lib/auth-context';
 import { moneyInputWords, normalizeMoneyInput } from '@/lib/money-input';
 import { releaseInFlight, tryAcquireInFlight } from '@/lib/inflight-lock';
@@ -16,7 +17,7 @@ import { clearPendingTopup, loadPendingTopup, savePendingTopup } from '@/lib/top
 
 type Operator = { title: string; min_amount: number; max_amount: number };
 type OperatorsResponse = { data?: { operators?: Record<string, Operator> } };
-type TopupStatus = 'success' | 'failed' | 'pending';
+type TopupStatus = 'success' | 'succeeded' | 'failed' | 'pending';
 type ChargeType = 'normal' | 'amazing';
 type FeePreview = { fee_amount: number; total_amount: number };
 
@@ -67,7 +68,8 @@ const createClientRequestId = () => {
 const requestTopupStatus = (
   apiToken: string,
   transactionId?: string | number | null,
-  clientRequestId?: string | null
+  clientRequestId?: string | null,
+  providerTransactionId?: string | null
 ) => fetchJson<any>('topup-status.php', {
   method: 'POST',
   headers: {
@@ -78,6 +80,7 @@ const requestTopupStatus = (
     api_token: apiToken,
     transaction_id: transactionId || null,
     client_request_id: clientRequestId || null,
+    trans_id: providerTransactionId || null,
   }),
 });
 
@@ -101,6 +104,7 @@ export default function TopupScreen() {
   const [pendingRestoreLoading, setPendingRestoreLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<TopupReceiptModel | null>(null);
+  const [pollingRestart, setPollingRestart] = useState(0);
   const clientRequestId = useRef<string | null>(null);
   const submitInFlight = useRef(false);
   const resultOwnerId = useRef<string | null>(null);
@@ -250,6 +254,30 @@ export default function TopupScreen() {
         body: JSON.stringify({ api_token: userToken, phone: cleanMobile, operator, amount: numericAmount, charge_type: chargeType, client_request_id: requestId }),
       });
       if (__DEV__) console.log('[AFARIEX-DEBUG] topup submit response', { client_request_id: requestId, status: response?.status, code: response?.code });
+      if (response?.status === 'online_payment_required') {
+        const onlineData = response?.data || response;
+        const paymentUrl = typeof onlineData?.url === 'string' ? onlineData.url : '';
+        const providerTransactionId = String(onlineData?.trans_id || '');
+        const pendingOnlineReceipt: TopupReceiptModel = {
+          ...pendingReceipt,
+          transactionId: String(onlineData?.transaction_id || ''),
+          providerTransactionId: providerTransactionId || undefined,
+          trackingCode: providerTransactionId || undefined,
+          message: 'برای تکمیل پرداخت درگاه، صفحه امن سرویس‌دهنده باز می‌شود؛ سپس وضعیت خرید بررسی خواهد شد.',
+        };
+        if (paymentUrl) {
+          try {
+            const parsedUrl = new URL(paymentUrl);
+            if (parsedUrl.protocol !== 'https:' || parsedUrl.hostname !== 'inax.ir') throw new Error('UNTRUSTED_PAYMENT_URL');
+            await WebBrowser.openBrowserAsync(parsedUrl.toString());
+          } catch {
+            pendingOnlineReceipt.message = 'پیوند پرداخت امن معتبر دریافت نشد؛ وضعیت درخواست را با همین شناسه بررسی کنید.';
+          }
+        }
+        setResult(pendingOnlineReceipt);
+        setStep('result');
+        return;
+      }
       const receipt = toReceipt(response, cleanMobile, operator, numericAmount, requestId, chargeType, '', pendingReceipt.createdAt);
       setResult(receipt);
       const updatedBalance = Number(response?.data?.remaining_balance ?? response?.data?.balance);
@@ -277,7 +305,7 @@ export default function TopupScreen() {
         setStep('result');
       } else if (!isApiResponseError(error) || error.status >= 500) {
         if (__DEV__) console.log('[AFARIEX-DEBUG] topup submission outcome uncertain', { client_request_id: clientRequestId.current, error: error instanceof Error ? error.name : 'unknown' });
-        const timedOut = error instanceof Error && error.name === 'ApiTimeoutError';
+        const timedOut = error instanceof ApiTimeoutError || (error instanceof Error && error.name === 'ApiTimeoutError');
         setResult({ ...pendingReceipt, message: timedOut
           ? 'پاسخ نهایی در زمان تعیین‌شده دریافت نشد. ممکن است درخواست همچنان در حال پردازش باشد. برای جلوگیری از خرید تکراری، دوباره پرداخت نکنید و وضعیت تراکنش را بررسی کنید.'
           : 'پاسخ سرور دریافت نشد و نتیجه درخواست نامشخص است. برای جلوگیری از خرید تکراری، وضعیت تراکنش را با همین شناسه بررسی کنید.' });
@@ -301,7 +329,8 @@ export default function TopupScreen() {
       const response = await requestTopupStatus(
         userToken,
         result.transactionId || null,
-        result.clientRequestId || clientRequestId.current || null
+        result.clientRequestId || clientRequestId.current || null,
+        result.providerTransactionId || null
       );
       if (__DEV__) console.log('[AFARIEX-DEBUG] topup status response', { status: response?.status, code: response?.code });
       const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
@@ -320,7 +349,11 @@ export default function TopupScreen() {
         setResult(toReceipt(notVisible, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt));
       } else if (payload?.status) setResult(toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt));
       else if (__DEV__) console.log('[AFARIEX-DEBUG] topup status check unavailable', { error: error instanceof Error ? error.name : 'unknown' });
-      if (!payload?.status) Alert.alert('وضعیت نامشخص', 'فعلاً امکان دریافت نتیجه نیست. درخواست همچنان در انتظار بررسی است؛ دوباره تلاش کنید.');
+      if (!payload?.status) {
+        setResult((current) => current?.status === 'pending' ? { ...current, message: describeStatusCheckError(error) } : current);
+        pollingWindow.current = null;
+        setPollingRestart((current) => current + 1);
+      }
     } finally { statusRequestInFlight.current = false; setSubmitting(false); }
   };
   useEffect(() => {
@@ -334,11 +367,10 @@ export default function TopupScreen() {
     }
     const activePollingWindow = pollingWindow.current;
     const startedAt = activePollingWindow.startedAt;
-    const delays = [3000, 5000, 10000];
-    // Backend caps Inax at 90s; allow 30s for DB finalization and transport.
-    const maxWindowMs = 600000;
-    const maxStatusCallMs = 120000;
-    const maxStatusChecks = 12;
+    const delays = [4000, 5000, 6000];
+    const maxWindowMs = 240000;
+    const maxStatusCallMs = 50000;
+    const maxStatusChecks = 40;
 
     const scheduleNext = () => {
       const elapsed = Date.now() - startedAt;
@@ -366,9 +398,10 @@ export default function TopupScreen() {
           const response = await requestTopupStatus(
             userToken,
             result.transactionId || null,
-            result.clientRequestId || clientRequestId.current || null
+            result.clientRequestId || clientRequestId.current || null,
+            result.providerTransactionId || null
           );
-          if (['success', 'failed', 'pending'].includes(response?.status)) {
+          if (['success', 'succeeded', 'failed', 'pending'].includes(response?.status)) {
             const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
             setResult(updated);
             updatedStatus = updated.status;
@@ -385,7 +418,7 @@ export default function TopupScreen() {
             const updated = toReceipt(notVisible, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
             setResult(updated);
             updatedStatus = updated.status;
-          } else if (['success', 'failed', 'pending'].includes(payload?.status)) {
+          } else if (['success', 'succeeded', 'failed', 'pending'].includes(payload?.status)) {
             const updated = toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
             setResult(updated);
             updatedStatus = updated.status;
@@ -403,7 +436,7 @@ export default function TopupScreen() {
       stopped = true;
       if (timer) clearTimeout(timer);
     };
-  }, [step, result?.status, result?.transactionId, result?.clientRequestId, result?.mobile, result?.operator, result?.amount, result?.chargeType, result?.createdAt, userToken]);
+  }, [step, result?.status, result?.transactionId, result?.clientRequestId, result?.mobile, result?.operator, result?.amount, result?.chargeType, result?.createdAt, pollingRestart, userToken]);
 
 
   if (!isInitialized || loading || pendingRestoreLoading) return <SafeAreaView style={styles.safe}><ActivityIndicator color={appColors.primary} /></SafeAreaView>;
@@ -430,7 +463,7 @@ export default function TopupScreen() {
           {!!cleanAmount && <Text style={styles.words}>{moneyInputWords(cleanAmount)}</Text>}
           <TouchableOpacity style={styles.primaryButton} onPress={openConfirmation}><Text style={styles.primaryText}>ادامه و تأیید</Text></TouchableOpacity>
         </>}
-      {step === 'result' && result && <><TopupReceiptView receipt={result} />{result.status === 'pending' && <><TouchableOpacity style={styles.primaryButton} onPress={checkStatus} disabled={submitting}>{submitting ? <ActivityIndicator color={appColors.background} /> : <Text style={styles.primaryText}>بررسی وضعیت تراکنش</Text>}</TouchableOpacity><TouchableOpacity style={styles.secondaryButton} onPress={checkStatus} disabled={submitting}><Text style={styles.secondaryText}>بازیابی درخواست با همان شناسه</Text></TouchableOpacity></>}{result.status !== 'pending' && <TouchableOpacity style={styles.secondaryButton} onPress={() => { clientRequestId.current = null; operatorManuallySelected.current = false; setResult(null); setMobile(''); setAmount(''); setChargeType('normal'); setStep('form'); }}><Text style={styles.secondaryText}>خرید شارژ جدید</Text></TouchableOpacity>}</>}
+      {step === 'result' && result && <><TopupReceiptView receipt={result} />{result.status === 'pending' && <><TouchableOpacity style={styles.primaryButton} onPress={checkStatus} disabled={submitting}>{submitting ? <ActivityIndicator color={appColors.background} /> : <Text style={styles.primaryText}>بررسی وضعیت تراکنش</Text>}</TouchableOpacity><TouchableOpacity style={styles.secondaryButton} onPress={checkStatus} disabled={submitting}><Text style={styles.secondaryText}>بازیابی درخواست با همان شناسه</Text></TouchableOpacity></>}{result.status === 'failed' && <TouchableOpacity style={styles.primaryButton} onPress={() => { clientRequestId.current = null; setResult(null); setPollingRestart(0); setStep('form'); }}><Text style={styles.primaryText}>تلاش مجدد برای همین خرید</Text></TouchableOpacity>}{result.status !== 'pending' && <TouchableOpacity style={styles.secondaryButton} onPress={() => { clientRequestId.current = null; operatorManuallySelected.current = false; setResult(null); setMobile(''); setAmount(''); setChargeType('normal'); setStep('form'); }}><Text style={styles.secondaryText}>خرید شارژ جدید</Text></TouchableOpacity>}</>}
       </ScrollView>
       <Modal visible={step === 'confirm'} transparent animationType="fade" onRequestClose={() => setStep('form')}>
         <View style={styles.modalBackdrop}>
@@ -463,12 +496,19 @@ export default function TopupScreen() {
 }
 
 function toReceipt(payload: any, mobile: string, operator: string, amount: number, fallbackClientRequestId?: string | null, fallbackChargeType: ChargeType = 'normal', fallbackTransactionId = '', fallbackCreatedAt?: string): TopupReceiptModel {
-  const status = (payload?.status === 'success' || payload?.status === 'failed' || payload?.status === 'pending' ? payload.status : 'pending') as TopupStatus;
+  const rawStatus = payload?.status as TopupStatus | undefined;
+  const status = rawStatus === 'succeeded' ? 'success' : rawStatus === 'success' || rawStatus === 'failed' || rawStatus === 'pending' ? rawStatus : 'pending';
   const data = payload?.data || {};
   const reference = data.ref_code ?? data.trans_id ?? data.ref_id;
   const commissionAmount = Number(data.commission_amount || 0);
   const receiptAmount = Number(data.amount || amount);
-  return { transactionId: String(data.transaction_id || fallbackTransactionId), clientRequestId: String(data.client_request_id || fallbackClientRequestId || '') || undefined, mobile: String(data.mobile || data.phone || mobile), operator: String(data.operator || operator), operatorLabel: topupOperatorLabel(String(data.operator || operator)), amount: receiptAmount, commissionAmount, totalAmount: Number(data.total_amount ?? receiptAmount + commissionAmount), chargeType: (data.charge_type === 'amazing' ? 'amazing' : data.charge_type === 'normal' ? 'normal' : fallbackChargeType), status, refCode: reference ? String(reference) : undefined, trackingCode: data.tracking_code ? String(data.tracking_code) : undefined, orderId: data.order_id ? String(data.order_id) : undefined, message: String(payload?.message || ''), createdAt: data.created_at ? String(data.created_at) : fallbackCreatedAt };
+  return { transactionId: String(data.transaction_id || fallbackTransactionId), clientRequestId: String(data.client_request_id || fallbackClientRequestId || '') || undefined, providerTransactionId: data.trans_id ? String(data.trans_id) : undefined, mobile: String(data.mobile || data.phone || mobile), operator: String(data.operator || operator), operatorLabel: topupOperatorLabel(String(data.operator || operator)), amount: receiptAmount, commissionAmount, totalAmount: Number(data.total_amount ?? receiptAmount + commissionAmount), chargeType: (data.charge_type === 'amazing' ? 'amazing' : data.charge_type === 'normal' ? 'normal' : fallbackChargeType), status, refCode: reference ? String(reference) : undefined, trackingCode: data.tracking_code ? String(data.tracking_code) : undefined, orderId: data.order_id ? String(data.order_id) : undefined, message: String(payload?.message || ''), createdAt: data.created_at ? String(data.created_at) : fallbackCreatedAt };
+}
+
+function describeStatusCheckError(error: unknown): string {
+  if (error instanceof ApiTimeoutError) return 'پاسخ پیگیری دیر رسید؛ نتیجه خرید نامشخص است و با همین شناسه دوباره بررسی می‌شود.';
+  if (isApiResponseError(error)) return error.safeMessage || 'دریافت وضعیت خرید موقتاً ممکن نشد؛ درخواست با همان شناسه دوباره بررسی می‌شود.';
+  return 'ارتباط با سرور موقتاً برقرار نشد؛ خرید تکرار نشده و وضعیت با همان شناسه دوباره بررسی می‌شود.';
 }
 
 function SummaryRow({ label, value, last = false }: { label: string; value: string; last?: boolean }) { return <View style={[styles.summaryRow, last && styles.lastRow]}><Text style={styles.summaryLabel}>{label}</Text><Text style={styles.summaryValue}>{value}</Text></View>; }

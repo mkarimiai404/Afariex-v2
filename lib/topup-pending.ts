@@ -11,6 +11,7 @@ export const savePendingTopup = async (userId: string, receipt: TopupReceiptMode
   if (!receipt.clientRequestId) return;
   const pending = {
     clientRequestId: receipt.clientRequestId,
+    providerTransactionId: receipt.providerTransactionId || '',
     transactionId: receipt.transactionId || '',
     orderId: receipt.orderId || '',
     createdAt: receipt.createdAt || new Date().toISOString(),
@@ -36,6 +37,7 @@ export const loadPendingTopup = async (userId: string): Promise<TopupReceiptMode
     return {
       transactionId: String(data.transactionId || ''),
       clientRequestId: data.clientRequestId,
+      providerTransactionId: typeof data.providerTransactionId === 'string' ? data.providerTransactionId : undefined,
       orderId: typeof data.orderId === 'string' ? data.orderId : undefined,
       createdAt: typeof data.createdAt === 'string' ? data.createdAt : undefined,
       mobile: String(data.mobile || ''),

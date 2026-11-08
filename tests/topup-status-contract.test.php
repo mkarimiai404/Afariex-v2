@@ -39,9 +39,10 @@ $assert(
 $endpoint = file_get_contents(__DIR__ . '/../API/topup-status.php');
 $client = file_get_contents(__DIR__ . '/../app/topup.tsx');
 $create = file_get_contents(__DIR__ . '/../API/topup.php');
+$apiClient = file_get_contents(__DIR__ . '/../lib/api.ts');
 $migration = file_get_contents(__DIR__ . '/../database/migrations/019_topup_client_request_id.php');
 $claimMigration = file_get_contents(__DIR__ . '/../database/migrations/021_topup_provider_claims.php');
-$assert(is_string($endpoint) && is_string($client) && is_string($create) && is_string($migration) && is_string($claimMigration), 'top-up source files are readable');
+$assert(is_string($endpoint) && is_string($client) && is_string($create) && is_string($migration) && is_string($claimMigration) && is_string($apiClient), 'top-up source files are readable');
 
 $assert(str_contains($endpoint, "t.id = ?") && str_contains($endpoint, "(r.trans_id = ? OR r.ref_code = ?)") && str_contains($endpoint, "t.client_request_id = ?"), 'status lookup falls back through transaction, provider reference, and client request IDs');
 $assert(str_contains($endpoint, "t.user_id = ? AND t.type = 'topup'") && str_contains($endpoint, 'FOR UPDATE'), 'status lookups are owner-scoped and row-locked');
@@ -56,6 +57,10 @@ $assert($terminalCheckPosition !== false && $providerCallPosition !== false && $
 $assert(str_contains($create, 'topup_find_client_request') && str_contains($create, 'wallet_debit('), 'create flow checks idempotency before debit');
 $assert(str_contains($migration, 'uq_topup_client_request') && str_contains($migration, 'uq_recharge_client_request'), 'client request identifiers have database uniqueness constraints');
 $assert(str_contains($create, '$pdo->beginTransaction();') && str_contains($create, 'wallet_debit('), 'wallet debit and idempotency reservation share a transaction');
+$onlineGuard = strpos($create, "'ONLINE_PAYMENT_NOT_CONFIGURED'");
+$walletDebit = strpos($create, 'wallet_debit(');
+$assert($onlineGuard !== false && $walletDebit !== false && $onlineGuard < $walletDebit, 'online payment requests are rejected before any wallet debit until settlement support is configured');
+$assert(str_contains($apiClient, 'const TIMEOUT_MS = 18000') && str_contains($apiClient, "'topup-create.php': 60000") && str_contains($apiClient, "'topup-status.php': 45000") && str_contains($apiClient, 'requestMayHaveCompleted'), 'API timeouts are endpoint-specific and identify uncertain financial requests');
 $common = file_get_contents(__DIR__ . '/../API/lib/topup_common.php');
 $refundBody = substr($common, strpos($common, 'function topup_refund_transaction('));
 $assert(str_contains($refundBody, 'FOR UPDATE') && str_contains($refundBody, 'topup_refund_already_finalized') && str_contains($common, "'refunded', 'completed', 'failed'"), 'refund helper locks and checks durable refund/terminal markers');
@@ -97,7 +102,7 @@ $assert(str_contains($statusCheckBody, 'describeStatusCheckError(error)')
     && str_contains($statusCheckBody, 'setResult(updated)')
     && str_contains($statusCheckBody, 'setPollingRestart((current) => current + 1)')
     && !str_contains($statusCheckBody, 'Alert.alert(diagnostic.'), 'status check errors stay inline and restart bounded polling instead of opening an alert');
-$assert(str_contains($client, 'maxStatusChecks = 12') && str_contains($client, 'maxWindowMs = 600000') && str_contains($client, 'maxStatusCallMs = 120000'), 'automatic polling has synchronized attempt, call-timeout, and elapsed-time bounds');
+$assert(str_contains($client, 'maxStatusChecks = 40') && str_contains($client, 'maxWindowMs = 240000') && str_contains($client, 'maxStatusCallMs = 50000'), 'automatic polling has synchronized attempt, call-timeout, and elapsed-time bounds');
 $assert(str_contains($client, 'pollingWindow.current?.key !== pollingKey') && str_contains($client, 'checks: 0'), 'poll start and counter reset only for a different request identifier');
 $assert(str_contains($client, 'onPress={checkStatus}') && str_contains($client, "status: 'pending'"), 'manual retry remains available and unresolved responses remain pending');
 $assert(str_contains($client, 'checks: number') && str_contains($client, 'activePollingWindow.checks >= maxStatusChecks'), 'poll attempts are held in request-keyed ref state');

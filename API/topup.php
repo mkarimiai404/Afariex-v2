@@ -4,6 +4,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/lib/topup_common.php';
 
 topup_headers();
+ob_start();
 
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
     http_response_code(204);
@@ -29,6 +30,7 @@ $mobile = topup_normalize_mobile($data['phone'] ?? $data['mobile'] ?? '');
 $clientRequestId = topup_validate_client_request_id($data['client_request_id'] ?? null);
 $operator = strtoupper(trim((string)($data['operator'] ?? '')));
 $chargeType = strtolower(trim((string)($data['charge_type'] ?? 'normal')));
+$paymentType = strtolower(trim((string)($data['pay_type'] ?? 'credit')));
 $amount = normalize_persian_digits(trim((string)($data['amount'] ?? '')));
 $amount = str_replace([',', '٬', ' '], '', $amount);
 
@@ -64,6 +66,18 @@ if (!in_array($chargeType, ['normal', 'amazing', 'permanent'], true)) {
         'code' => 'INVALID_CHARGE_TYPE',
         'message' => 'نوع شارژ انتخاب‌شده معتبر نیست.',
     ], 422);
+}
+
+if ($paymentType !== 'credit') {
+    topup_json([
+        'success' => false,
+        'status' => 'failed',
+        'code' => $paymentType === 'online' ? 'ONLINE_PAYMENT_NOT_CONFIGURED' : 'INVALID_PAYMENT_TYPE',
+        'message' => $paymentType === 'online'
+            ? 'پرداخت آنلاین هنوز برای این سرویس فعال نشده است؛ هیچ مبلغی از کیف پول کسر نشد.'
+            : 'روش پرداخت انتخاب‌شده معتبر نیست؛ هیچ مبلغی از کیف پول کسر نشد.',
+        'data' => ['pay_type' => $paymentType],
+    ], $paymentType === 'online' ? 503 : 422);
 }
 
 if (!preg_match('/^\d+$/', $amount)) {
@@ -198,9 +212,10 @@ try {
         $chargeType,
         $clientRequestId,
         $providerClaimToken,
+        1,
     ];
 
-    $placeholders = ['?', '?', '?', '?', '?', '?', '?', '?', '?', '?', 'DATE_ADD(UTC_TIMESTAMP(), INTERVAL ' . $providerClaimLeaseSeconds . ' SECOND)', "'purchase'"];
+    $placeholders = ['?', '?', '?', '?', '?', '?', '?', '?', '?', '?', 'DATE_ADD(UTC_TIMESTAMP(), INTERVAL ' . $providerClaimLeaseSeconds . ' SECOND)', "'purchase'", '?'];
 
     if (in_array('description', $columns, true)) {
         $insertColumns[] = 'description';
@@ -219,9 +234,6 @@ try {
         $placeholders[] = '?';
         $insertValues[] = $wallet['balance_after'];
     }
-
-    $insertColumns[] = 'balance_applied';
-    $placeholders[] = '1';
 
     $insertColumns[] = 'created_at';
     $placeholders[] = 'NOW()';
@@ -350,7 +362,7 @@ try {
 
         topup_json([
             'success' => $finalStatus !== 'failed',
-            'status' => $finalStatus,
+            'status' => $finalStatus === 'success' ? 'succeeded' : $finalStatus,
             'message' => match ($finalStatus) {
                 'success' => 'خرید شارژ با موفقیت انجام شد.',
                 'failed' => 'خرید قبلاً ناموفق و بازپرداخت شده است.',
@@ -399,7 +411,7 @@ try {
 
         topup_json([
             'success' => $finalStatus !== 'failed',
-            'status' => $finalStatus,
+            'status' => $finalStatus === 'success' ? 'succeeded' : $finalStatus,
             'code' => $finalStatus === 'pending' ? 'PROVIDER_PENDING' : null,
             'message' => $finalStatus === 'success'
                 ? 'خرید شارژ با موفقیت تأیید شد.'
@@ -470,7 +482,7 @@ try {
     topup_json([
         'success' => false,
         'status' => 'failed',
-        'code' => 'PROVIDER_FAILED',
+        'code' => $providerCode,
         'message' => topup_provider_message(
             $providerCode,
             $providerMessage
@@ -550,7 +562,7 @@ try {
 
     topup_json([
         'success' => $finalStatus !== 'failed',
-        'status' => $finalStatus,
+        'status' => $finalStatus === 'success' ? 'succeeded' : $finalStatus,
         'code' => 'INAX_NETWORK_ERROR',
         'message' => $finalStatus === 'success'
             ? 'خرید شارژ با موفقیت تأیید شد.'

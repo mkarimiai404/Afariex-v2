@@ -31,6 +31,9 @@ function topup_headers(): void
 
 function topup_json(array $payload, int $status = 200): never
 {
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
     http_response_code($status);
 
     echo json_encode(
@@ -465,7 +468,7 @@ function topup_provider_message(
         -12 => 'شماره موبایل یا اپراتور صحیح نیست.',
         -18 => 'این شماره همراه اول دائمی نیست.',
         -22 => 'احراز هویت سرویس خرید شارژ ناموفق بود.',
-        -33 => 'اعتبار پنل خرید شارژ کافی نیست.',
+        -33 => 'اعتبار پنل تامین‌کننده کافی نمی‌باشد.',
         -44 => 'مبلغ شارژ برای این اپراتور مجاز نیست.',
         -55 => 'تراکنش خرید شارژ پیدا نشد.',
         -66 => 'اپراتور ایرانسل موقتاً در دسترس نیست.',
@@ -481,10 +484,9 @@ function topup_provider_message(
 
 function topup_order_id(): string
 {
-    $microtime = (int)(microtime(true) * 1000);
-    $random = random_int(100000, 999999);
-
-    return (string)$microtime . $random;
+    // Inax requires numeric order IDs; the random suffix protects concurrent reservations.
+    return (string)(int)(microtime(true) * 1000)
+        . str_pad((string)random_int(0, 999999999999), 12, '0', STR_PAD_LEFT);
 }
 
 function topup_validate_client_request_id(mixed $value): ?string

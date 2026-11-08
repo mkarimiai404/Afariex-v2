@@ -11,6 +11,7 @@ export type TopupReceiptModel = {
   totalAmount?: number;
   status: TopupReceiptStatus;
   clientRequestId?: string;
+  providerTransactionId?: string;
   refCode?: string;
   trackingCode?: string;
   orderId?: string;
