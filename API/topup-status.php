@@ -18,6 +18,7 @@ set_exception_handler(static function (Throwable $error): never {
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
 });
+
 require_once __DIR__ . '/lib/topup_common.php';
 
 topup_headers();
@@ -32,8 +33,10 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
 $data = topup_request_data();
 $user = topup_authenticate_user($data);
 $pdo = db();
+
 topup_require_columns($pdo);
 topup_require_recharge_columns($pdo);
+
 try {
     service_fee_require_schema();
 } catch (Throwable $error) {
@@ -45,6 +48,7 @@ try {
         'message' => 'سوابق کارمزد برای تأیید وضعیت مالی موجود نیست؛ بررسی پشتیبانی لازم است.',
     ], 503);
 }
+
 $transactionColumns = $pdo->query('SHOW COLUMNS FROM transactions')->fetchAll(PDO::FETCH_COLUMN, 0);
 $balanceAppliedSelect = 't.balance_applied';
 $refundAppliedSelect = in_array('refund_applied', $transactionColumns, true) ? 't.refund_applied' : '0 AS refund_applied';
@@ -55,6 +59,7 @@ $providerReference = strlen($providerReference) <= 50 ? $providerReference : '';
 $requestedOrderId = trim((string)($data['order_id'] ?? ''));
 $requestedOrderId = strlen($requestedOrderId) <= 50 ? $requestedOrderId : '';
 $clientRequestId = topup_validate_client_request_id($data['client_request_id'] ?? null);
+
 if ($transactionId <= 0 && $providerReference === '' && $requestedOrderId === '' && $clientRequestId === null) {
     topup_json(['success' => false, 'code' => 'INVALID_TRANSACTION', 'message' => 'شناسه تراکنش یا شناسه درخواست معتبر نیست.'], 422);
 }
@@ -78,6 +83,7 @@ $select = "SELECT t.id, t.user_id, t.amount, t.status, t.idempotency_key, t.topu
            LEFT JOIN service_fee_transactions sf ON sf.source_type = 'topup' AND sf.source_id = t.id
            WHERE %s AND t.user_id = ? AND t.type = 'topup'
            LIMIT 1 FOR UPDATE";
+
 $findTransaction = static function (PDO $pdo, string $condition, array $identifiers, int $userId, string $select): array|false {
     $stmt = $pdo->prepare(sprintf($select, $condition));
     $stmt->execute([...$identifiers, $userId]);
@@ -89,6 +95,7 @@ $responseForSnapshot = static function (array $row, string $status, int $userId,
     $refCode = trim((string)($row['provider_ref_code'] ?? $row['ref_code'] ?? ''));
     $commission = topup_commission_data($pdo, $transactionId, (int)$row['amount']);
     $balance = topup_current_balance($pdo, $userId);
+
     return [
         'success' => $status === 'success',
         'status' => $status === 'success' ? 'succeeded' : $status,
@@ -125,7 +132,7 @@ $manualReview = static function (string $code, ?int $transactionId = null, ?stri
         'code' => $code,
         'retryable' => false,
         'reconciliation_required' => true,
-        'message' => 'اطلاعات مالی درخواست با سوابق کیف پول سازگار نیست؛ خرید یا بازپرداخت تکرار نمی‌شود و بررسی پشتیبانی لازم است.',
+        'message' => 'اطلاعات مالی درخواست با سوابق کیف پول سازگار نیست؛ خرید یا refund تکرار نمی‌شود و بررسی پشتیبانی لازم است.',
         'data' => array_filter([
             'transaction_id' => $transactionId,
             'client_request_id' => $requestId,
@@ -135,8 +142,7 @@ $manualReview = static function (string $code, ?int $transactionId = null, ?stri
     ], 503);
 };
 
-// Phase 1: look up, validate, and claim in a short transaction. The lease also
-// coordinates status checks with the original purchase provider call.
+// Phase 1: Lookup, validate, and set lease claim token
 $pdo->beginTransaction();
 try {
     $transaction = false;
@@ -152,6 +158,7 @@ try {
     if (!$transaction && $clientRequestId !== null) {
         $transaction = $findTransaction($pdo, 't.client_request_id = ?', [$clientRequestId], (int)$user['id'], $select);
     }
+
     if (!$transaction) {
         $pdo->commit();
         topup_json([
@@ -166,11 +173,13 @@ try {
 
     $transactionId = (int)$transaction['id'];
     $orderId = (string)$transaction['idempotency_key'];
+    
     $snapshot = topup_status_snapshot($transaction);
     if ($snapshot['reconciliation_required']) {
         $pdo->commit();
         $manualReview(empty($transaction['recharge_status']) ? 'TOPUP_RECHARGE_RECORD_MISSING' : 'TOPUP_STATUS_RECONCILIATION_REQUIRED', $transactionId, (string)$transaction['client_request_id'], $orderId);
     }
+
     $evidenceState = match ($snapshot['status']) {
         'success' => 'success',
         'failed' => 'refunded',
@@ -181,12 +190,14 @@ try {
         $pdo->commit();
         $manualReview((string)$evidence['code'], $transactionId, (string)$transaction['client_request_id'], $orderId);
     }
+
     if ($snapshot['status'] !== 'pending') {
         $response = $responseForSnapshot($transaction, $snapshot['status'], (int)$user['id'], $pdo);
         $pdo->commit();
         topup_json($response);
     }
-    if ((int)($transaction['provider_claim_active'] ?? 0) === 1) {
+
+    if ((int)$transaction['provider_claim_active'] === 1) {
         $pdo->commit();
         topup_json([
             'success' => true,
@@ -230,6 +241,7 @@ try {
            AND (provider_operation_token IS NULL OR provider_operation_lease_until <= UTC_TIMESTAMP())"
     );
     $claim->execute([$claimToken, $transactionId]);
+
     if ($claim->rowCount() !== 1) {
         $pdo->commit();
         topup_json([
@@ -243,55 +255,67 @@ try {
     }
     $pdo->commit();
 } catch (Throwable $error) {
-    if ($pdo->inTransaction()) $pdo->rollBack();
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+    }
     throw $error;
 }
 
-// No transaction or row lock is held across this external request. A crashed worker leaves a finite lease.
-db_disconnect();
-$pdo = null;
+// External gateway inquiry (outside DB transaction lock)
 try {
-    $provider = (new InaxClient())->transStatus(
-        $orderId,
-        $storedTransId
-    );
+    $provider = (new InaxClient())->transStatus($orderId, $storedTransId);
 } catch (InaxConfigurationException $error) {
     $pdo = db();
-    try { topup_clear_provider_claim($pdo, $transactionId, $claimToken); } catch (Throwable $releaseError) {
-        error_log('Top-up status claim release failed transaction=' . $transactionId);
-    }
-    topup_json(['success' => false, 'status' => 'pending', 'code' => 'INAX_CONFIGURATION_ERROR', 'retryable' => true, 'message' => 'تنظیمات سرویس کامل نیست؛ وضعیت مالی نامشخص باقی ماند.'], 503);
+    topup_clear_provider_claim($pdo, $transactionId, $claimToken);
+    topup_json([
+        'success' => false,
+        'status' => 'pending',
+        'code' => 'INAX_CONFIGURATION_ERROR',
+        'retryable' => false,
+        'message' => 'تنظیمات درگاه اینکس ناقص یا نامعتبر است.',
+    ], 503);
 } catch (InaxNetworkException $error) {
     $pdo = db();
-    try { topup_clear_provider_claim($pdo, $transactionId, $claimToken); } catch (Throwable $releaseError) {
-        error_log('Top-up status claim release failed transaction=' . $transactionId);
-    }
-    topup_json(['success' => false, 'status' => 'pending', 'code' => 'INAX_NETWORK_ERROR', 'retryable' => true, 'message' => 'ارتباط با سرویس برقرار نشد؛ وضعیت مالی نامشخص است و بعداً دوباره بررسی می‌شود.'], 502);
+    topup_clear_provider_claim($pdo, $transactionId, $claimToken);
+    topup_json([
+        'success' => false,
+        'status' => 'pending',
+        'code' => 'INAX_NETWORK_ERROR',
+        'retryable' => true,
+        'message' => 'خطای ارتباطی با درگاه اینکس رخ داد؛ بعداً دوباره تلاش کنید.',
+    ], 502);
 } catch (Throwable $error) {
     $pdo = db();
-    try { topup_clear_provider_claim($pdo, $transactionId, $claimToken); } catch (Throwable $releaseError) {
-        error_log('Top-up status claim release failed transaction=' . $transactionId);
-    }
-    error_log('Top-up provider status call failed transaction=' . $transactionId . ' exception=' . get_class($error));
-    topup_json(['success' => false, 'status' => 'pending', 'code' => 'TOPUP_STATUS_ERROR', 'retryable' => true, 'message' => 'دریافت وضعیت خرید شارژ انجام نشد؛ بعداً دوباره بررسی کنید.'], 500);
+    topup_clear_provider_claim($pdo, $transactionId, $claimToken);
+    topup_json([
+        'success' => false,
+        'status' => 'pending',
+        'code' => 'TOPUP_PROVIDER_ERROR',
+        'retryable' => true,
+        'message' => 'خطای پیش‌بینی‌نشده در استعلام وضعیت رخ داد.',
+    ], 500);
 }
 
+// Phase 2: Process response and update database atomically
 $pdo = db();
 $providerCode = topup_provider_code($provider);
 $providerStatus = topup_provider_status_class($provider);
 $providerTransId = topup_provider_trans_id($provider['trans_id'] ?? null);
 $transId = $providerTransId ?? $storedTransId;
 $refCode = trim((string)($provider['ref_code'] ?? '')) ?: trim((string)($transaction['provider_ref_code'] ?? $transaction['ref_code'] ?? ''));
-if (strlen($refCode) > 100) $refCode = substr($refCode, 0, 100);
+if (strlen($refCode) > 100) {
+    $refCode = substr($refCode, 0, 100);
+}
 
-// Phase 2: re-read and lock current state in a new short transaction. A lost or
-// expired claim cannot write; a concurrently finalized transaction is immutable.
 $pdo->beginTransaction();
 try {
     $freshStatement = $pdo->prepare(str_replace('%s', 't.id = ?', $select));
     $freshStatement->execute([$transactionId, (int)$user['id']]);
     $fresh = $freshStatement->fetch();
-    if (!$fresh) throw new RuntimeException('TOPUP_TRANSACTION_DISAPPEARED');
+
+    if (!$fresh) {
+        throw new RuntimeException('TOPUP_TRANSACTION_DISAPPEARED');
+    }
 
     $freshSnapshot = topup_status_snapshot($fresh);
     if ($freshSnapshot['reconciliation_required']) {
@@ -299,6 +323,7 @@ try {
         $pdo->commit();
         $manualReview('TOPUP_STATUS_RECONCILIATION_REQUIRED', $transactionId, (string)$fresh['client_request_id'], (string)$fresh['idempotency_key']);
     }
+
     if ($freshSnapshot['status'] !== 'pending') {
         $freshEvidenceState = $freshSnapshot['status'] === 'success' ? 'success' : 'refunded';
         $freshEvidence = topup_refund_evidence($fresh, $freshEvidenceState);
@@ -310,18 +335,17 @@ try {
         $pdo->commit();
         topup_json($response);
     }
-    if (!hash_equals((string)($fresh['provider_operation_token'] ?? ''), $claimToken)
-        || (int)($fresh['provider_claim_active'] ?? 0) !== 1) {
-        $response = [
+
+    if (!hash_equals((string)($fresh['provider_operation_token'] ?? ''), $claimToken) || (int)($fresh['provider_claim_active'] ?? 0) !== 1) {
+        $pdo->commit();
+        topup_json([
             'success' => true,
             'status' => 'pending',
             'code' => 'TOPUP_PROVIDER_CLAIM_EXPIRED',
             'retryable' => true,
             'message' => 'مهلت این بررسی پایان یافته است؛ وضعیت را دوباره بررسی کنید.',
-            'data' => ['transaction_id' => $transactionId, 'client_request_id' => (string)$fresh['client_request_id'], 'order_id' => (string)$fresh['idempotency_key']],
-        ];
-        $pdo->commit();
-        topup_json($response);
+            'data' => ['transaction_id' => $transactionId],
+        ], 409);
     }
 
     if (topup_provider_status_conflicts($provider)) {
@@ -336,58 +360,77 @@ try {
         $manualReview('TOPUP_PROVIDER_STATUS_CONFLICT', $transactionId, (string)$fresh['client_request_id'], $orderId);
     }
 
-    $evidence = topup_refund_evidence($fresh);
-    if (!$evidence['valid']) {
-        topup_clear_provider_claim($pdo, $transactionId, $claimToken);
-        $pdo->commit();
-        $manualReview((string)$evidence['code'], $transactionId, (string)$fresh['client_request_id'], (string)$fresh['idempotency_key']);
-    }
-
     if ($providerStatus === 'success') {
-        topup_update_records($pdo, $transactionId, $orderId,
-            ['status' => 'success', 'provider_ref_code' => $refCode],
-            ['status' => 'completed', 'trans_id' => $transId, 'ref_code' => $refCode, 'raw_response' => $provider, 'error_code' => null, 'error_msg' => null],
-            $claimToken);
-    } elseif ($providerStatus === 'failed') {
-        topup_refund_transaction($pdo, $transactionId,
-            'کد سرویس: ' . $providerCode . '؛ ' . topup_provider_message($providerCode, trim((string)($provider['msg'] ?? ''))),
-            $claimToken,
-            ['error_code' => $providerCode, 'raw_response' => $provider, 'trans_id' => $transId, 'ref_code' => $refCode]);
-    } else {
-        topup_update_records($pdo, $transactionId, $orderId,
-            ['status' => 'pending', 'description' => 'خرید شارژ در انتظار پاسخ نهایی سرویس است.'],
-            ['status' => 'pending', 'trans_id' => $transId, 'ref_code' => $refCode, 'error_code' => $providerCode,
-                'error_msg' => topup_provider_message($providerCode, trim((string)($provider['msg'] ?? ''))), 'raw_response' => $provider],
-            $claimToken);
+        topup_update_records($pdo, $transactionId, 'success', $transId, $refCode, $claimToken);
+        $freshStatement->execute([$transactionId, (int)$user['id']]);
+        $updated = $freshStatement->fetch();
+        $response = $responseForSnapshot($updated ?: $fresh, 'success', (int)$user['id'], $pdo);
+        $pdo->commit();
+        topup_json($response);
     }
 
-    $freshStatement->execute([$transactionId, (int)$user['id']]);
-    $final = $freshStatement->fetch();
-    if (!$final) throw new RuntimeException('TOPUP_TRANSACTION_DISAPPEARED');
-    $finalSnapshot = topup_status_snapshot($final);
-    if ($finalSnapshot['reconciliation_required']) {
+    if ($providerStatus === 'failed') {
+        $refundResult = topup_refund_transaction(
+            $pdo,
+            $transactionId,
+            (string)($provider['msg'] ?? 'خرید شارژ توسط درگاه لغو یا ناموفق اعلام شد.'),
+            (string)$providerCode,
+            $transId,
+            $refCode,
+            $claimToken
+        );
+        if (!$refundResult['success']) {
+            $marker = 'TOPUP_RECONCILIATION_REQUIRED: ' . ($refundResult['code'] ?? 'REFUND_FAILED');
+            $pdo->prepare('UPDATE mobile_recharges SET error_msg = ? WHERE order_id = ? AND status = \'pending\'')
+                ->execute([$marker, $orderId]);
+            $pdo->commit();
+            $manualReview((string)($refundResult['code'] ?? 'REFUND_MANUAL_REVIEW'), $transactionId, (string)$fresh['client_request_id'], $orderId);
+        }
+        $freshStatement->execute([$transactionId, (int)$user['id']]);
+        $updated = $freshStatement->fetch();
+        $response = $responseForSnapshot($updated ?: $fresh, 'failed', (int)$user['id'], $pdo);
         $pdo->commit();
-        $manualReview('TOPUP_STATUS_RECONCILIATION_REQUIRED', $transactionId, (string)$final['client_request_id'], (string)$final['idempotency_key']);
+        topup_json($response);
     }
-    $finalEvidenceState = match ($finalSnapshot['status']) {
-        'success' => 'success',
-        'failed' => 'refunded',
-        default => 'pending',
-    };
-    $finalEvidence = topup_refund_evidence($final, $finalEvidenceState);
-    if (!$finalEvidence['valid']) {
-        $pdo->commit();
-        $manualReview((string)$finalEvidence['code'], $transactionId, (string)$final['client_request_id'], (string)$final['idempotency_key']);
+
+    // Still pending at provider side
+    if ($refCode !== '' || $transId !== null) {
+        $updateData = [];
+        if ($refCode !== '' && empty($fresh['provider_ref_code']) && empty($fresh['ref_code'])) {
+            $updateData['provider_ref_code'] = $refCode;
+        }
+        if (!empty($updateData)) {
+            topup_update_transaction($pdo, $transactionId, $updateData);
+        }
+        if ($transId !== null) {
+            $pdo->prepare('UPDATE mobile_recharges SET trans_id = COALESCE(NULLIF(trans_id, \'\'), ?) WHERE order_id = ? AND status = \'pending\'')
+                ->execute([$transId, $orderId]);
+        }
     }
-    $response = $responseForSnapshot($final, $finalSnapshot['status'], (int)$user['id'], $pdo);
+
+    topup_clear_provider_claim($pdo, $transactionId, $claimToken);
     $pdo->commit();
-    topup_json($response);
+
+    topup_json([
+        'success' => true,
+        'status' => 'pending',
+        'code' => 'PROVIDER_PENDING',
+        'retryable' => true,
+        'message' => trim((string)($provider['msg'] ?? '')) ?: 'تراکنش همچنان در شبکه اپراتور در انتظار است.',
+        'data' => [
+            'transaction_id' => $transactionId,
+            'client_request_id' => (string)$fresh['client_request_id'],
+            'order_id' => $orderId,
+            'trans_id' => $transId,
+            'tracking_code' => $refCode !== '' ? $refCode : $orderId,
+            'mobile' => (string)$fresh['topup_mobile'],
+            'operator' => (string)$fresh['topup_operator'],
+            'amount' => (int)$fresh['amount'],
+        ],
+    ]);
 } catch (Throwable $error) {
-    if ($pdo->inTransaction()) $pdo->rollBack();
-    try { topup_clear_provider_claim($pdo, $transactionId, $claimToken); } catch (Throwable $releaseError) {
-        error_log('Top-up status claim release failed transaction=' . $transactionId);
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
     }
-    topup_log_lifecycle('status_finalization_error', $orderId, $transactionId, $providerCode, 'pending');
-    error_log('Top-up status finalization failed transaction=' . $transactionId . ' exception=' . get_class($error));
-    topup_json(['success' => false, 'status' => 'pending', 'code' => 'TOPUP_STATUS_ERROR', 'retryable' => true, 'message' => 'وضعیت مالی درخواست قابل تأیید نیست؛ بعداً دوباره بررسی کنید.'], 500);
+    throw $error;
 }

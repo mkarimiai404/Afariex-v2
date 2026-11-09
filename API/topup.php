@@ -3,8 +3,40 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/lib/topup_common.php';
 
+
+// Keep audit events in the same topup_debug.log used by topup_log_lifecycle().
+// The shared helper is preferred; this fallback supports installations where
+// afariex_log_transaction() has not been defined separately.
+if (!function_exists('afariex_log_transaction')) {
+    function afariex_log_transaction(string $event, array $data): void
+    {
+        if (function_exists('topup_server_log')) {
+            topup_server_log($event, $data);
+            return;
+        }
+
+        $entry = [
+            'date' => date(DATE_ATOM),
+            'event' => $event,
+            'payload' => $data,
+        ];
+        $json = json_encode($entry, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if (is_string($json)) {
+            $handle = @fopen(__DIR__ . '/topup_debug.log', 'ab');
+            if ($handle !== false) {
+                if (@flock($handle, LOCK_EX)) {
+                    @fwrite($handle, $json . PHP_EOL);
+                    @fflush($handle);
+                    @flock($handle, LOCK_UN);
+                }
+                @fclose($handle);
+            }
+        }
+    }
+}
+
+
 topup_headers();
-ob_start();
 
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
     http_response_code(204);
@@ -20,6 +52,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 $data = topup_request_data();
+afariex_log_transaction('TOPUP_REQUEST', $data);
 $user = topup_authenticate_user($data);
 $pdo = db();
 
@@ -30,7 +63,6 @@ $mobile = topup_normalize_mobile($data['phone'] ?? $data['mobile'] ?? '');
 $clientRequestId = topup_validate_client_request_id($data['client_request_id'] ?? null);
 $operator = strtoupper(trim((string)($data['operator'] ?? '')));
 $chargeType = strtolower(trim((string)($data['charge_type'] ?? 'normal')));
-$paymentType = strtolower(trim((string)($data['pay_type'] ?? 'credit')));
 $amount = normalize_persian_digits(trim((string)($data['amount'] ?? '')));
 $amount = str_replace([',', '٬', ' '], '', $amount);
 
@@ -66,18 +98,6 @@ if (!in_array($chargeType, ['normal', 'amazing', 'permanent'], true)) {
         'code' => 'INVALID_CHARGE_TYPE',
         'message' => 'نوع شارژ انتخاب‌شده معتبر نیست.',
     ], 422);
-}
-
-if ($paymentType !== 'credit') {
-    topup_json([
-        'success' => false,
-        'status' => 'failed',
-        'code' => $paymentType === 'online' ? 'ONLINE_PAYMENT_NOT_CONFIGURED' : 'INVALID_PAYMENT_TYPE',
-        'message' => $paymentType === 'online'
-            ? 'پرداخت آنلاین هنوز برای این سرویس فعال نشده است؛ هیچ مبلغی از کیف پول کسر نشد.'
-            : 'روش پرداخت انتخاب‌شده معتبر نیست؛ هیچ مبلغی از کیف پول کسر نشد.',
-        'data' => ['pay_type' => $paymentType],
-    ], $paymentType === 'online' ? 503 : 422);
 }
 
 if (!preg_match('/^\d+$/', $amount)) {
@@ -212,10 +232,9 @@ try {
         $chargeType,
         $clientRequestId,
         $providerClaimToken,
-        1,
     ];
 
-    $placeholders = ['?', '?', '?', '?', '?', '?', '?', '?', '?', '?', 'DATE_ADD(UTC_TIMESTAMP(), INTERVAL ' . $providerClaimLeaseSeconds . ' SECOND)', "'purchase'", '?'];
+    $placeholders = ['?', '?', '?', '?', '?', '?', '?', '?', '?', '?', 'DATE_ADD(UTC_TIMESTAMP(), INTERVAL ' . $providerClaimLeaseSeconds . ' SECOND)', "'purchase'"];
 
     if (in_array('description', $columns, true)) {
         $insertColumns[] = 'description';
@@ -234,6 +253,9 @@ try {
         $placeholders[] = '?';
         $insertValues[] = $wallet['balance_after'];
     }
+
+    $insertColumns[] = 'balance_applied';
+    $placeholders[] = '1';
 
     $insertColumns[] = 'created_at';
     $placeholders[] = 'NOW()';
@@ -323,6 +345,14 @@ try {
     // while Inax is doing network work, then reconnect for local finalization.
     db_disconnect();
     $pdo = null;
+    afariex_log_transaction('INAX_REQUEST', [
+        'order_id' => $orderId,
+        'transaction_id' => $transactionId,
+        'mobile' => $mobile,
+        'amount' => $amountProvider,
+        'operator' => topup_provider_operator_code($operator),
+        'charge_type' => $chargeType,
+    ]);
     $providerResponse = (new InaxService())->buyTopup(
         $mobile,
         $amountProvider,
@@ -331,6 +361,11 @@ try {
         $orderId,
         null
     );
+    afariex_log_transaction('INAX_RESPONSE', [
+        'order_id' => $orderId,
+        'transaction_id' => $transactionId,
+        'response' => $providerResponse,
+    ]);
     $pdo = db();
 
     $providerCode = topup_provider_code($providerResponse);
@@ -358,11 +393,12 @@ try {
             $providerClaimToken
         );
         topup_log_lifecycle('provider_result', $orderId, $transactionId, $providerCode, $finalStatus);
+        afariex_log_transaction('TRANSACTION_RESULT', ['order_id' => $orderId, 'transaction_id' => $transactionId, 'provider_code' => $providerCode, 'status' => $finalStatus]);
         $responseBalance = topup_current_balance($pdo, (int)$user['id']) ?? $wallet['balance_after'];
 
         topup_json([
             'success' => $finalStatus !== 'failed',
-            'status' => $finalStatus === 'success' ? 'succeeded' : $finalStatus,
+            'status' => $finalStatus,
             'message' => match ($finalStatus) {
                 'success' => 'خرید شارژ با موفقیت انجام شد.',
                 'failed' => 'خرید قبلاً ناموفق و بازپرداخت شده است.',
@@ -407,11 +443,12 @@ try {
             $providerClaimToken
         );
         topup_log_lifecycle('provider_result', $orderId, $transactionId, $providerCode, $finalStatus);
+        afariex_log_transaction('TRANSACTION_RESULT', ['order_id' => $orderId, 'transaction_id' => $transactionId, 'provider_code' => $providerCode, 'status' => $finalStatus]);
         $responseBalance = topup_current_balance($pdo, (int)$user['id']) ?? $wallet['balance_after'];
 
         topup_json([
             'success' => $finalStatus !== 'failed',
-            'status' => $finalStatus === 'success' ? 'succeeded' : $finalStatus,
+            'status' => $finalStatus,
             'code' => $finalStatus === 'pending' ? 'PROVIDER_PENDING' : null,
             'message' => $finalStatus === 'success'
                 ? 'خرید شارژ با موفقیت تأیید شد.'
@@ -452,6 +489,7 @@ try {
         );
     } catch (Throwable $refundError) {
         topup_log_lifecycle('refund_failed', $orderId, $transactionId, $providerCode, 'pending');
+        afariex_log_transaction('TRANSACTION_RESULT', ['order_id' => $orderId, 'transaction_id' => $transactionId, 'provider_code' => $providerCode, 'status' => 'pending', 'result' => 'refund_failed']);
         error_log(
             'Top-up refund failed transaction='
             . $transactionId
@@ -478,11 +516,12 @@ try {
         ], 503);
     }
 
+    afariex_log_transaction('TRANSACTION_RESULT', ['order_id' => $orderId, 'transaction_id' => $transactionId, 'provider_code' => $providerCode, 'status' => 'failed', 'refunded' => $refund['refunded'] ?? false]);
     topup_log_lifecycle('provider_result', $orderId, $transactionId, $providerCode, 'failed');
     topup_json([
         'success' => false,
         'status' => 'failed',
-        'code' => $providerCode,
+        'code' => 'PROVIDER_FAILED',
         'message' => topup_provider_message(
             $providerCode,
             $providerMessage
@@ -523,6 +562,7 @@ try {
 
     $configurationFinalStatus = $configRefund !== null ? 'failed' : 'pending';
     topup_log_lifecycle('configuration_error', $orderId, $transactionId, null, $configurationFinalStatus);
+    afariex_log_transaction('TRANSACTION_RESULT', ['order_id' => $orderId, 'transaction_id' => $transactionId, 'status' => $configurationFinalStatus, 'result' => 'configuration_error']);
     topup_json([
         'success' => false,
         'status' => $configurationFinalStatus,
@@ -558,11 +598,12 @@ try {
         error_log('Top-up pending-state update failed transaction=' . $transactionId . ' error=' . $updateError->getMessage());
     }
     topup_log_lifecycle('provider_network_error', $orderId, $transactionId, null, $finalStatus);
+    afariex_log_transaction('TRANSACTION_RESULT', ['order_id' => $orderId, 'transaction_id' => $transactionId, 'status' => $finalStatus, 'result' => 'network_error']);
     $responseBalance = topup_current_balance($pdo, (int)$user['id']) ?? $wallet['balance_after'];
 
     topup_json([
         'success' => $finalStatus !== 'failed',
-        'status' => $finalStatus === 'success' ? 'succeeded' : $finalStatus,
+        'status' => $finalStatus,
         'code' => 'INAX_NETWORK_ERROR',
         'message' => $finalStatus === 'success'
             ? 'خرید شارژ با موفقیت تأیید شد.'
@@ -588,6 +629,7 @@ try {
         && in_array(topup_provider_code($providerResponse), [1, -200], true)
     ) {
         topup_log_lifecycle('local_finalization_error', $orderId, $transactionId, topup_provider_code($providerResponse), 'pending');
+        afariex_log_transaction('TRANSACTION_RESULT', ['order_id' => $orderId, 'transaction_id' => $transactionId, 'provider_code' => topup_provider_code($providerResponse), 'status' => 'pending', 'result' => 'local_finalization_error']);
         error_log(
             'Top-up provider result requires local finalization retry transaction='
             . $transactionId
@@ -618,6 +660,7 @@ try {
         ], 503);
     }
     topup_log_lifecycle('internal_error', $orderId, $transactionId, isset($providerResponse) ? topup_provider_code($providerResponse) : null, 'pending');
+    afariex_log_transaction('TRANSACTION_RESULT', ['order_id' => $orderId, 'transaction_id' => $transactionId, 'provider_code' => isset($providerResponse) ? topup_provider_code($providerResponse) : null, 'status' => 'pending', 'result' => 'internal_error']);
 
     error_log(
         'Top-up provider failure transaction='

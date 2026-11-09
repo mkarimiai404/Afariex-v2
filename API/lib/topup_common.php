@@ -412,15 +412,68 @@ function topup_provider_operator_code(string $operator): string
     return (string)$rules[$operator]['provider_code'];
 }
 
+/**
+ * Append a structured event to the dedicated top-up server log.
+ * Sensitive values are redacted recursively before they are serialized.
+ */
+function topup_server_log(string $event, array $payload = []): void
+{
+    $redact = static function (mixed $value) use (&$redact): mixed {
+        if (!is_array($value)) {
+            return $value;
+        }
+
+        $clean = [];
+        foreach ($value as $key => $item) {
+            $keyName = strtolower((string)$key);
+            if (preg_match('/(?:api[_-]?token|access[_-]?token|authorization|password|passwd|secret|credential|private[_-]?key)/i', $keyName)) {
+                $clean[$key] = '[REDACTED]';
+            } else {
+                $clean[$key] = $redact($item);
+            }
+        }
+        return $clean;
+    };
+
+    $entry = [
+        'date' => date(DATE_ATOM),
+        'event' => $event,
+        'payload' => $redact($payload),
+    ];
+    $json = json_encode($entry, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    if (!is_string($json)) {
+        return;
+    }
+
+    $handle = @fopen(__DIR__ . '/topup_debug.log', 'ab');
+    if ($handle === false) {
+        return;
+    }
+
+    try {
+        if (@flock($handle, LOCK_EX)) {
+            @fwrite($handle, $json . PHP_EOL);
+            @fflush($handle);
+            @flock($handle, LOCK_UN);
+        }
+    } finally {
+        @fclose($handle);
+    }
+}
+
 function topup_log_lifecycle(string $event, string $orderId, int $transactionId, ?int $providerCode, string $finalStatus): void
 {
-    error_log('[topup] ' . json_encode([
-        'event' => $event,
+    $payload = [
         'order_id' => $orderId,
         'transaction_id' => $transactionId,
         'provider_code' => $providerCode,
         'final_status' => $finalStatus,
-    ], JSON_UNESCAPED_SLASHES));
+    ];
+    error_log('[topup] ' . json_encode(
+        ['event' => $event] + $payload,
+        JSON_UNESCAPED_SLASHES
+    ));
+    topup_server_log($event, $payload);
 }
 
 function topup_provider_code(array $response): int
