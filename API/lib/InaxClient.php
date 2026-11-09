@@ -6,6 +6,8 @@ final class InaxNetworkException extends RuntimeException {}
 
 final class InaxClient
 {
+    private const TOPUP_OPERATION_TIMEOUT_SECONDS = 20;
+
     private string $endpoint;
     private string $username;
     private string $password;
@@ -35,7 +37,7 @@ final class InaxClient
 
     public function topup(string $operator, int $amount, string $mobile, string $orderId): array
     {
-        return $this->request(['method' => 'topup', 'operator' => $operator, 'amount' => $amount, 'mobile' => $mobile, 'charge_type' => 'normal', 'order_id' => $orderId, 'pay_type' => 'credit', 'company' => 'آفاریکس']);
+        return $this->request(['method' => 'topup', 'operator' => $operator, 'amount' => $amount, 'mobile' => $mobile, 'charge_type' => 'normal', 'order_id' => $orderId, 'pay_type' => 'credit', 'company' => 'آفاریکس'], self::TOPUP_OPERATION_TIMEOUT_SECONDS);
     }
 
     public function topupWithOptions(string $operator, int $amount, string $mobile, string $orderId, string $chargeType, ?int $mnp = null): array
@@ -53,7 +55,7 @@ final class InaxClient
         }
         if (!in_array($mnp, [0, 1], true)) throw new InaxConfigurationException('INAX_MNP_INVALID');
         // MNP remains disabled by default until Inax confirms how portable numbers are routed.
-        return $this->request(['method' => 'topup', 'operator' => $operator, 'amount' => $amount, 'mobile' => $mobile, 'charge_type' => $chargeType, 'order_id' => $orderId, 'pay_type' => 'credit', 'mnp' => $mnp, 'company' => 'آفاریکس']);
+        return $this->request(['method' => 'topup', 'operator' => $operator, 'amount' => $amount, 'mobile' => $mobile, 'charge_type' => $chargeType, 'order_id' => $orderId, 'pay_type' => 'credit', 'mnp' => $mnp, 'company' => 'آفاریکس'], self::TOPUP_OPERATION_TIMEOUT_SECONDS);
     }
 
     public function transStatus(string $orderId, ?string $transId = null): array
@@ -63,14 +65,18 @@ final class InaxClient
                 'payment_status' => 'paid', 'trans_id' => $transId ?: 'MOCK-' . $orderId,
                 'ref_code' => 'MOCK-' . $orderId, 'mock' => true];
         }
-        $parameters = ['method' => 'trans_status', 'order_id' => $orderId];
-        if ($transId !== null && trim($transId) !== '') $parameters['trans_id'] = trim($transId);
-        return $this->request($parameters);
+        $transId = is_string($transId) ? trim($transId) : '';
+        if ($transId === '' || strlen($transId) > 50 || preg_match('/[\x00-\x1F\x7F]/', $transId)) {
+            throw new InvalidArgumentException('INAX_TRANS_ID_REQUIRED');
+        }
+        $parameters = ['method' => 'trans_status', 'order_id' => $orderId, 'trans_id' => $transId];
+        return $this->request($parameters, self::TOPUP_OPERATION_TIMEOUT_SECONDS);
     }
     public function credit(): array { return $this->request(['method' => 'credit']); }
 
-    private function request(array $parameters): array
+    private function request(array $parameters, ?int $timeoutOverride = null): array
     {
+        $timeout = $timeoutOverride === null ? $this->timeout : min($this->timeout, max(1, $timeoutOverride));
         $payload = array_merge(['username' => $this->username, 'password' => $this->password], $parameters);
         $body = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         if (!is_string($body)) throw new InaxNetworkException('INAX_REQUEST_ENCODING_FAILED');
@@ -87,7 +93,7 @@ final class InaxClient
             $this->logResponse($requestMetadata, $startedAtMonotonic, 0, 0, 'cURL initialization failed', null, null);
             throw new InaxNetworkException('INAX_CURL_INIT_FAILED');
         }
-        curl_setopt_array($curl, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body, CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT => min(10, $this->timeout), CURLOPT_TIMEOUT => $this->timeout, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Content-Type: application/json', 'Content-Length: ' . strlen($body)], CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2]);
+        curl_setopt_array($curl, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body, CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT => min(10, $timeout), CURLOPT_TIMEOUT => $timeout, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Content-Type: application/json', 'Content-Length: ' . strlen($body)], CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2]);
         $responseBody = curl_exec($curl);
         $curlError = curl_error($curl);
         $curlErrorNumber = curl_errno($curl);

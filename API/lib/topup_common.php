@@ -275,7 +275,8 @@ function topup_update_records(
 
     try {
         $transactionLock = $pdo->prepare(
-            "SELECT id, provider_operation_token
+            "SELECT id, status, provider_operation_token,
+                    (provider_operation_lease_until > UTC_TIMESTAMP()) AS provider_claim_active
              FROM transactions
              WHERE id = ? AND type = 'topup'
              LIMIT 1
@@ -303,23 +304,17 @@ function topup_update_records(
         // A provider response may write only while its lease token is still
         // current. In particular, a delayed purchase response cannot refund
         // after a status worker has taken over an expired lease.
-        if (!hash_equals((string)($lockedTransaction['provider_operation_token'] ?? ''), $providerClaimToken)) {
-            if ($ownsTransaction) $pdo->commit();
-            return match ($currentRechargeStatus) {
-                'completed' => 'success',
-                'refunded', 'failed' => 'failed',
-                default => 'pending',
-            };
+        if (!hash_equals((string)($lockedTransaction['provider_operation_token'] ?? ''), $providerClaimToken)
+            || (int)($lockedTransaction['provider_claim_active'] ?? 0) !== 1) {
+            throw new RuntimeException('TOPUP_PROVIDER_CLAIM_EXPIRED');
         }
 
         if (in_array($currentRechargeStatus, ['completed', 'refunded', 'failed'], true)) {
-            topup_clear_provider_claim($pdo, $transactionId, $providerClaimToken);
-            if ($ownsTransaction) {
-                $pdo->commit();
-            }
-            return $currentRechargeStatus === 'completed' ? 'success' : 'failed';
+            throw new RuntimeException('INVALID_TOPUP_STATUS_TRANSITION');
         }
-        if ($currentRechargeStatus !== 'pending' || !in_array($targetRechargeStatus, ['pending', 'completed'], true)) {
+        if ((string)$lockedTransaction['status'] !== 'pending'
+            || $currentRechargeStatus !== 'pending'
+            || !in_array($targetRechargeStatus, ['pending', 'completed'], true)) {
             throw new RuntimeException('INVALID_TOPUP_STATUS_TRANSITION');
         }
 
@@ -348,6 +343,14 @@ function topup_update_records(
     } catch (Throwable $error) {
         if ($ownsTransaction && $pdo->inTransaction()) {
             $pdo->rollBack();
+        }
+
+        if ($ownsTransaction) {
+            try {
+                topup_clear_provider_claim($pdo, $transactionId, $providerClaimToken);
+            } catch (Throwable $releaseError) {
+                error_log('Top-up record claim release failed transaction=' . $transactionId);
+            }
         }
 
         throw $error;
@@ -429,11 +432,8 @@ function topup_provider_code(array $response): int
 
 function topup_normalize_provider_code(int $code): int
 {
-    // Only the documented 11, 12, and 77 variants are equivalent across signs.
     return match ($code) {
-        11 => -11,
-        12 => -12,
-        77 => -77,
+        11, 12, 18, 22, 33, 44, 55, 66, 67, 77, 91, 200 => -$code,
         default => $code,
     };
 }
@@ -456,7 +456,24 @@ function topup_provider_status_class(array $response): string
     if ($confirmedSuccess && $confirmedFailure) return 'pending';
     if ($confirmedSuccess) return 'success';
     if ($confirmedFailure) return 'failed';
-    return 'pending';
+    return topup_provider_result_class(topup_provider_code($response));
+}
+
+function topup_provider_status_conflicts(array $response): bool
+{
+    $finalStatus = strtolower(trim((string)($response['final_status'] ?? '')));
+    $paymentStatus = strtolower(trim((string)($response['payment_status'] ?? '')));
+    $confirmedSuccess = $finalStatus === 'succeeded' || $paymentStatus === 'paid';
+    $confirmedFailure = in_array($finalStatus, ['failed', 'refund_provider'], true) || $paymentStatus === 'refund';
+    return $confirmedSuccess && $confirmedFailure;
+}
+
+function topup_provider_trans_id(mixed $value): ?string
+{
+    if (!is_string($value) && !is_numeric($value)) return null;
+    $value = trim((string)$value);
+    if ($value === '' || strlen($value) > 50 || preg_match('/[\x00-\x1F\x7F]/', $value)) return null;
+    return $value;
 }
 
 function topup_provider_message(
@@ -535,6 +552,10 @@ function topup_status_snapshot(array $transaction): array
 {
     $transactionStatus = strtolower(trim((string)($transaction['status'] ?? '')));
     $rechargeStatus = strtolower(trim((string)($transaction['recharge_status'] ?? '')));
+
+    if ((int)($transaction['reconciliation_marker'] ?? 0) === 1) {
+        return ['status' => 'pending', 'reconciliation_required' => true];
+    }
 
     if ($rechargeStatus === '') {
         return ['status' => 'pending', 'reconciliation_required' => true];
@@ -656,13 +677,16 @@ function topup_refund_evidence(array $row, string $expectedState = 'pending'): a
 
 function topup_provider_claim_token(): string
 {
-    return bin2hex(random_bytes(16));
+    $bytes = random_bytes(16);
+    $bytes[6] = chr((ord($bytes[6]) & 0x0f) | 0x40);
+    $bytes[8] = chr((ord($bytes[8]) & 0x3f) | 0x80);
+    // Compact 32-character UUIDv4 encoding fits the existing CHAR(32) column.
+    return bin2hex($bytes);
 }
 
 function topup_provider_claim_lease_seconds(): int
 {
-    $configuredTimeout = min(90, max(1, (int)(getenv('INAX_TIMEOUT') ?: 30)));
-    return max(90, $configuredTimeout + 60);
+    return 30;
 }
 
 function topup_clear_provider_claim(PDO $pdo, int $transactionId, string $claimToken): void
@@ -768,6 +792,9 @@ function topup_update_transaction(
 
     foreach ($updates as $column => $value) {
         if (in_array($column, $allowed, true)) {
+            if ($column === 'provider_ref_code' && is_string($value)) {
+                $value = substr($value, 0, 50);
+            }
             $parts[] = $column . ' = ?';
             $values[] = $value;
         }
@@ -791,7 +818,7 @@ function topup_update_transaction(
 
     try {
         $transactionStmt = $pdo->prepare(
-            "SELECT idempotency_key
+            "SELECT idempotency_key, status
              FROM transactions
              WHERE id = ? AND type = 'topup'
              LIMIT 1
@@ -818,21 +845,11 @@ function topup_update_transaction(
         $rechargeStatus = $rechargeStmt->fetchColumn();
         $requestedStatus = $updates['status'] ?? null;
 
-        $terminalStatus = match ((string)$rechargeStatus) {
-            'completed' => 'success',
-            'refunded' => 'failed',
-            default => null,
-        };
-
-        if (
-            $terminalStatus !== null
-            && $requestedStatus !== $terminalStatus
-        ) {
-            if ($ownsTransaction) {
-                $pdo->commit();
-            }
-
-            return;
+        if ($requestedStatus !== null && (
+            in_array((string)$transaction['status'], ['success', 'failed', 'completed', 'refunded'], true)
+            || in_array((string)$rechargeStatus, ['completed', 'failed', 'refunded'], true)
+        )) {
+            throw new RuntimeException('INVALID_TOPUP_STATUS_TRANSITION');
         }
 
         $values[] = $transactionId;
@@ -879,7 +896,7 @@ function topup_refund_transaction(
             true
         );
 
-        $select = 'id, user_id, amount, status, idempotency_key, topup_mobile, topup_operator, topup_charge_type, client_request_id, balance_before, balance_after, provider_operation_token'
+        $select = 'id, user_id, amount, status, idempotency_key, topup_mobile, topup_operator, topup_charge_type, client_request_id, balance_before, balance_after, provider_operation_token, (provider_operation_lease_until > UTC_TIMESTAMP()) AS provider_claim_active'
             . ($hasRefundApplied ? ', refund_applied' : ', 0 AS refund_applied');
         if (!in_array('balance_applied', $columns, true)) {
             throw new RuntimeException('TOPUP_FINANCIAL_EVIDENCE_MISSING');
@@ -943,8 +960,9 @@ function topup_refund_transaction(
             throw new RuntimeException('TOPUP_FINANCIAL_EVIDENCE_MISSING');
         }
 
-        if (!hash_equals((string)($transaction['provider_operation_token'] ?? ''), $providerClaimToken)) {
-            throw new RuntimeException('TOPUP_PROVIDER_CLAIM_LOST');
+        if (!hash_equals((string)($transaction['provider_operation_token'] ?? ''), $providerClaimToken)
+            || (int)($transaction['provider_claim_active'] ?? 0) !== 1) {
+            throw new RuntimeException('TOPUP_PROVIDER_CLAIM_EXPIRED');
         }
 
         $evidence = topup_refund_evidence([
@@ -1025,6 +1043,14 @@ function topup_refund_transaction(
     } catch (Throwable $error) {
         if ($ownsTransaction && $pdo->inTransaction()) {
             $pdo->rollBack();
+        }
+
+        if ($ownsTransaction) {
+            try {
+                topup_clear_provider_claim($pdo, $transactionId, $providerClaimToken);
+            } catch (Throwable $releaseError) {
+                error_log('Top-up refund claim release failed transaction=' . $transactionId);
+            }
         }
 
         throw $error;

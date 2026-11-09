@@ -69,7 +69,8 @@ const requestTopupStatus = (
   apiToken: string,
   transactionId?: string | number | null,
   clientRequestId?: string | null,
-  providerTransactionId?: string | null
+  providerTransactionId?: string | null,
+  orderId?: string | null
 ) => fetchJson<any>('topup-status.php', {
   method: 'POST',
   headers: {
@@ -81,6 +82,7 @@ const requestTopupStatus = (
     transaction_id: transactionId || null,
     client_request_id: clientRequestId || null,
     trans_id: providerTransactionId || null,
+    order_id: orderId || null,
   }),
 });
 
@@ -289,7 +291,7 @@ export default function TopupScreen() {
         const existingTransactionId = String((payload?.data as Record<string, unknown> | undefined)?.transaction_id ?? '');
         if (existingTransactionId) {
           try {
-            const existing = await requestTopupStatus(userToken, existingTransactionId, requestId);
+            const existing = await requestTopupStatus(userToken, existingTransactionId, requestId, null, pendingReceipt.orderId);
             setResult(toReceipt(existing, cleanMobile, operator, numericAmount, clientRequestId.current, chargeType, '', pendingReceipt.createdAt));
             setStep('result');
           } catch {
@@ -330,7 +332,8 @@ export default function TopupScreen() {
         userToken,
         result.transactionId || null,
         result.clientRequestId || clientRequestId.current || null,
-        result.providerTransactionId || null
+        result.providerTransactionId || null,
+        result.orderId || null
       );
       if (__DEV__) console.log('[AFARIEX-DEBUG] topup status response', { status: response?.status, code: response?.code });
       const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
@@ -343,8 +346,8 @@ export default function TopupScreen() {
         const notVisible = {
           ...(payload || {}),
           status: 'pending',
-          code: payload?.code || 'TOPUP_TRANSACTION_NOT_VISIBLE_YET',
-          message: payload?.message || 'درخواست هنوز قابل مشاهده نیست؛ وضعیت نامشخص است. بعداً با همین شناسه دوباره بررسی کنید.',
+          code: 'TOPUP_TRANSACTION_NOT_FOUND',
+          message: payload?.message || 'تراکنش هنوز پیدا نشد؛ با همین شناسه بعداً دوباره بررسی کنید.',
         };
         setResult(toReceipt(notVisible, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt));
       } else if (payload?.status) setResult(toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt));
@@ -367,17 +370,17 @@ export default function TopupScreen() {
     }
     const activePollingWindow = pollingWindow.current;
     const startedAt = activePollingWindow.startedAt;
-    const delays = [4000, 5000, 6000];
-    const maxWindowMs = 240000;
-    const maxStatusCallMs = 50000;
-    const maxStatusChecks = 40;
+    const delays = [3000, 5000, 10000];
+    const maxWindowMs = 120000;
+    const maxStatusCallMs = 45000;
+    const maxStatusChecks = 12;
 
     const scheduleNext = () => {
       const elapsed = Date.now() - startedAt;
       if (stopped) return;
       if (activePollingWindow.checks >= maxStatusChecks || elapsed + maxStatusCallMs >= maxWindowMs) {
         setResult((current) => current?.status === 'pending'
-          ? { ...current, message: 'بررسی خودکار پس از پایان مهلت متوقف شد و نتیجه نهایی سرویس هنوز نرسیده است. برای جلوگیری از خرید تکراری، پرداخت را تکرار نکنید؛ با همین شناسه دوباره وضعیت را بررسی کنید یا با پشتیبانی تماس بگیرید.' }
+          ? { ...current, message: 'درخواست برای تطبیق دستی به پشتیبانی ارجاع شد. Do not re-attempt payment; transaction is being reconciled. پرداخت را دوباره انجام ندهید؛ تراکنش در حال تطبیق است.' }
           : current);
         return;
       }
@@ -399,7 +402,8 @@ export default function TopupScreen() {
             userToken,
             result.transactionId || null,
             result.clientRequestId || clientRequestId.current || null,
-            result.providerTransactionId || null
+            result.providerTransactionId || null,
+            result.orderId || null
           );
           if (['success', 'succeeded', 'failed', 'pending'].includes(response?.status)) {
             const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
@@ -414,7 +418,7 @@ export default function TopupScreen() {
             : null;
           if (payload?.retryable === false) stopPolling = true;
           if (isApiResponseError(error) && error.status === 404) {
-            const notVisible = { ...(payload || {}), success: false, status: 'pending', code: payload?.code || 'TOPUP_TRANSACTION_NOT_VISIBLE_YET', message: payload?.message || 'درخواست هنوز قابل مشاهده نیست؛ وضعیت نامشخص است و دوباره بررسی می‌شود.' };
+            const notVisible = { ...(payload || {}), success: false, status: 'pending', code: 'TOPUP_TRANSACTION_NOT_FOUND', message: payload?.message || 'تراکنش هنوز پیدا نشد؛ با همین شناسه دوباره بررسی می‌شود.' };
             const updated = toReceipt(notVisible, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
             setResult(updated);
             updatedStatus = updated.status;

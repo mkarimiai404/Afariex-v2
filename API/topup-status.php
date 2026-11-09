@@ -51,8 +51,11 @@ $refundAppliedSelect = in_array('refund_applied', $transactionColumns, true) ? '
 
 $transactionId = (int)($data['transaction_id'] ?? 0);
 $providerReference = trim((string)($data['trans_id'] ?? $data['ref_id'] ?? ''));
+$providerReference = strlen($providerReference) <= 50 ? $providerReference : '';
+$requestedOrderId = trim((string)($data['order_id'] ?? ''));
+$requestedOrderId = strlen($requestedOrderId) <= 50 ? $requestedOrderId : '';
 $clientRequestId = topup_validate_client_request_id($data['client_request_id'] ?? null);
-if ($transactionId <= 0 && $providerReference === '' && $clientRequestId === null) {
+if ($transactionId <= 0 && $providerReference === '' && $requestedOrderId === '' && $clientRequestId === null) {
     topup_json(['success' => false, 'code' => 'INVALID_TRANSACTION', 'message' => 'شناسه تراکنش یا شناسه درخواست معتبر نیست.'], 422);
 }
 
@@ -66,6 +69,7 @@ $select = "SELECT t.id, t.user_id, t.amount, t.status, t.idempotency_key, t.topu
                   r.client_request_id AS recharge_client_request_id,
                   r.trans_id, r.ref_code, r.error_code AS provider_error_code,
                   r.error_msg AS provider_error_message, r.status AS recharge_status,
+                  CASE WHEN r.error_msg LIKE 'TOPUP_RECONCILIATION_REQUIRED:%' THEN 1 ELSE 0 END AS reconciliation_marker,
                   sf.user_id AS fee_user_id, sf.source_type AS fee_source_type, sf.service_code AS fee_service_code,
                   sf.source_id AS fee_source_id, sf.original_amount AS fee_original_amount,
                   sf.fee_amount, sf.total_amount AS fee_total_amount, sf.status AS fee_status
@@ -120,11 +124,13 @@ $manualReview = static function (string $code, ?int $transactionId = null, ?stri
         'status' => 'pending',
         'code' => $code,
         'retryable' => false,
+        'reconciliation_required' => true,
         'message' => 'اطلاعات مالی درخواست با سوابق کیف پول سازگار نیست؛ خرید یا بازپرداخت تکرار نمی‌شود و بررسی پشتیبانی لازم است.',
         'data' => array_filter([
             'transaction_id' => $transactionId,
             'client_request_id' => $requestId,
             'order_id' => $orderId,
+            'reconciliation_required' => 1,
         ], static fn(mixed $value): bool => $value !== null),
     ], 503);
 };
@@ -140,6 +146,9 @@ try {
     if (!$transaction && $providerReference !== '') {
         $transaction = $findTransaction($pdo, '(r.trans_id = ? OR r.ref_code = ?)', [$providerReference, $providerReference], (int)$user['id'], $select);
     }
+    if (!$transaction && $requestedOrderId !== '') {
+        $transaction = $findTransaction($pdo, 't.idempotency_key = ?', [$requestedOrderId], (int)$user['id'], $select);
+    }
     if (!$transaction && $clientRequestId !== null) {
         $transaction = $findTransaction($pdo, 't.client_request_id = ?', [$clientRequestId], (int)$user['id'], $select);
     }
@@ -148,7 +157,7 @@ try {
         topup_json([
             'success' => false,
             'status' => 'pending',
-            'code' => 'TOPUP_TRANSACTION_NOT_VISIBLE_YET',
+            'code' => 'TOPUP_TRANSACTION_NOT_FOUND',
             'retryable' => true,
             'message' => 'درخواست هنوز در دسترس نیست؛ وضعیت را بعداً با همین شناسه دوباره بررسی کنید.',
             'data' => ['transaction_id' => null, 'client_request_id' => $clientRequestId],
@@ -195,7 +204,19 @@ try {
                 'commission_amount' => (int)$transaction['fee_amount'],
                 'total_amount' => (int)$evidence['amount_toman'],
             ],
-        ]);
+        ], 409);
+    }
+
+    $storedTransId = topup_provider_trans_id($transaction['trans_id'] ?? null);
+    if ($storedTransId === null) {
+        $marker = 'TOPUP_RECONCILIATION_REQUIRED: provider trans_id is missing or invalid.';
+        $pdo->prepare('UPDATE mobile_recharges SET error_msg = ? WHERE order_id = ? AND status = \'pending\'')
+            ->execute([$marker, (string)$transaction['idempotency_key']]);
+        if (in_array('description', $transactionColumns, true)) {
+            topup_update_transaction($pdo, (int)$transaction['id'], ['description' => $marker]);
+        }
+        $pdo->commit();
+        $manualReview('TOPUP_PROVIDER_TRANS_ID_MISSING', (int)$transaction['id'], (string)$transaction['client_request_id'], (string)$transaction['idempotency_key']);
     }
 
     $claimToken = topup_provider_claim_token();
@@ -218,7 +239,7 @@ try {
             'retryable' => true,
             'message' => 'درخواست دیگری وضعیت خرید را بررسی می‌کند؛ کمی بعد دوباره تلاش کنید.',
             'data' => ['transaction_id' => $transactionId, 'client_request_id' => (string)$transaction['client_request_id'], 'order_id' => $orderId],
-        ]);
+        ], 409);
     }
     $pdo->commit();
 } catch (Throwable $error) {
@@ -226,14 +247,13 @@ try {
     throw $error;
 }
 
-// No transaction or row lock is held across this external request. A crashed
-// worker leaves only a lease, which expires after the provider timeout plus a safety margin.
+// No transaction or row lock is held across this external request. A crashed worker leaves a finite lease.
 db_disconnect();
 $pdo = null;
 try {
     $provider = (new InaxClient())->transStatus(
         $orderId,
-        trim((string)($transaction['trans_id'] ?? '')) ?: null
+        $storedTransId
     );
 } catch (InaxConfigurationException $error) {
     $pdo = db();
@@ -259,8 +279,10 @@ try {
 $pdo = db();
 $providerCode = topup_provider_code($provider);
 $providerStatus = topup_provider_status_class($provider);
-$transId = trim((string)($provider['trans_id'] ?? '')) ?: trim((string)($transaction['trans_id'] ?? ''));
+$providerTransId = topup_provider_trans_id($provider['trans_id'] ?? null);
+$transId = $providerTransId ?? $storedTransId;
 $refCode = trim((string)($provider['ref_code'] ?? '')) ?: trim((string)($transaction['provider_ref_code'] ?? $transaction['ref_code'] ?? ''));
+if (strlen($refCode) > 100) $refCode = substr($refCode, 0, 100);
 
 // Phase 2: re-read and lock current state in a new short transaction. A lost or
 // expired claim cannot write; a concurrently finalized transaction is immutable.
@@ -300,6 +322,18 @@ try {
         ];
         $pdo->commit();
         topup_json($response);
+    }
+
+    if (topup_provider_status_conflicts($provider)) {
+        $marker = 'TOPUP_RECONCILIATION_REQUIRED: conflicting provider success and failure indicators.';
+        $pdo->prepare('UPDATE mobile_recharges SET error_msg = ? WHERE order_id = ? AND status = \'pending\'')
+            ->execute([$marker, $orderId]);
+        if (in_array('description', $transactionColumns, true)) {
+            topup_update_transaction($pdo, $transactionId, ['description' => $marker]);
+        }
+        topup_clear_provider_claim($pdo, $transactionId, $claimToken);
+        $pdo->commit();
+        $manualReview('TOPUP_PROVIDER_STATUS_CONFLICT', $transactionId, (string)$fresh['client_request_id'], $orderId);
     }
 
     $evidence = topup_refund_evidence($fresh);
