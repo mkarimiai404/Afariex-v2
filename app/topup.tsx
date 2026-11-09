@@ -47,8 +47,8 @@ const detectOperator = (value: string): string | null => {
   return null;
 };
 
-const fetchWalletBalance = async (userId: string, userToken: string): Promise<number | null> => {
-  const payload = new URLSearchParams({ user_id: userId, id: userId, api_token: userToken, token: userToken, user_token: userToken });
+const fetchWalletBalance = async (userId: string, token: string): Promise<number | null> => {
+  const payload = new URLSearchParams({ user_id: userId, id: userId, api_token: token, token, user_token: token });
   const response = await fetchJson<any>('dashboard.php', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: payload.toString() });
   const rawBalance = response?.balance ?? response?.user?.balance ?? response?.data?.balance ?? response?.result?.balance;
   const balance = Number(String(rawBalance ?? '').replace(/[٬,\s]/g, ''));
@@ -66,7 +66,7 @@ const createClientRequestId = () => {
 };
 
 const requestTopupStatus = (
-  apiToken: string,
+  token: string,
   transactionId?: string | number | null,
   clientRequestId?: string | null,
   providerTransactionId?: string | null,
@@ -75,10 +75,10 @@ const requestTopupStatus = (
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
-    Authorization: `Bearer ${apiToken}`,
+    Authorization: `Bearer ${token}`,
   },
   body: JSON.stringify({
-    api_token: apiToken,
+    api_token: token,
     transaction_id: transactionId || null,
     client_request_id: clientRequestId || null,
     trans_id: providerTransactionId || null,
@@ -88,7 +88,7 @@ const requestTopupStatus = (
 
 export default function TopupScreen() {
   const router = useRouter();
-  const { userId, userToken, isAuthenticated, isInitialized } = useAuth();
+  const { userId, token, isAuthenticated, isInitialized } = useAuth();
   const [operators, setOperators] = useState<Record<string, Operator>>(fallbackOperators);
   const [operator, setOperator] = useState('MCI');
   const [chargeType, setChargeType] = useState<ChargeType>('normal');
@@ -119,7 +119,7 @@ export default function TopupScreen() {
   }, [isAuthenticated, isInitialized, router]);
 
   useEffect(() => {
-    if (!userId || !userToken) return;
+    if (!userId || !token) return;
     let active = true;
     setPendingRestoreLoading(true);
     resultOwnerId.current = null;
@@ -134,7 +134,7 @@ export default function TopupScreen() {
       setStep('result');
     }).catch(() => undefined).finally(() => { if (active) setPendingRestoreLoading(false); });
     return () => { active = false; };
-  }, [userId, userToken]);
+  }, [userId, token]);
 
   useEffect(() => {
     if (!userId || !result || resultOwnerId.current !== userId) return;
@@ -145,26 +145,26 @@ export default function TopupScreen() {
   }, [result, userId]);
 
   useEffect(() => {
-    if (!userToken) return;
+    if (!token) return;
     let active = true;
     setLoading(true);
-    fetchJson<OperatorsResponse>('topup-operators.php', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}` }, body: JSON.stringify({ api_token: userToken }) })
+    fetchJson<OperatorsResponse>('topup-operators.php', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ api_token: token }) })
       .then((response) => { const remote = response?.data?.operators; if (active && remote && Object.keys(remote).length) setOperators(remote); })
       .catch(() => undefined)
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [userToken]);
+  }, [token]);
 
   useEffect(() => {
-    if (!userToken || !userId) return;
+    if (!token || !userId) return;
     let active = true;
     setBalanceLoading(true);
-    fetchWalletBalance(userId, userToken)
+    fetchWalletBalance(userId, token)
       .then((balance) => { if (active && balance !== null) setWalletBalance(balance); })
       .catch((error) => { if (__DEV__) console.log('[AFARIEX-DEBUG] topup wallet balance unavailable', { error: error instanceof Error ? error.name : 'unknown' }); })
       .finally(() => { if (active) setBalanceLoading(false); });
     return () => { active = false; };
-  }, [userId, userToken]);
+  }, [userId, token]);
 
   const selectedOperator = operators[operator] || fallbackOperators[operator];
   const quickAmounts = useMemo(() => [20000, 50000, 100000, 200000], []);
@@ -181,18 +181,18 @@ export default function TopupScreen() {
   };
 
   const refreshPreflightBalance = () => {
-    if (!userId || !userToken) return;
+    if (!userId || !token) return;
     setWalletBalance(null);
     setBalanceLoading(true);
     setFeePreview(null);
     setFeeError(false);
     setFeeLoading(true);
-    fetchWalletBalance(userId, userToken)
+    fetchWalletBalance(userId, token)
       .then((balance) => { if (balance !== null) setWalletBalance(balance); })
       .catch((error) => { if (__DEV__) console.log('[AFARIEX-DEBUG] preflight balance refresh failed', { error: error instanceof Error ? error.name : 'unknown' }); })
       .finally(() => setBalanceLoading(false));
 
-    const payload = new URLSearchParams({ api_token: userToken, service_code: 'mobile_recharge', amount: String(numericAmount) });
+    const payload = new URLSearchParams({ api_token: token, service_code: 'mobile_recharge', amount: String(numericAmount) });
     fetchJson<any>('service-fee-preview.php', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -233,7 +233,7 @@ export default function TopupScreen() {
   };
 
   const submit = async () => {
-    if (!userToken || !userId || submitting || !tryAcquireInFlight(submitInFlight)) return;
+    if (!token || !userId || submitting || !tryAcquireInFlight(submitInFlight)) return;
     setSubmitting(true);
     resultOwnerId.current = userId;
     clientRequestId.current ??= createClientRequestId();
@@ -247,13 +247,12 @@ export default function TopupScreen() {
       message: 'پاسخ درخواست هنوز دریافت نشده است؛ وضعیت آن با همین شناسه پیگیری می‌شود.',
     };
     try {
-      // Store the id before sending; after a disconnect, status lookup is safer than resubmitting.
       await savePendingTopup(userId, pendingReceipt).catch(() => undefined);
       if (__DEV__) console.log('[AFARIEX-DEBUG] topup submit started', { client_request_id: requestId, operator, charge_type: chargeType, amount: numericAmount });
       const response = await fetchJson<any>('topup-create.php', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}` },
-        body: JSON.stringify({ api_token: userToken, phone: cleanMobile, operator, amount: numericAmount, charge_type: chargeType, client_request_id: requestId }),
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ api_token: token, phone: cleanMobile, operator, amount: numericAmount, charge_type: chargeType, client_request_id: requestId }),
       });
       if (__DEV__) console.log('[AFARIEX-DEBUG] topup submit response', { client_request_id: requestId, status: response?.status, code: response?.code });
       if (response?.status === 'online_payment_required') {
@@ -291,7 +290,7 @@ export default function TopupScreen() {
         const existingTransactionId = String((payload?.data as Record<string, unknown> | undefined)?.transaction_id ?? '');
         if (existingTransactionId) {
           try {
-            const existing = await requestTopupStatus(userToken, existingTransactionId, requestId, null, pendingReceipt.orderId);
+            const existing = await requestTopupStatus(token, existingTransactionId, requestId, null, pendingReceipt.orderId);
             setResult(toReceipt(existing, cleanMobile, operator, numericAmount, clientRequestId.current, chargeType, '', pendingReceipt.createdAt));
             setStep('result');
           } catch {
@@ -323,20 +322,20 @@ export default function TopupScreen() {
   };
 
   const checkStatus = async () => {
-    if (!userToken || !result || (!result.transactionId && !result.clientRequestId) || submitting || statusRequestInFlight.current) return;
+    if (!token || !result || (!result.transactionId && !result.clientRequestId) || submitting || statusRequestInFlight.current) return;
     statusRequestInFlight.current = true;
     setSubmitting(true);
     try {
       if (__DEV__) console.log('[AFARIEX-DEBUG] topup status check started', { transaction_id: result.transactionId || null, client_request_id: result.clientRequestId || null });
       const response = await requestTopupStatus(
-        userToken,
+        token,
         result.transactionId || null,
         result.clientRequestId || clientRequestId.current || null,
         result.providerTransactionId || null,
         result.orderId || null
       );
       if (__DEV__) console.log('[AFARIEX-DEBUG] topup status response', { status: response?.status, code: response?.code });
-      const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
+      const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt, result.trackingCode, result.orderId);
       setResult(updated);
       const updatedBalance = Number(response?.data?.remaining_balance ?? response?.data?.balance);
       if (Number.isFinite(updatedBalance)) setWalletBalance(updatedBalance);
@@ -349,8 +348,8 @@ export default function TopupScreen() {
           code: 'TOPUP_TRANSACTION_NOT_FOUND',
           message: payload?.message || 'تراکنش هنوز پیدا نشد؛ با همین شناسه بعداً دوباره بررسی کنید.',
         };
-        setResult(toReceipt(notVisible, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt));
-      } else if (payload?.status) setResult(toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt));
+        setResult(toReceipt(notVisible, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt, result.trackingCode, result.orderId));
+      } else if (payload?.status) setResult(toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt, result.trackingCode, result.orderId));
       else if (__DEV__) console.log('[AFARIEX-DEBUG] topup status check unavailable', { error: error instanceof Error ? error.name : 'unknown' });
       if (!payload?.status) {
         setResult((current) => current?.status === 'pending' ? { ...current, message: describeStatusCheckError(error) } : current);
@@ -359,8 +358,9 @@ export default function TopupScreen() {
       }
     } finally { statusRequestInFlight.current = false; setSubmitting(false); }
   };
+
   useEffect(() => {
-    if (step !== 'result' || result?.status !== 'pending' || !userToken) return;
+    if (step !== 'result' || result?.status !== 'pending' || !token) return;
 
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -380,7 +380,7 @@ export default function TopupScreen() {
       if (stopped) return;
       if (activePollingWindow.checks >= maxStatusChecks || elapsed + maxStatusCallMs >= maxWindowMs) {
         setResult((current) => current?.status === 'pending'
-          ? { ...current, message: 'درخواست برای تطبیق دستی به پشتیبانی ارجاع شد. Do not re-attempt payment; transaction is being reconciled. پرداخت را دوباره انجام ندهید؛ تراکنش در حال تطبیق است.' }
+          ? { ...current, message: 'درخواست برای تطبیق دستی به پشتیبانی ارجاع شد. پرداخت را دوباره انجام ندهید؛ تراکنش در حال تطبیق است.' }
           : current);
         return;
       }
@@ -399,14 +399,14 @@ export default function TopupScreen() {
         let stopPolling = false;
         try {
           const response = await requestTopupStatus(
-            userToken,
+            token,
             result.transactionId || null,
             result.clientRequestId || clientRequestId.current || null,
             result.providerTransactionId || null,
             result.orderId || null
           );
           if (['success', 'succeeded', 'failed', 'pending'].includes(response?.status)) {
-            const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
+            const updated = toReceipt(response, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt, result.trackingCode, result.orderId);
             setResult(updated);
             updatedStatus = updated.status;
             const updatedBalance = Number(response?.data?.remaining_balance ?? response?.data?.balance);
@@ -419,11 +419,11 @@ export default function TopupScreen() {
           if (payload?.retryable === false) stopPolling = true;
           if (isApiResponseError(error) && error.status === 404) {
             const notVisible = { ...(payload || {}), success: false, status: 'pending', code: 'TOPUP_TRANSACTION_NOT_FOUND', message: payload?.message || 'تراکنش هنوز پیدا نشد؛ با همین شناسه دوباره بررسی می‌شود.' };
-            const updated = toReceipt(notVisible, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
+            const updated = toReceipt(notVisible, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt, result.trackingCode, result.orderId);
             setResult(updated);
             updatedStatus = updated.status;
           } else if (['success', 'succeeded', 'failed', 'pending'].includes(payload?.status)) {
-            const updated = toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt);
+            const updated = toReceipt(payload, result.mobile, result.operator, result.amount, result.clientRequestId, result.chargeType, result.transactionId, result.createdAt, result.trackingCode, result.orderId);
             setResult(updated);
             updatedStatus = updated.status;
           }
@@ -440,7 +440,7 @@ export default function TopupScreen() {
       stopped = true;
       if (timer) clearTimeout(timer);
     };
-  }, [step, result?.status, result?.transactionId, result?.clientRequestId, result?.mobile, result?.operator, result?.amount, result?.chargeType, result?.createdAt, pollingRestart, userToken]);
+  }, [step, result?.status, result?.transactionId, result?.clientRequestId, result?.mobile, result?.operator, result?.amount, result?.chargeType, result?.createdAt, result?.trackingCode, result?.orderId, pollingRestart, token]);
 
 
   if (!isInitialized || loading || pendingRestoreLoading) return <SafeAreaView style={styles.safe}><ActivityIndicator color={appColors.primary} /></SafeAreaView>;
@@ -499,14 +499,48 @@ export default function TopupScreen() {
   </SafeAreaView>;
 }
 
-function toReceipt(payload: any, mobile: string, operator: string, amount: number, fallbackClientRequestId?: string | null, fallbackChargeType: ChargeType = 'normal', fallbackTransactionId = '', fallbackCreatedAt?: string): TopupReceiptModel {
+function toReceipt(
+  payload: any,
+  mobile: string,
+  operator: string,
+  amount: number,
+  fallbackClientRequestId?: string | null,
+  fallbackChargeType: ChargeType = 'normal',
+  fallbackTransactionId = '',
+  fallbackCreatedAt?: string,
+  fallbackTrackingCode?: string,
+  fallbackOrderId?: string
+): TopupReceiptModel {
   const rawStatus = payload?.status as TopupStatus | undefined;
   const status = rawStatus === 'succeeded' ? 'success' : rawStatus === 'success' || rawStatus === 'failed' || rawStatus === 'pending' ? rawStatus : 'pending';
   const data = payload?.data || {};
   const reference = data.ref_code ?? data.trans_id ?? data.ref_id;
   const commissionAmount = Number(data.commission_amount || 0);
   const receiptAmount = Number(data.amount || amount);
-  return { transactionId: String(data.transaction_id || fallbackTransactionId), clientRequestId: String(data.client_request_id || fallbackClientRequestId || '') || undefined, providerTransactionId: data.trans_id ? String(data.trans_id) : undefined, mobile: String(data.mobile || data.phone || mobile), operator: String(data.operator || operator), operatorLabel: topupOperatorLabel(String(data.operator || operator)), amount: receiptAmount, commissionAmount, totalAmount: Number(data.total_amount ?? receiptAmount + commissionAmount), chargeType: (data.charge_type === 'amazing' ? 'amazing' : data.charge_type === 'normal' ? 'normal' : fallbackChargeType), status, refCode: reference ? String(reference) : undefined, trackingCode: data.tracking_code ? String(data.tracking_code) : undefined, orderId: data.order_id ? String(data.order_id) : undefined, message: String(payload?.message || ''), createdAt: data.created_at ? String(data.created_at) : fallbackCreatedAt };
+
+  // استخراج مقدار tracking code و حفظ مقدار قبلی در صورت خالی بودن در استعلام مجدد
+  const trackingCandidate = data.tracking_code ?? data.order_id ?? (reference ? String(reference) : undefined);
+  const finalTrackingCode = trackingCandidate ? String(trackingCandidate) : fallbackTrackingCode;
+  const finalOrderId = data.order_id ? String(data.order_id) : fallbackOrderId;
+
+  return {
+    transactionId: String(data.transaction_id || fallbackTransactionId),
+    clientRequestId: String(data.client_request_id || fallbackClientRequestId || '') || undefined,
+    providerTransactionId: data.trans_id ? String(data.trans_id) : undefined,
+    mobile: String(data.mobile || data.phone || mobile),
+    operator: String(data.operator || operator),
+    operatorLabel: topupOperatorLabel(String(data.operator || operator)),
+    amount: receiptAmount,
+    commissionAmount,
+    totalAmount: Number(data.total_amount ?? receiptAmount + commissionAmount),
+    chargeType: (data.charge_type === 'amazing' ? 'amazing' : data.charge_type === 'normal' ? 'normal' : fallbackChargeType),
+    status,
+    refCode: reference ? String(reference) : undefined,
+    trackingCode: finalTrackingCode,
+    orderId: finalOrderId,
+    message: String(payload?.message || ''),
+    createdAt: data.created_at ? String(data.created_at) : fallbackCreatedAt,
+  };
 }
 
 function describeStatusCheckError(error: unknown): string {
@@ -515,7 +549,14 @@ function describeStatusCheckError(error: unknown): string {
   return 'ارتباط با سرور موقتاً برقرار نشد؛ خرید تکرار نشده و وضعیت با همان شناسه دوباره بررسی می‌شود.';
 }
 
-function SummaryRow({ label, value, last = false }: { label: string; value: string; last?: boolean }) { return <View style={[styles.summaryRow, last && styles.lastRow]}><Text style={styles.summaryLabel}>{label}</Text><Text style={styles.summaryValue}>{value}</Text></View>; }
+function SummaryRow({ label, value, last = false }: { label: string; value: string; last?: boolean }) {
+  return (
+    <View style={[styles.summaryRow, last && styles.lastRow]}>
+      <Text style={styles.summaryLabel}>{label}</Text>
+      <Text style={styles.summaryValue}>{value}</Text>
+    </View>
+  );
+}
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: appColors.background },
