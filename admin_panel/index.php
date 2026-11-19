@@ -6,22 +6,22 @@ require_login();
 require_permission('view');
 
 $totalAgencies = (int)db()->query('SELECT COUNT(*) FROM agencies')->fetchColumn();
-$totalActiveRates = (int)db()->query('SELECT COUNT(*) FROM exchange_rates WHERE is_active = 1')->fetchColumn();
+$totalActiveRates = (int)db()->query('SELECT COUNT(DISTINCT CONCAT(source_currency, CHAR(124), destination_currency)) FROM exchange_rates WHERE is_active = 1 AND effective_date <= CURRENT_DATE')->fetchColumn();
 $totalRemittances = (int)db()->query('SELECT COUNT(*) FROM remittances')->fetchColumn();
 $sumToman = (float)db()->query('SELECT COALESCE(SUM(amount_toman), 0) FROM remittances')->fetchColumn();
-$sumAfghani = (float)db()->query('SELECT COALESCE(SUM(amount_afghani), 0) FROM remittances')->fetchColumn();
+$sumAfghani = (float)db()->query("SELECT COALESCE(SUM(amount_afghani), 0) FROM remittances WHERE destination_currency = 'AFN'")->fetchColumn();
 
-$currentRate = db()->query('
+$currentRate = db()->query("
     SELECT rate, afn_to_toman, toman_to_afn, effective_date, created_at
     FROM exchange_rates
-    WHERE is_active = 1
-    ORDER BY id DESC
+    WHERE is_active = 1 AND source_currency = 'IRT' AND destination_currency = 'AFN' AND effective_date <= CURRENT_DATE
+    ORDER BY effective_date DESC, id DESC
     LIMIT 1
-')->fetch();
+")->fetch();
 
 $latestRemittanceRows = [];
 $stmtLatest = db()->prepare('
-    SELECT id, user_id, agency, destination_country, sender, receiver, amount_toman, amount_afghani, status, created_at
+    SELECT id, user_id, agency, destination_country, sender, receiver, amount_toman, amount_afghani, source_currency, destination_currency, status, created_at
     FROM remittances
     ORDER BY id DESC
     LIMIT 8
@@ -297,8 +297,8 @@ render_page_start('داشبورد', 'index');
                         <th>کشور مقصد</th>
                         <th>فرستنده</th>
                         <th>گیرنده</th>
-                        <th>تومان</th>
-                        <th>افغانی</th>
+                        <th>مبلغ ارز مبدأ</th>
+                        <th>مبلغ ارز مقصد</th>
                         <th>وضعیت</th>
                         <th>تاریخ</th>
                     </tr>
@@ -315,8 +315,8 @@ render_page_start('داشبورد', 'index');
                             <td><?= e(remittance_destination_countries()[(string)($row['destination_country'] ?? '')] ?? '—') ?></td>
                             <td><?= e($row['sender']) ?></td>
                             <td><?= e($row['receiver']) ?></td>
-                            <td style="color:#059669 !important; font-weight:600;"><?= e(number_format((float)$row['amount_toman'])) ?></td>
-                            <td style="color:#2563eb !important; font-weight:600;"><?= e(number_format((float)$row['amount_afghani'])) ?></td>
+                            <td style="color:#059669 !important; font-weight:600;"><?= e(number_format((float)$row['amount_toman'])) ?> <?= e((string)($row['source_currency'] ?: 'IRT')) ?></td>
+                            <td style="color:#2563eb !important; font-weight:600;"><?= e(number_format((float)$row['amount_afghani'])) ?> <?= e((string)($row['destination_currency'] ?: 'AFN')) ?></td>
                             <td><span class="md-badge"><?= e(status_fa((string)$row['status'])) ?></span></td>
                             <td><span dir="ltr" style="font-size:13px; color:#64748b;"><?= e(jalali_date((string)$row['created_at'])) ?></span></td>
                         </tr>

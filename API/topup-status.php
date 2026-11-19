@@ -1,6 +1,9 @@
 <?php
 declare(strict_types=1);
 
+ini_set('display_errors', '0');
+ini_set('display_startup_errors', '0');
+
 ob_start();
 set_exception_handler(static function (Throwable $error): never {
     while (ob_get_level() > 0) {
@@ -20,6 +23,7 @@ set_exception_handler(static function (Throwable $error): never {
 });
 
 require_once __DIR__ . '/lib/topup_common.php';
+
 
 topup_headers();
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
@@ -74,7 +78,7 @@ $select = "SELECT t.id, t.user_id, t.amount, t.status, t.idempotency_key, t.topu
                   r.client_request_id AS recharge_client_request_id,
                   r.trans_id, r.ref_code, r.error_code AS provider_error_code,
                   r.error_msg AS provider_error_message, r.status AS recharge_status,
-                  CASE WHEN r.error_msg LIKE 'TOPUP_RECONCILIATION_REQUIRED:%' THEN 1 ELSE 0 END AS reconciliation_marker,
+                  CASE WHEN r.error_msg LIKE 'TOPUP_RECONCILIATION_REQUIRED:%%' THEN 1 ELSE 0 END AS reconciliation_marker,
                   sf.user_id AS fee_user_id, sf.source_type AS fee_source_type, sf.service_code AS fee_service_code,
                   sf.source_id AS fee_source_id, sf.original_amount AS fee_original_amount,
                   sf.fee_amount, sf.total_amount AS fee_total_amount, sf.status AS fee_status
@@ -85,7 +89,7 @@ $select = "SELECT t.id, t.user_id, t.amount, t.status, t.idempotency_key, t.topu
            LIMIT 1 FOR UPDATE";
 
 $findTransaction = static function (PDO $pdo, string $condition, array $identifiers, int $userId, string $select): array|false {
-    $stmt = $pdo->prepare(sprintf($select, $condition));
+    $stmt = $pdo->prepare(str_replace('%s', $condition, $select));
     $stmt->execute([...$identifiers, $userId]);
     return $stmt->fetch();
 };
@@ -164,7 +168,7 @@ try {
         topup_json([
             'success' => false,
             'status' => 'pending',
-            'code' => 'TOPUP_TRANSACTION_NOT_FOUND',
+            'code' => 'TOPUP_TRANSACTION_NOT_VISIBLE_YET',
             'retryable' => true,
             'message' => 'درخواست هنوز در دسترس نیست؛ وضعیت را بعداً با همین شناسه دوباره بررسی کنید.',
             'data' => ['transaction_id' => null, 'client_request_id' => $clientRequestId],
@@ -262,6 +266,8 @@ try {
 }
 
 // External gateway inquiry (outside DB transaction lock)
+db_disconnect();
+$pdo = null;
 try {
     $provider = (new InaxClient())->transStatus($orderId, $storedTransId);
 } catch (InaxConfigurationException $error) {
@@ -361,10 +367,23 @@ try {
     }
 
     if ($providerStatus === 'success') {
-        topup_update_records($pdo, $transactionId, 'success', $transId, $refCode, $claimToken);
+        topup_update_records(
+            $pdo,
+            $transactionId,
+            (string)$transaction['idempotency_key'],
+            ['status' => 'success', 'provider_ref_code' => $refCode],
+            ['status' => 'completed', 'trans_id' => $transId, 'ref_code' => $refCode, 'raw_response' => $provider, 'error_code' => null, 'error_msg' => null],
+            $claimToken
+        );
         $freshStatement->execute([$transactionId, (int)$user['id']]);
         $updated = $freshStatement->fetch();
-        $response = $responseForSnapshot($updated ?: $fresh, 'success', (int)$user['id'], $pdo);
+        $finalRow = $updated ?: $fresh;
+        $finalSnapshot = topup_status_snapshot($finalRow);
+        if ($finalSnapshot['reconciliation_required']) {
+            $pdo->commit();
+            $manualReview('TOPUP_STATUS_RECONCILIATION_REQUIRED', $transactionId, (string)$finalRow['client_request_id'], (string)$finalRow['idempotency_key']);
+        }
+        $response = $responseForSnapshot($finalRow, $finalSnapshot['status'], (int)$user['id'], $pdo);
         $pdo->commit();
         topup_json($response);
     }
@@ -374,10 +393,14 @@ try {
             $pdo,
             $transactionId,
             (string)($provider['msg'] ?? 'خرید شارژ توسط درگاه لغو یا ناموفق اعلام شد.'),
-            (string)$providerCode,
-            $transId,
-            $refCode,
-            $claimToken
+            $claimToken,
+            [
+                'trans_id' => $transId,
+                'ref_code' => $refCode,
+                'raw_response' => $provider,
+                'error_code' => $providerCode,
+                'error_msg' => $provider['msg'] ?? null
+            ]
         );
         if (!$refundResult['success']) {
             $marker = 'TOPUP_RECONCILIATION_REQUIRED: ' . ($refundResult['code'] ?? 'REFUND_FAILED');
@@ -388,7 +411,13 @@ try {
         }
         $freshStatement->execute([$transactionId, (int)$user['id']]);
         $updated = $freshStatement->fetch();
-        $response = $responseForSnapshot($updated ?: $fresh, 'failed', (int)$user['id'], $pdo);
+        $finalRow = $updated ?: $fresh;
+        $finalSnapshot = topup_status_snapshot($finalRow);
+        if ($finalSnapshot['reconciliation_required']) {
+            $pdo->commit();
+            $manualReview('TOPUP_STATUS_RECONCILIATION_REQUIRED', $transactionId, (string)$finalRow['client_request_id'], (string)$finalRow['idempotency_key']);
+        }
+        $response = $responseForSnapshot($finalRow, $finalSnapshot['status'], (int)$user['id'], $pdo);
         $pdo->commit();
         topup_json($response);
     }

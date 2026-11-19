@@ -26,7 +26,11 @@ try {
     $user->execute([$token]);
     $userId = (int)($user->fetchColumn() ?: 0);
     if (!$userId) transaction_receipt_json(['success' => false, 'message' => 'احراز هویت لازم است.'], 401);
-    $stmt = db()->prepare("SELECT id, amount, type, status, created_at, description, tracking_code, receipt_image FROM transactions WHERE id = ? AND user_id = ? AND type NOT IN ('withdraw', 'withdrawal') LIMIT 1");
+    $currencySelect = "'IRT' AS currency_code";
+    $currencyColumn = db()->prepare('SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?');
+    $currencyColumn->execute(['transactions', 'currency_code']);
+    if ((int)$currencyColumn->fetchColumn() > 0) $currencySelect = 'currency_code';
+    $stmt = db()->prepare("SELECT id, amount, type, status, created_at, description, tracking_code, receipt_image, {$currencySelect} FROM transactions WHERE id = ? AND user_id = ? AND type NOT IN ('withdraw', 'withdrawal') LIMIT 1");
     $stmt->execute([$id, $userId]);
     $row = $stmt->fetch();
     if (!$row) transaction_receipt_json(['success' => false, 'message' => 'رسید پیدا نشد.'], 404);
@@ -42,7 +46,7 @@ try {
         }
     }
     transaction_receipt_json(['success' => true, 'data' => [
-        'id' => (string)$row['id'], 'amount' => (string)$row['amount'], 'type' => (string)$row['type'],
+        'id' => (string)$row['id'], 'amount' => (string)$row['amount'], 'currency' => (string)($row['currency_code'] ?? 'IRT'), 'type' => (string)$row['type'],
         'status' => (string)$row['status'], 'created_at' => (string)$row['created_at'],
         'description' => (string)($row['description'] ?? ''), 'tracking_code' => (string)($row['tracking_code'] ?? ''),
         'receipt_full_url' => $imageUrl,

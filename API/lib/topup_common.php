@@ -509,7 +509,9 @@ function topup_provider_status_class(array $response): string
     if ($confirmedSuccess && $confirmedFailure) return 'pending';
     if ($confirmedSuccess) return 'success';
     if ($confirmedFailure) return 'failed';
-    return topup_provider_result_class(topup_provider_code($response));
+    $providerCode = topup_provider_code($response);
+    if (topup_normalize_provider_code($providerCode) === 1) return 'pending';
+    return topup_provider_result_class($providerCode);
 }
 
 function topup_provider_status_conflicts(array $response): bool
@@ -739,7 +741,11 @@ function topup_provider_claim_token(): string
 
 function topup_provider_claim_lease_seconds(): int
 {
-    return 30;
+    $configuredTimeout = getenv('INAX_TIMEOUT');
+    $providerTimeout = $configuredTimeout === false || trim($configuredTimeout) === ''
+        ? 30
+        : max(1, min(120, (int)$configuredTimeout));
+    return max(30, $providerTimeout + 30);
 }
 
 function topup_clear_provider_claim(PDO $pdo, int $transactionId, string $claimToken): void

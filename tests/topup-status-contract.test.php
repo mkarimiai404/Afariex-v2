@@ -74,10 +74,12 @@ $assert($globalTry !== false && $globalCatch !== false && $globalTry < $globalCa
     && str_contains($endpoint, "'retryable' => true")
     && str_contains($endpoint, 'ob_end_clean()'), 'uncaught runtime errors are buffered and converted to retryable JSON without leaking output');
 $phaseOneCommit = strpos($endpoint, '$pdo->commit();', strpos($endpoint, '// Phase 1'));
-$disconnect = strpos($endpoint, 'db_disconnect();', strpos($endpoint, '// No transaction or row lock'));
+$disconnect = strpos($endpoint, 'db_disconnect();', $phaseOneCommit === false ? 0 : $phaseOneCommit);
 $phaseTwoTransaction = strpos($endpoint, '$pdo->beginTransaction();', strpos($endpoint, '// Phase 2'));
 $freshRead = strpos($endpoint, '$freshStatement = $pdo->prepare', $providerCallPosition);
+$providerReconnect = strpos($endpoint, '$pdo = db();', $providerCallPosition === false ? 0 : $providerCallPosition);
 $assert($phaseOneCommit !== false && $providerCallPosition !== false && $phaseOneCommit < $disconnect && $disconnect < $providerCallPosition && $phaseTwoTransaction !== false && $freshRead !== false && $providerCallPosition < $phaseTwoTransaction && $phaseTwoTransaction < $freshRead, 'provider call is between released claim and finalization database sessions');
+$assert($providerReconnect !== false && $providerCallPosition < $providerReconnect && $providerReconnect < $phaseTwoTransaction, 'status flow reconnects PDO after the external provider call');
 $assert(str_contains($endpoint, 'provider_operation_token') && str_contains($endpoint, 'provider_operation_lease_until') && str_contains($endpoint, 'TOPUP_PROVIDER_CLAIM_EXPIRED'), 'provider claim is token-checked and expires for crash recovery');
 $assert(str_contains($endpoint, 'hash_equals((string)($fresh[\'provider_operation_token\'] ?? \'\'), $claimToken)') && str_contains($endpoint, 'if ($freshSnapshot[\'status\'] !== \'pending\')'), 'stale provider responses cannot overwrite a newer terminal outcome');
 $assert(str_contains($endpoint, 'topup_clear_provider_claim($pdo, $transactionId, $claimToken)') && str_contains($endpoint, 'catch (InaxNetworkException $error)'), 'network failures release their claim and remain pending for retry');
@@ -87,7 +89,7 @@ $purchaseProviderCall = strpos($create, '(new InaxService())->buyTopup(');
 $purchaseDisconnect = strpos($create, 'db_disconnect();', $purchaseProviderCall === false ? 0 : $purchaseProviderCall - 500);
 $assert($purchaseProviderCall !== false && $purchaseDisconnect !== false && $purchaseDisconnect < $purchaseProviderCall && strpos($create, '$pdo = db();', $purchaseProviderCall) > $purchaseProviderCall, 'purchase releases its committed PDO connection during Inax and reconnects for finalization');
 $assert(str_contains($common, 'string $providerClaimToken') && str_contains($common, 'topup_clear_provider_claim($pdo, $transactionId, $providerClaimToken)'), 'completed pending/success/refund work requires and releases only its matching provider claim inside the transaction');
-$assert(str_contains($common, "throw new RuntimeException('TOPUP_PROVIDER_CLAIM_LOST')") && str_contains($common, 'hash_equals((string)($lockedTransaction[\'provider_operation_token\'] ?? \'\'), $providerClaimToken)'), 'purchase writes and refunds are fenced by the current provider claim token');
+$assert(str_contains($common, "throw new RuntimeException('TOPUP_PROVIDER_CLAIM_EXPIRED')") && str_contains($common, 'hash_equals((string)($lockedTransaction[\'provider_operation_token\'] ?? \'\'), $providerClaimToken)'), 'purchase writes and refunds are fenced by the current provider claim token');
 $assert(str_contains($create, '$providerClaimToken') && str_contains($endpoint, '$claimToken'), 'purchase and status finalizers pass their own lease token when persisting provider outcomes');
 
 $guardPosition = strpos($client, 'tryAcquireInFlight(submitInFlight)');
@@ -102,11 +104,13 @@ $assert(str_contains($statusCheckBody, 'describeStatusCheckError(error)')
     && str_contains($statusCheckBody, 'setResult(updated)')
     && str_contains($statusCheckBody, 'setPollingRestart((current) => current + 1)')
     && !str_contains($statusCheckBody, 'Alert.alert(diagnostic.'), 'status check errors stay inline and restart bounded polling instead of opening an alert');
-$assert(str_contains($client, 'maxStatusChecks = 40') && str_contains($client, 'maxWindowMs = 240000') && str_contains($client, 'maxStatusCallMs = 50000'), 'automatic polling has synchronized attempt, call-timeout, and elapsed-time bounds');
+$assert(str_contains($client, 'maxStatusChecks = 12') && str_contains($client, 'maxWindowMs = 120000') && str_contains($client, 'maxStatusCallMs = 45000'), 'automatic polling has synchronized attempt, call-timeout, and elapsed-time bounds');
 $assert(str_contains($client, 'pollingWindow.current?.key !== pollingKey') && str_contains($client, 'checks: 0'), 'poll start and counter reset only for a different request identifier');
 $assert(str_contains($client, 'onPress={checkStatus}') && str_contains($client, "status: 'pending'"), 'manual retry remains available and unresolved responses remain pending');
 $assert(str_contains($client, 'checks: number') && str_contains($client, 'activePollingWindow.checks >= maxStatusChecks'), 'poll attempts are held in request-keyed ref state');
-$assert(str_contains($client, 'TOPUP_TRANSACTION_NOT_VISIBLE_YET') && str_contains($client, "status: 'pending'"), '404 is not rendered as financial failure');
+$assert(str_contains($endpoint, "'code' => 'TOPUP_TRANSACTION_NOT_VISIBLE_YET'")
+    && str_contains($client, 'error.status === 404')
+    && str_contains($client, "status: 'pending'"), '404 is not rendered as financial failure');
 $assert(str_contains($client, 'payload?.retryable === false') && str_contains($client, '!stopPolling'), 'non-retryable reconciliation responses stop automatic polling');
 
 echo "Top-up status contract tests passed ({$assertions} assertions)." . PHP_EOL;

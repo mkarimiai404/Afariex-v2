@@ -69,6 +69,7 @@ function orders_has_columns(array $available, array $required): bool
 
 try {
     require_once __DIR__ . '/../admin_panel/config.php';
+    require_once __DIR__ . '/includes/remittance_currencies.php';
     $input = $_POST;
     if (!$input && stripos($_SERVER['CONTENT_TYPE'] ?? '', 'application/json') !== false) {
         $decoded = json_decode((string)file_get_contents('php://input'), true);
@@ -91,13 +92,15 @@ try {
 
     if (table_exists('transactions')) {
         $fetchTransactions = static function (bool $includeFees) use ($pdo, $userId): array {
+            $transactionColumns = orders_table_columns($pdo, 'transactions');
+            $currencySelect = in_array('currency_code', $transactionColumns, true) ? 't.currency_code' : "'IRT'";
             $feeSelect = $includeFees
                 ? ', COALESCE(sft.fee_amount, 0) AS fee_amount, COALESCE(sft.total_amount, t.amount) AS total_amount'
                 : ', 0 AS fee_amount, t.amount AS total_amount';
             $feeJoin = $includeFees
                 ? "LEFT JOIN service_fee_transactions sft ON sft.source_type COLLATE utf8mb4_persian_ci = (CASE WHEN t.type IN ('withdraw', 'withdrawal') THEN 'withdrawal' ELSE t.type END) COLLATE utf8mb4_persian_ci AND sft.source_id = t.id"
                 : '';
-            $stmt = $pdo->prepare("SELECT t.id, t.amount, t.type, t.status, t.description, t.created_at {$feeSelect} FROM transactions t {$feeJoin} WHERE t.user_id = ? ORDER BY t.id DESC");
+            $stmt = $pdo->prepare("SELECT t.id, t.amount, t.type, t.status, t.description, t.created_at, {$currencySelect} AS currency_code {$feeSelect} FROM transactions t {$feeJoin} WHERE t.user_id = ? ORDER BY t.id DESC");
             $stmt->execute([$userId]);
             return $stmt->fetchAll();
         };
@@ -110,16 +113,25 @@ try {
         }
         foreach ($transactionRows as $row) {
             $type = strtolower(trim((string)($row['type'] ?? '')));
-            if (!in_array($type, ['deposit', 'withdraw', 'withdrawal'], true)) continue;
+            if (!in_array($type, ['deposit', 'manual_deposit', 'withdraw', 'withdrawal', 'manual_withdrawal'], true)) continue;
+            $isDeposit = in_array($type, ['deposit', 'manual_deposit'], true);
             $orders[] = [
                 'id' => 'transaction-' . (int)$row['id'],
-                'type' => $type === 'deposit' ? 'deposit' : 'withdrawal',
-                'title' => $type === 'deposit' ? 'افزایش موجودی' : 'برداشت وجه',
+                'type' => $isDeposit ? 'deposit' : 'withdrawal',
+                'title' => $isDeposit ? 'افزایش موجودی' : 'برداشت وجه',
                 'amount' => (float)($row['amount'] ?? 0),
-                'currency' => 'تومان',
+                'currency' => (static function (string $code): string {
+                    $currency = remittance_source_currencies()[$code] ?? remittance_destination_currencies()[$code] ?? null;
+                    return is_array($currency) ? (string)$currency['name'] . ' (' . $code . ')' : $code;
+                })(strtoupper((string)($row['currency_code'] ?? 'IRT'))),
+                'currency_code' => strtoupper((string)($row['currency_code'] ?? 'IRT')),
+                'currency_symbol' => (static function (string $code): string {
+                    $currency = remittance_source_currencies()[$code] ?? remittance_destination_currencies()[$code] ?? null;
+                    return is_array($currency) ? (string)($currency['symbol'] ?? $code) : $code;
+                })(strtoupper((string)($row['currency_code'] ?? 'IRT'))),
                 'status' => strtolower(trim((string)($row['status'] ?? 'pending'))),
                 'created_at' => $row['created_at'] ?? null,
-                'description' => $type === 'deposit' ? 'درخواست افزایش موجودی کیف پول' : 'درخواست برداشت از کیف پول',
+                'description' => trim((string)($row['description'] ?? '')) !== '' ? (string)$row['description'] : ($isDeposit ? 'درخواست افزایش موجودی کیف پول' : 'درخواست برداشت از کیف پول'),
                 'metadata' => [
                     'fee_amount' => (int)($row['fee_amount'] ?? 0),
                     'total_amount' => (int)($row['total_amount'] ?? $row['amount'] ?? 0),
@@ -134,14 +146,18 @@ try {
         $countrySelect = in_array('destination_country', $remittanceColumns, true)
             ? 'r.destination_country'
             : 'NULL AS destination_country';
-        $fetchRemittances = static function (bool $includeFees) use ($pdo, $userId, $countrySelect): array {
+        $sourceCurrencySelect = in_array('source_currency', $remittanceColumns, true) ? 'r.source_currency' : "'IRT' AS source_currency";
+        $destinationCurrencySelect = in_array('destination_currency', $remittanceColumns, true) ? 'r.destination_currency' : "'AFN' AS destination_currency";
+        $exchangeCommissionSelect = in_array('exchange_commission_percentage', $remittanceColumns, true) ? 'r.exchange_commission_percentage' : '0 AS exchange_commission_percentage';
+        $exchangeRateSelect = in_array('exchange_rate_value', $remittanceColumns, true) ? 'r.exchange_rate_value' : 'NULL AS exchange_rate_value';
+        $fetchRemittances = static function (bool $includeFees) use ($pdo, $userId, $countrySelect, $sourceCurrencySelect, $destinationCurrencySelect, $exchangeCommissionSelect, $exchangeRateSelect): array {
             $feeSelect = $includeFees
                 ? ', COALESCE(sft.fee_amount, 0) AS fee_amount, COALESCE(sft.total_amount, r.amount_toman) AS total_amount, COALESCE(sft.configured_fee_type, \'fixed\') AS fee_type, COALESCE(sft.configured_fee_value, 0) AS fee_value'
                 : ', 0 AS fee_amount, r.amount_toman AS total_amount, \'fixed\' AS fee_type, 0 AS fee_value';
             $feeJoin = $includeFees
                 ? "LEFT JOIN service_fee_transactions sft ON sft.source_type COLLATE utf8mb4_persian_ci = 'remittance' COLLATE utf8mb4_persian_ci AND sft.source_id = r.id"
                 : '';
-            $stmt = $pdo->prepare('SELECT r.id, r.amount_toman, r.amount_afghani, r.status, r.created_at, ' . $countrySelect . ', r.sender, r.receiver, r.agency, (SELECT a.address FROM agencies a WHERE BINARY a.name = BINARY r.agency ORDER BY a.id DESC LIMIT 1) AS agency_address ' . $feeSelect . ' FROM remittances r ' . $feeJoin . ' WHERE r.user_id = ? ORDER BY r.id DESC');
+            $stmt = $pdo->prepare('SELECT r.id, r.amount_toman, r.amount_afghani, r.status, r.created_at, ' . $countrySelect . ', ' . $sourceCurrencySelect . ', ' . $destinationCurrencySelect . ', ' . $exchangeCommissionSelect . ', ' . $exchangeRateSelect . ', r.sender, r.receiver, r.agency, (SELECT a.address FROM agencies a WHERE BINARY a.name = BINARY r.agency ORDER BY a.id DESC LIMIT 1) AS agency_address ' . $feeSelect . ' FROM remittances r ' . $feeJoin . ' WHERE r.user_id = ? ORDER BY r.id DESC');
             $stmt->execute([$userId]);
             return $stmt->fetchAll();
         };
@@ -166,8 +182,13 @@ try {
                     'tracking_number' => (int)$row['id'],
                     'sender' => trim((string)($row['sender'] ?? '')),
                     'receiver' => trim((string)($row['receiver'] ?? '')),
-                    'amount_afghani' => (float)($row['amount_afghani'] ?? 0),
+                    'amount_afghani' => (string)($row['amount_afghani'] ?? '0'),
                     'amount_toman' => (int)($row['amount_toman'] ?? 0),
+                    'source_currency' => (string)($row['source_currency'] ?? 'IRT'),
+                    'destination_currency' => (string)($row['destination_currency'] ?? 'AFN'),
+                    'destination_currency_precision' => remittance_currency_precision((string)($row['destination_currency'] ?? 'AFN')),
+                    'exchange_commission_percentage' => (float)($row['exchange_commission_percentage'] ?? 0),
+                    'exchange_rate_value' => $row['exchange_rate_value'] !== null ? (string)$row['exchange_rate_value'] : null,
                     'fee_amount' => (int)($row['fee_amount'] ?? 0),
                     'total_amount' => (int)($row['total_amount'] ?? $row['amount_toman'] ?? 0),
                     'fee_type' => (string)($row['fee_type'] ?? 'fixed'),

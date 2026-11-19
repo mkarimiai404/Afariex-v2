@@ -23,18 +23,20 @@ export function RemittanceReceiptView({ receipt }: { receipt: RemittanceReceiptM
         <ReceiptRow label="فرستنده" value={view.sender} />
         <ReceiptRow label="گیرنده" value={view.receiver} />
         {view.destinationCountry ? <ReceiptRow label="کشور مقصد" value={view.destinationCountry} /> : null}
+        {view.exchangeRate ? <ReceiptRow label="نرخ تبدیل" value={view.exchangeRateLabel} /> : null}
         <ReceiptRow label="نمایندگی / مقصد" value={view.destination} last />
       </View>
 
       <View style={styles.details}>
-        <ReceiptRow label="مبلغ حواله" value={`${view.originalAmountToman} تومان`} />
-        <ReceiptRow label={view.feeLabel} value={`${view.feeAmountToman} تومان`} />
-        <ReceiptRow label="مبلغ نهایی کسر شده" value={`${view.totalChargedToman} تومان`} last />
+        <ReceiptRow label="مبلغ حواله" value={`${view.originalAmountToman} ${view.sourceCurrencyLabel}`} />
+        <ReceiptRow label={view.feeLabel} value={`${view.feeAmountToman} ${view.sourceCurrencyLabel}`} />
+        {Number(view.commissionPercentage || 0) > 0 ? <ReceiptRow label="کارمزد تبدیل" value={view.exchangeCommissionLabel} /> : null}
+        <ReceiptRow label="مبلغ نهایی کسر شده" value={`${view.totalChargedToman} ${view.sourceCurrencyLabel}`} last />
       </View>
 
       <View style={styles.amountBox}>
         <Text style={styles.amountLabel}>مبلغ دریافتی حواله</Text>
-        <Text style={styles.amountValue}>{view.amount} «{view.amountWords}» افغانی</Text>
+        <Text style={styles.amountValue}>{view.amount} {view.destinationCurrencyLabel}</Text>
       </View>
 
       <View style={styles.statusBox}>
@@ -75,7 +77,7 @@ const styles = StyleSheet.create({
   value: { flex: 1, fontFamily: 'VazirmatnBold', fontSize: 13, color: appColors.text, textAlign: 'right' },
   amountBox: { backgroundColor: appColors.surface, borderRadius: 15, padding: 17, marginTop: 14 },
   amountLabel: { fontFamily: 'Vazirmatn', fontSize: 11, color: '#d1fae5', textAlign: 'center' },
-  amountValue: { fontFamily: 'VazirmatnBold', fontSize: 18, lineHeight: 32, color: '#fff', textAlign: 'center', writingDirection: 'rtl', marginTop: 4 },
+  amountValue: { fontFamily: 'VazirmatnBold', fontSize: 18, lineHeight: 32, color: '#fff', textAlign: 'center', writingDirection: 'ltr', marginTop: 4 },
   statusBox: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', borderColor: appColors.surfaceRaised, borderWidth: 1, borderRadius: 13, padding: 13, marginTop: 14 },
   statusLabel: { fontFamily: 'Vazirmatn', fontSize: 12, color: appColors.textSecondary },
   statusPill: { backgroundColor: appColors.surfaceRaised, borderColor: '#a7f3d0', borderWidth: 1, borderRadius: 99, paddingVertical: 6, paddingHorizontal: 13 },

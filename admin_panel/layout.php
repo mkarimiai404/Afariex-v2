@@ -13,6 +13,7 @@ function render_page_start(string $title, string $activePage, bool $showSidebar 
         'fee_reports' => ['label' => 'گزارش کارمزدها', 'href' => 'service_fee_reports.php'],
         'remittances' => ['label' => 'حواله‌ها', 'href' => 'remittances.php'],
         'receipts' => ['label' => 'فیش‌های واریزی', 'href' => 'receipts.php'],
+        'topup_orders' => ['label' => 'سفارش‌های شارژ', 'href' => 'topup_orders.php'],
         'withdrawals' => ['label' => 'برداشت‌ها', 'href' => 'withdrawals.php'],
         'users' => ['label' => 'کاربران', 'href' => 'users.php'],
         'debts' => ['label' => 'بدهی کاربران', 'href' => 'user_debts.php'],

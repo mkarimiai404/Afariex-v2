@@ -130,6 +130,15 @@ if ($existingRequest !== null) {
     topup_respond_existing_request($pdo, $existingRequest, $mobile, $operator, $amountInt, $chargeType);
 }
 
+$requestedPaymentMethod = strtolower(trim((string)($data['payment_method'] ?? $data['pay_type'] ?? 'wallet')));
+if (in_array($requestedPaymentMethod, ['online', 'online_payment', 'gateway'], true)) {
+    topup_json([
+        'success' => false,
+        'code' => 'ONLINE_PAYMENT_NOT_CONFIGURED',
+        'message' => 'پرداخت آنلاین برای خرید شارژ فعال نیست؛ مبلغ از کیف پول پرداخت می‌شود.',
+    ], 422);
+}
+
 try {
     service_fee_require_schema();
 } catch (Throwable $error) {

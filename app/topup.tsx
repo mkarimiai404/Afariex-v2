@@ -49,7 +49,7 @@ const detectOperator = (value: string): string | null => {
 
 const fetchWalletBalance = async (userId: string, token: string): Promise<number | null> => {
   const payload = new URLSearchParams({ user_id: userId, id: userId, api_token: token, token, user_token: token });
-  const response = await fetchJson<any>('dashboard.php', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: payload.toString() });
+  const response = await fetchJson<any>('dashboard.php', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: `Bearer ${token}` }, body: payload.toString() });
   const rawBalance = response?.balance ?? response?.user?.balance ?? response?.data?.balance ?? response?.result?.balance;
   const balance = Number(String(rawBalance ?? '').replace(/[٬,\s]/g, ''));
   return Number.isFinite(balance) ? balance : null;
@@ -88,7 +88,7 @@ const requestTopupStatus = (
 
 export default function TopupScreen() {
   const router = useRouter();
-  const { userId, token, isAuthenticated, isInitialized } = useAuth();
+  const { userId, userToken: token, isAuthenticated, isInitialized } = useAuth();
   const [operators, setOperators] = useState<Record<string, Operator>>(fallbackOperators);
   const [operator, setOperator] = useState('MCI');
   const [chargeType, setChargeType] = useState<ChargeType>('normal');
@@ -145,15 +145,18 @@ export default function TopupScreen() {
   }, [result, userId]);
 
   useEffect(() => {
-    if (!token) return;
+    if (!token) {
+      if (isInitialized) setLoading(false);
+      return;
+    }
     let active = true;
     setLoading(true);
-    fetchJson<OperatorsResponse>('topup-operators.php', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ api_token: token }) })
+    fetchJson<OperatorsResponse>('topup-operators.php', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ api_token: token, token, user_token: token }) })
       .then((response) => { const remote = response?.data?.operators; if (active && remote && Object.keys(remote).length) setOperators(remote); })
       .catch(() => undefined)
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [token]);
+  }, [token, isInitialized]);
 
   useEffect(() => {
     if (!token || !userId) return;
@@ -192,10 +195,10 @@ export default function TopupScreen() {
       .catch((error) => { if (__DEV__) console.log('[AFARIEX-DEBUG] preflight balance refresh failed', { error: error instanceof Error ? error.name : 'unknown' }); })
       .finally(() => setBalanceLoading(false));
 
-    const payload = new URLSearchParams({ api_token: token, service_code: 'mobile_recharge', amount: String(numericAmount) });
+    const payload = new URLSearchParams({ api_token: token, token, user_token: token, service_code: 'mobile_recharge', amount: String(numericAmount) });
     fetchJson<any>('service-fee-preview.php', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: `Bearer ${token}` },
       body: payload.toString(),
     })
       .then((response) => {

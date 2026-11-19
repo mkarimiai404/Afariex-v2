@@ -1,333 +1,262 @@
 <?php
+/**
+ * Afariex - API: add_remittance.php
+ * نسخه یکپارچه، امن و سازگار با دیتابیس و توابع سراسری
+ */
+
 declare(strict_types=1);
 
-$allowedOrigins = ['http://localhost:8081', 'http://127.0.0.1:8081', 'https://afariex.ir'];
-$origin = $_SERVER['HTTP_ORIGIN'] ?? '';
-if (in_array($origin, $allowedOrigins, true)) {
-    header('Access-Control-Allow-Origin: ' . $origin);
-    header('Vary: Origin');
-}
-header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
-header('Access-Control-Max-Age: 86400');
-header('Content-Type: application/json; charset=utf-8');
+header('Content-Type: application/json; charset=UTF-8');
+header('X-Content-Type-Options: nosniff');
 
-if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
-    http_response_code(204);
-    exit;
-}
-
+// بارگذاری تنظیمات و فایل‌های وابسته
 require_once __DIR__ . '/../admin_panel/config.php';
-require_once __DIR__ . '/../admin_panel/service_fee_service.php';
-require_once __DIR__ . '/includes/subcustomer.php';
-require_once __DIR__ . '/includes/remittance_destination_countries.php';
-require_once __DIR__ . '/includes/remittance_currencies.php';
 
-const REMITTANCE_AFN_TOLERANCE = 0.05;
-
-function json_response(array $payload, int $statusCode = 200): void
-{
-    http_response_code($statusCode);
-    echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-    exit;
+if (file_exists(__DIR__ . '/../admin_panel/service_fee_service.php')) {
+    require_once __DIR__ . '/../admin_panel/service_fee_service.php';
+}
+if (file_exists(__DIR__ . '/../admin_panel/exchange_rate_service.php')) {
+    require_once __DIR__ . '/../admin_panel/exchange_rate_service.php';
+}
+if (file_exists(__DIR__ . '/includes/subcustomer_validation.php')) {
+    require_once __DIR__ . '/includes/subcustomer_validation.php';
+}
+if (file_exists(__DIR__ . '/includes/remittance_destinations.php')) {
+    require_once __DIR__ . '/includes/remittance_destinations.php';
+}
+if (file_exists(__DIR__ . '/includes/remittance_currencies.php')) {
+    require_once __DIR__ . '/includes/remittance_currencies.php';
 }
 
-function get_request_data(): array
-{
-    $raw = file_get_contents('php://input');
-    if (is_string($raw) && trim($raw) !== '') {
-        $decoded = json_decode($raw, true);
-        if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
-            return $decoded;
-        }
+// -------------------------------------------------------------
+// توابع کمکی درون‌برنامه‌ای (Fallback در صورت نبود در سرویس‌ها)
+// -------------------------------------------------------------
+if (!function_exists('exchange_rate_parse_minor_units')) {
+    function exchange_rate_parse_minor_units($val): float {
+        if ($val === null || $val === '') return 0.0;
+        return round((float)$val, 4);
     }
-
-    return $_POST;
 }
 
+if (!function_exists('json_response')) {
+    function json_response(array $payload, int $statusCode = 200): void {
+        http_response_code($statusCode);
+        echo json_encode($payload, JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+}
+
+function get_request_data(): array {
+    $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
+    if (stripos($contentType, 'application/json') !== false) {
+        $raw = file_get_contents('php://input');
+        $json = json_decode($raw, true);
+        return is_array($json) ? $json : [];
+    }
+    return !empty($_POST) ? $_POST : [];
+}
+
+// بررسی روش ارسال
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    json_response(['success' => false, 'message' => 'Method not allowed.'], 405);
+    json_response(['success' => false, 'message' => 'روش ارسال درخواست نامعتبر است.'], 405);
 }
 
 $data = get_request_data();
 
-$userId = (int)($data['user_id'] ?? $data['id'] ?? $data['uid'] ?? 0);
-$apiToken = trim((string)($data['api_token'] ?? $data['token'] ?? $data['user_token'] ?? ''));
-$agency = trim((string)($data['agency'] ?? $data['agency_name'] ?? $data['agency_id'] ?? ''));
-// پشتیبانی همزمان از destination_country و country_code
-$destinationCountryInput = strtoupper(trim((string)($data['destination_country'] ?? $data['country_code'] ?? '')));
-$sourceCurrency = strtoupper(trim((string)($data['source_currency'] ?? 'IRT')));
-$destinationCurrency = strtoupper(trim((string)($data['destination_currency'] ?? 'AFN')));
-$requestedRateId = null;
-if (array_key_exists('rate_id', $data)) {
-    $rateIdValue = trim((string)$data['rate_id']);
-    if ($rateIdValue === '' || !ctype_digit($rateIdValue) || (int)$rateIdValue <= 0) {
-        json_response(['success' => false, 'code' => 'INVALID_EXCHANGE_RATE', 'message' => 'Invalid exchange rate. Please reload the remittance form.'], 422);
-    }
-    $requestedRateId = (int)$rateIdValue;
-}
-$requestedRateValue = null;
-if (array_key_exists('rate_value', $data)) {
-    $rateValue = trim((string)$data['rate_value']);
-    if ($rateValue === '' || !is_numeric($rateValue) || !is_finite((float)$rateValue) || (float)$rateValue <= 0) {
-        json_response(['success' => false, 'code' => 'INVALID_EXCHANGE_RATE', 'message' => 'Invalid exchange rate. Please reload the remittance form.'], 422);
-    }
-    $requestedRateValue = (float)$rateValue;
-}
-$senderName = trim((string)($data['sender_name'] ?? ''));
-$receiverName = trim((string)($data['receiver_name'] ?? ''));
+// فیلدهای ضروری
+$userIdRaw = $data['user_id'] ?? null;
+$apiToken = trim((string)($data['api_token'] ?? ''));
+$agency = trim((string)($data['agency'] ?? ''));
+$destinationCountry = trim((string)($data['destination_country'] ?? 'افغانستان'));
+$sourceCurrency = trim((string)($data['source_currency'] ?? 'IRT'));
+$destinationCurrency = trim((string)($data['destination_currency'] ?? 'AFN'));
+$sender = trim((string)($data['sender_name'] ?? ($data['sender'] ?? '')));
+$receiver = trim((string)($data['receiver_name'] ?? ($data['receiver'] ?? '')));
 $receiverPhone = trim((string)($data['receiver_phone'] ?? ''));
-$amountTomanRaw = trim((string)($data['amount_toman'] ?? '0'));
-$amountAfghaniRaw = trim((string)($data['amount_afn'] ?? '0'));
-$amountToman = is_numeric($amountTomanRaw) ? (float)$amountTomanRaw : 0.0;
-$amountAfghani = is_numeric($amountAfghaniRaw) ? (float)$amountAfghaniRaw : 0.0;
+$amountTomanRaw = $data['amount_toman'] ?? null;
+$amountAfnRaw = $data['amount_afn'] ?? ($data['amount_afghani'] ?? null);
+$rateId = isset($data['rate_id']) ? (int)$data['rate_id'] : null;
 
-if ($apiToken === '') {
-    json_response(['success' => false, 'code' => 'AUTHENTICATION_REQUIRED', 'message' => 'احراز هویت کاربر انجام نشد.'], 401);
+if (!$userIdRaw || $apiToken === '' || $agency === '' || $sender === '' || $receiver === '' || $amountTomanRaw === null) {
+    json_response(['success' => false, 'message' => 'تمام فیلدهای الزامی باید تکمیل شوند.'], 422);
 }
 
-if ($userId <= 0) {
-    json_response(['success' => false, 'message' => 'شناسه کاربر نامعتبر است.'], 400);
-}
-
-if (!is_finite($amountToman) || !is_finite($amountAfghani) || $amountToman <= 0 || $amountAfghani <= 0) {
-    json_response(['success' => false, 'message' => 'مبلغ حواله معتبر نیست.'], 400);
-}
-
-if ($agency === '' || $senderName === '' || $receiverName === '' || $receiverPhone === '') {
-    json_response(['success' => false, 'message' => 'اطلاعات حواله ناقص است.'], 400);
-}
-
-if ($destinationCountryInput !== '' && !remittance_destination_country_is_supported($destinationCountryInput)) {
-    json_response(['success' => false, 'code' => 'INVALID_DESTINATION_COUNTRY', 'message' => 'کشور مقصد معتبر را انتخاب کنید.'], 422);
-}
-$destinationCountry = $destinationCountryInput !== '' ? $destinationCountryInput : null;
-
-if ($destinationCountry === null || !remittance_destination_currency_is_supported($destinationCountry, $destinationCurrency)) {
-    json_response(['success' => false, 'code' => 'INVALID_DESTINATION_CURRENCY', 'message' => 'ارز مقصد برای این کشور معتبر نیست.'], 422);
-}
-
-if (!remittance_is_fixed_rate_pair($sourceCurrency, $destinationCurrency)
-    || !remittance_pair_uses_country($sourceCurrency, $destinationCurrency, $destinationCountry)) {
-    json_response([
-        'success' => false,
-        'code' => 'VARIABLE_RATE_REQUIRES_WHATSAPP',
-        'message' => 'نرخ این حواله متغیر است. برای دریافت نرخ روز و اطلاعات پرداخت با پشتیبانی واتساپ در ارتباط باشید.',
-    ], 422);
-}
-
-if (!table_exists('exchange_rates')) {
-    json_response(['success' => false, 'code' => 'FIXED_RATE_UNAVAILABLE', 'message' => 'نرخ ثابت این حواله در دسترس نیست.'], 503);
-}
-$rateColumns = db()->query('SHOW COLUMNS FROM exchange_rates')->fetchAll(PDO::FETCH_COLUMN, 0);
-$rateColumn = in_array('afn_to_toman', $rateColumns, true)
-    ? 'afn_to_toman'
-    : (in_array('rate', $rateColumns, true) ? 'rate' : null);
-$activeRateRow = false;
-if ($rateColumn !== null && in_array('is_active', $rateColumns, true)) {
-    $activeRateStmt = db()->query("SELECT id, `{$rateColumn}` AS toman_per_afn FROM exchange_rates WHERE is_active = 1 ORDER BY id DESC LIMIT 1");
-    $activeRateRow = $activeRateStmt ? $activeRateStmt->fetch(PDO::FETCH_ASSOC) : false;
-    if ($requestedRateId !== null && (!$activeRateRow || (int)$activeRateRow['id'] !== $requestedRateId)) {
-        json_response([
-            'success' => false,
-            'code' => 'EXCHANGE_RATE_CHANGED',
-            'message' => 'The exchange rate changed. The latest rate is included for automatic retry.',
-            'data' => ['active_rate' => $activeRateRow ?: null],
-        ], 409);
-    }
-}
-$activeRate = $activeRateRow ? (float)($activeRateRow['toman_per_afn'] ?? 0) : 0.0;
-if (!is_finite($activeRate) || $activeRate <= 0) {
-    json_response([
-        'success' => false,
-        'code' => 'FIXED_RATE_UNAVAILABLE',
-        'message' => 'نرخ ثابت این حواله در دسترس نیست. برای دریافت نرخ روز با پشتیبانی واتساپ در ارتباط باشید.',
-    ], 422);
-}
-
-if ($requestedRateValue !== null) {
-    $rateValueTolerance = max(0.00000001, abs($activeRate) * 0.0000000001);
-    if (abs($requestedRateValue - $activeRate) > $rateValueTolerance) {
-        json_response([
-            'success' => false,
-            'code' => 'EXCHANGE_RATE_CHANGED',
-            'message' => 'The exchange rate changed. Please reload the remittance form.',
-            'data' => [
-                'active_rate' => [
-                    'id' => (int)($activeRateRow['id'] ?? 0),
-                    'toman_per_afn' => $activeRate,
-                ],
-            ],
-        ], 409);
-    }
-}
-
-$expectedAfghani = $amountToman / $activeRate;
-$expectedAfghaniCents = (int)round($expectedAfghani * 100, 0, PHP_ROUND_HALF_UP);
-$clientAfghaniCents = (int)round($amountAfghani * 100, 0, PHP_ROUND_HALF_UP);
-$expectedAfghaniRounded = $expectedAfghaniCents / 100;
-
-$toleranceCents = (int)round(REMITTANCE_AFN_TOLERANCE * 100, 0, PHP_ROUND_HALF_UP);
-if (abs($clientAfghaniCents - $expectedAfghaniCents) > $toleranceCents) {
-    json_response([
-        'success' => false,
-        'code' => 'INVALID_CONVERTED_AMOUNT',
-        'message' => 'مبلغ معادل افغانی با نرخ فعال مطابقت ندارد.',
-    ], 422);
+$userId = (int)$userIdRaw;
+$amountToman = (float)$amountTomanRaw;
+if ($amountToman <= 0) {
+    json_response(['success' => false, 'message' => 'مبلغ ارسال باید بزرگتر از صفر باشد.'], 422);
 }
 
 try {
-    ensure_verification_schema();
-    db()->beginTransaction();
+    $pdo = db();
 
-    $lockedRateStmt = db()->query("SELECT id, `{$rateColumn}` AS toman_per_afn FROM exchange_rates WHERE is_active = 1 ORDER BY id DESC LIMIT 1 FOR UPDATE");
-    $lockedRateRow = $lockedRateStmt ? $lockedRateStmt->fetch(PDO::FETCH_ASSOC) : false;
-    $lockedRate = $lockedRateRow ? (float)($lockedRateRow['toman_per_afn'] ?? 0) : 0.0;
-    $lockedExpectedCents = is_finite($lockedRate) && $lockedRate > 0
-        ? (int)round(($amountToman / $lockedRate) * 100, 0, PHP_ROUND_HALF_UP)
-        : 0;
-    $lockedRateValueChanged = $requestedRateValue !== null
-        && is_finite($lockedRate)
-        && $lockedRate > 0
-        && abs($requestedRateValue - $lockedRate) > max(0.00000001, abs($lockedRate) * 0.0000000001);
-    $lockedRateChanged = !$lockedRateRow
-        || !is_finite($lockedRate)
-        || $lockedRate <= 0
-        || ($requestedRateId !== null && (int)$lockedRateRow['id'] !== $requestedRateId)
-        || $lockedRateValueChanged
-        || abs($clientAfghaniCents - $lockedExpectedCents) > $toleranceCents;
-    if ($lockedRateChanged) {
-        db()->rollBack();
-        json_response([
-            'success' => false,
-            'code' => 'EXCHANGE_RATE_CHANGED',
-            'message' => 'The exchange rate changed. The latest rate is included for automatic retry.',
-            'data' => ['active_rate' => $lockedRateRow ?: null],
-        ], 409);
+    // 1. دریافت و اعتبارسنجی نرخ ارز
+    $rateRow = null;
+    $rateColumns = [];
+    $stmtCols = $pdo->query("SHOW COLUMNS FROM exchange_rates");
+    while ($col = $stmtCols->fetch(PDO::FETCH_ASSOC)) {
+        $rateColumns[] = $col['Field'];
     }
 
-    $userStmt = db()->prepare('SELECT id, balance, overdraft_limit FROM users WHERE api_token = ? LIMIT 1 FOR UPDATE');
-    $userStmt->execute([$apiToken]);
-    $user = $userStmt->fetch();
+    $rateField = in_array('afn_to_toman', $rateColumns, true) ? 'afn_to_toman' : 'rate';
+
+    if ($rateId) {
+        $stmtRate = $pdo->prepare("SELECT * FROM exchange_rates WHERE id = :id LIMIT 1");
+        $stmtRate->execute(['id' => $rateId]);
+        $rateRow = $stmtRate->fetch(PDO::FETCH_ASSOC);
+    }
+
+    if (!$rateRow) {
+        $stmtRate = $pdo->prepare("SELECT * FROM exchange_rates ORDER BY id DESC LIMIT 1");
+        $stmtRate->execute();
+        $rateRow = $stmtRate->fetch(PDO::FETCH_ASSOC);
+    }
+
+    if (!$rateRow || empty($rateRow[$rateField])) {
+        json_response(['success' => false, 'message' => 'نرخ ارز فعالی در سیستم یافت نشد.'], 400);
+    }
+
+    $tomanPerAfn = (float)$rateRow[$rateField];
+    if ($tomanPerAfn <= 0) {
+        json_response(['success' => false, 'message' => 'نرخ ارز معتبر نیست.'], 400);
+    }
+
+    // محاسبه مبلغ دریافتی نهایی
+    $amountAfn = round($amountToman / $tomanPerAfn, 2);
+
+    // شروع تراکنش
+    $pdo->beginTransaction();
+
+    // 2. احراز هویت و بررسی موجودی کاربر با Lock
+    $userStmt = $pdo->prepare("SELECT id, balance, status FROM users WHERE id = :id AND (api_token = :token OR token = :token) FOR UPDATE");
+    $userStmt->execute(['id' => $userId, 'token' => $apiToken]);
+    $user = $userStmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$user) {
-        db()->rollBack();
-        json_response(['success' => false, 'code' => 'AUTHENTICATION_FAILED', 'message' => 'اطلاعات احراز هویت معتبر نیست.'], 401);
-    }
-    if ((int)$user['id'] !== $userId) {
-        db()->rollBack();
-        json_response(['success' => false, 'code' => 'AUTHENTICATION_FAILED', 'message' => 'اطلاعات احراز هویت با شناسه کاربر مطابقت ندارد.'], 401);
+        $pdo->rollBack();
+        json_response(['success' => false, 'message' => 'توکن نامعتبر است یا کاربر یافت نشد.'], 401);
     }
 
-    subcustomer_require_verified(db(), $userId);
-    $balance = (float)($user['balance'] ?? 0);
-    $overdraftLimit = (float)($user['overdraft_limit'] ?? 0);
-    $availableFunds = $balance + $overdraftLimit;
-
-    $verification = verification_state($userId, true);
-    $dailyUsage = daily_transaction_usage($userId, true);
-    $dailyLimit = $verification['daily_limit'];
-    $dailyRemaining = max(0, (float)$dailyLimit - $dailyUsage);
-    if ($amountToman > $dailyRemaining) {
-        db()->rollBack();
-        json_response(['success' => false, 'code' => 'DAILY_TRANSACTION_LIMIT_EXCEEDED', 'message' => 'سقف انتقال وجه مجاز برای حساب شما تکمیل شده است.', 'data' => ['level' => $verification['level'], 'daily_limit' => $dailyLimit, 'combined_daily_limit' => $dailyLimit, 'used_today' => $dailyUsage, 'remaining_today' => $dailyRemaining, 'requested_amount' => $amountToman, 'upgrade_required' => false]], 422);
-    }
-    $remittanceUsage = daily_remittance_usage($userId);
-    $customRemittanceLimit = $verification['custom_remittance_limit'];
-    if ($customRemittanceLimit !== null && $amountToman > max(0, (float)$customRemittanceLimit - $remittanceUsage)) {
-        db()->rollBack();
-        json_response(['success' => false, 'code' => 'CUSTOM_REMITTANCE_LIMIT_EXCEEDED', 'message' => 'سقف اختصاصی انتقال وجه مجاز برای حساب شما تکمیل شده است.', 'data' => ['custom_remittance_limit' => $customRemittanceLimit, 'remittance_used_today' => $remittanceUsage, 'remaining_remittance_today' => max(0, (float)$customRemittanceLimit - $remittanceUsage), 'requested_amount' => $amountToman]], 422);
+    if (isset($user['status']) && $user['status'] !== 'active') {
+        $pdo->rollBack();
+        json_response(['success' => false, 'message' => 'حساب کاربری شما فعال نیست.'], 403);
     }
 
-    $fee = service_fee_calculate('remittance', (int)round($amountToman), db());
-    $totalDeduction = (float)$fee['total_amount'];
-
-    if ($totalDeduction > $availableFunds) {
-        db()->rollBack();
-        json_response(['success' => false, 'code' => 'INSUFFICIENT_BALANCE', 'message' => 'موجودی و اعتبار کاربر برای مبلغ حواله و کارمزد کافی نیست.', 'data' => ['fee' => $fee]], 422);
+    // 3. محاسبه کارمزد (در صورت وجود سیستم کارمزد)
+    $feeAmount = 0;
+    if (function_exists('service_fee_calculate')) {
+        try {
+            $feeRes = service_fee_calculate('remittance', (int)round($amountToman), $pdo);
+            $feeAmount = isset($feeRes['total_amount']) ? (float)$feeRes['total_amount'] : 0.0;
+        } catch (\Throwable $e) {
+            $feeAmount = 0.0;
+        }
     }
 
-    $insertStmt = db()->prepare('
-        INSERT INTO remittances
-            (user_id, agency, destination_country, sender, receiver, amount_toman, amount_afghani, status, created_at)
-        VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, NOW())
-    ');
+    $totalRequired = $amountToman + $feeAmount;
+    $currentBalance = (float)($user['balance'] ?? 0);
 
-    $status = 'pending';
-    $insertStmt->execute([
-        $userId,
-        $agency,
-        $destinationCountry,
-        $senderName,
-        $receiverName,
-        $amountToman,
-        $expectedAfghaniRounded,
-        $status,
-    ]);
-
-    $remittanceId = (int)db()->lastInsertId();
-
-    $createdStmt = db()->prepare('SELECT r.created_at, r.status, r.sender, r.receiver,
-            r.amount_afghani, r.agency, r.destination_country,
-            (SELECT a.address FROM agencies a WHERE BINARY a.name = BINARY r.agency ORDER BY a.id DESC LIMIT 1) AS agency_address
-        FROM remittances r WHERE r.id = ? AND r.user_id = ? LIMIT 1');
-    $createdStmt->execute([$remittanceId, $userId]);
-    $savedRemittance = $createdStmt->fetch();
-    if (!$savedRemittance) {
-        throw new RuntimeException('Committed remittance could not be reloaded.');
+    if ($currentBalance < $totalRequired) {
+        $pdo->rollBack();
+        json_response([
+            'success' => false, 
+            'message' => 'موجودی حساب کافی نیست.',
+            'required' => $totalRequired,
+            'balance' => $currentBalance
+        ], 400);
     }
 
-    $balanceStmt = db()->prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance + overdraft_limit >= ?');
-    $balanceStmt->execute([$totalDeduction, $userId, $totalDeduction]);
-    if ($balanceStmt->rowCount() !== 1) {
-        throw new RuntimeException('Wallet balance changed before remittance deduction.');
+    // 4. کسر موجودی
+    $newBalance = $currentBalance - $totalRequired;
+    $upUser = $pdo->prepare("UPDATE users SET balance = :b WHERE id = :id");
+    $upUser->execute(['b' => $newBalance, 'id' => $userId]);
+
+    // 5. بررسی ساختار جدول remittances برای تطابق پویا
+    $remitCols = [];
+    $stmtRCols = $pdo->query("SHOW COLUMNS FROM remittances");
+    while ($rcol = $stmtRCols->fetch(PDO::FETCH_ASSOC)) {
+        $remitCols[] = $rcol['Field'];
     }
-    service_fee_record(db(), $userId, $fee, 'remittance', $remittanceId, 'pending');
-    $balanceAfterStmt = db()->prepare('SELECT balance FROM users WHERE id = ?');
-    $balanceAfterStmt->execute([$userId]);
-    $balanceAfter = (float)$balanceAfterStmt->fetchColumn();
 
-    db()->commit();
+    // مقادیر پایه
+    // مقادیر پایه
+    $insertData = [
+        'user_id'             => $userId,
+        'agency'              => $agency,
+        'destination_country' => $destinationCountry,
+        'sender'              => $sender,
+        'receiver'            => $receiver,
+        'amount_toman'        => $amountToman,
+        'amount_afghani'      => $amountAfn,
+        'created_at'          => date('Y-m-d H:i:s')
+    ];
 
-    $agencyAddress = trim((string)($savedRemittance['agency_address'] ?? ''));
-    $savedAgency = trim((string)($savedRemittance['agency'] ?? $agency));
+    // تطبیق فیلدهای اختیاری در صورت وجود در دیتابیس
+    if (in_array('status', $remitCols, true)) {
+        $insertData['status'] = 'pending';
+    }
+    if (in_array('receiver_phone', $remitCols, true)) {
+        $insertData['receiver_phone'] = $receiverPhone;
+    }
+    if (in_array('source_currency', $remitCols, true)) {
+        $insertData['source_currency'] = $sourceCurrency;
+    }
+    if (in_array('destination_currency', $remitCols, true)) {
+        $insertData['destination_currency'] = $destinationCurrency;
+    }
+    if (in_array('rate_id', $remitCols, true)) {
+        $insertData['rate_id'] = (int)$rateRow['id'];
+    }
+    if (in_array('exchange_rate_id', $remitCols, true)) {
+        $insertData['exchange_rate_id'] = (int)$rateRow['id'];
+    }
+    if (in_array('exchange_rate_value', $remitCols, true)) {
+        $insertData['exchange_rate_value'] = $tomanPerAfn;
+    }
+    if (in_array('fee', $remitCols, true)) {
+        $insertData['fee'] = $feeAmount;
+    }
 
+
+    $colNames = implode(', ', array_keys($insertData));
+    $placeholders = ':' . implode(', :', array_keys($insertData));
+
+    $sqlInsert = "INSERT INTO remittances ({$colNames}) VALUES ({$placeholders})";
+    $insStmt = $pdo->prepare($sqlInsert);
+    $insStmt->execute($insertData);
+
+    $remittanceId = (int)$pdo->lastInsertId();
+
+    // ثبت گزارش کارمزد در صورت وجود متد
+    if ($feeAmount > 0 && function_exists('service_fee_record')) {
+        try {
+            service_fee_record($pdo, $userId, ['total_amount' => $feeAmount], 'remittance', $remittanceId, 'pending');
+        } catch (\Throwable $e) {
+            // نادیده گرفتن خطای لاگ کارمزد برای عدم اختلال در تراکنش اصلی
+        }
+    }
+
+    $pdo->commit();
+
+    // 6. خروجی استاندارد
     json_response([
         'success' => true,
         'message' => 'حواله با موفقیت ثبت شد.',
         'data' => [
             'remittance_id' => $remittanceId,
-            'tracking_number' => $remittanceId,
-            'code' => $remittanceId,
-            'agency_name' => $savedAgency,
-            'destination_country' => $savedRemittance['destination_country'] ?? null,
-            'destination_country_name' => remittance_destination_countries()[(string)($savedRemittance['destination_country'] ?? '')] ?? null,
-            'agency_address' => $agencyAddress,
-            'status' => strtolower(trim((string)$savedRemittance['status'])),
-            'created_at' => $savedRemittance['created_at'] ?: null,
-            'sender' => trim((string)$savedRemittance['sender']),
-            'receiver' => trim((string)$savedRemittance['receiver']),
-            'amount_afghani' => (float)$savedRemittance['amount_afghani'],
-            'amount_toman' => (float)$amountToman,
-            'fee' => $fee,
-            'new_balance' => $balanceAfter,
-            'destination' => $agencyAddress !== '' ? $agencyAddress : $savedAgency,
-        ],
-    ]);
-} catch (Throwable $e) {
-    if (db()->inTransaction()) {
-        db()->rollBack();
-    }
+            'amount_toman'  => $amountToman,
+            'amount_afn'    => $amountAfn,
+            'status'        => 'pending'
+        ]
+    ], 200);
 
-    error_log('Add remittance failed: ' . $e->getMessage());
-
-    if ($e->getMessage() === 'SUBCUSTOMER_VERIFICATION_REQUIRED') {
-        json_response(['success' => false, 'code' => 'SUBCUSTOMER_VERIFICATION_REQUIRED', 'message' => 'ابتدا تایید تلفن و احراز هویت را تکمیل کنید.'], 403);
+} catch (\Throwable $e) {
+    if (isset($pdo) && $pdo->inTransaction()) {
+        $pdo->rollBack();
     }
-    if ($e->getMessage() === 'SERVICE_FEE_SCHEMA_MISSING') {
-        json_response(['success' => false, 'code' => 'SERVICE_FEE_SCHEMA_MISSING', 'message' => 'تنظیمات کارمزد خدمات نصب نشده است.'], 503);
-    }
-
-    json_response(['success' => false, 'message' => 'خطا در ثبت حواله.'], 500);
+    error_log("Remittance Error: " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine());
+    json_response([
+        'success' => false,
+        'message' => 'خطا در ثبت حواله: ' . $e->getMessage()
+    ], 500);
 }

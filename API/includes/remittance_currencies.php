@@ -46,6 +46,23 @@ function remittance_currency_name(string $currencyCode): ?string
     return $currency['name'] ?? null;
 }
 
+function remittance_currency_precision(string $currencyCode): int
+{
+    $code = strtoupper(trim($currencyCode));
+    $registry = remittance_source_currencies() + remittance_destination_currencies();
+    if (!isset($registry[$code])) {
+        return 2;
+    }
+    // The currency registry currently stores names and symbols; these are the ISO minor-unit exceptions.
+    if (in_array($code, ['IRT', 'UZS'], true)) {
+        return 0;
+    }
+    if (in_array($code, ['BHD', 'IQD', 'KWD', 'OMR'], true)) {
+        return 3;
+    }
+    return 2;
+}
+
 function remittance_country_destination_currencies(string $countryCode): array
 {
     $country = strtoupper(trim($countryCode));

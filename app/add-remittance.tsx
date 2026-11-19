@@ -28,7 +28,7 @@ import { AppBottomNav } from '@/components/app-bottom-nav';
 import { RemittanceReceiptView } from '@/components/remittance-receipt-view';
 import { buildRemittanceReceiptText, customerTrackingNumber, RemittanceReceiptModel } from '@/lib/remittance-receipt';
 import { createRemittanceReceiptPdf } from '@/lib/remittance-receipt-native';
-import { buildVariableRateWhatsAppUrl } from '@/lib/remittance-currency-flow';
+import { buildVariableRateWhatsAppUrl, calculateDestinationAmount } from '@/lib/remittance-currency-flow';
 import { moneyInputWords, normalizeMoneyInput } from '@/lib/money-input';
 import { useMoneyInput } from '@/hooks/use-money-input';
 
@@ -57,7 +57,11 @@ type RemittanceMetadata = {
 
 type ExchangeRate = {
   id: string | number;
-  toman_per_afn: string | number;
+  source_currency: string;
+  destination_currency: string;
+  exchange_rate: string | number;
+  commission_percentage?: string | number;
+  toman_per_afn?: string | number | null;
   effective_date?: string;
 };
 
@@ -86,35 +90,6 @@ const formatReceiptDate = (value: string) => {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
-const calculateAfghaniAmount = (amountToman: string | number, tomanPerAfghani: string | number) => {
-  const normalizedToman = normalizeMoneyInput(amountToman);
-  const rateText = String(tomanPerAfghani).trim().toLowerCase();
-  const rateParts = rateText.match(/^(\d+)(?:\.(\d*))?(?:e([+-]?\d+))?$/);
-  if (!normalizedToman || !rateParts) return '';
-
-  try {
-    let rateDigits = BigInt(`${rateParts[1]}${rateParts[2] || ''}`);
-    let rateScale = (rateParts[2] || '').length - Number(rateParts[3] || 0);
-    if (rateScale < 0) {
-      rateDigits *= 10n ** BigInt(-rateScale);
-      rateScale = 0;
-    }
-    while (rateScale > 0 && rateDigits % 10n === 0n) {
-      rateDigits /= 10n;
-      rateScale -= 1;
-    }
-    if (rateDigits <= 0n) return '';
-
-    const numerator = BigInt(normalizedToman) * 100n * (10n ** BigInt(rateScale));
-    const wholeCents = numerator / rateDigits;
-    const remainder = numerator % rateDigits;
-    const roundedCents = wholeCents + (remainder * 2n >= rateDigits ? 1n : 0n);
-    return `${roundedCents / 100n}.${String(roundedCents % 100n).padStart(2, '0')}`;
-  } catch {
-    return '';
-  }
-};
-
 export default function AddRemittanceScreen() {
   const router = useRouter();
   const { userId, userToken, userName, userMobile, isInitialized, setUserBalance } = useAuth();
@@ -123,13 +98,11 @@ export default function AddRemittanceScreen() {
   const [destinationCountryGroups, setDestinationCountryGroups] = useState<DestinationCountryGroup[]>([]);
   const [sourceCurrencies, setSourceCurrencies] = useState<CurrencyOption[]>([{ code: 'IRT', name: 'تومان' }]);
   const [destinationCurrencies, setDestinationCurrencies] = useState<CurrencyOption[]>([]);
-  const [fixedRatePairs, setFixedRatePairs] = useState<RemittanceMetadata['fixed_rate_pairs']>([]);
   const [selectedSourceCurrency, setSelectedSourceCurrency] = useState('IRT');
   const [selectedDestinationCountry, setSelectedDestinationCountry] = useState('');
   const [selectedDestinationCurrency, setSelectedDestinationCurrency] = useState('AFN');
   const [exchangeRates, setExchangeRates] = useState<ExchangeRate[]>([]);
   const [selectedAgencyId, setSelectedAgencyId] = useState<string | null>(null);
-  const [selectedRateId, setSelectedRateId] = useState<number | null>(null);
 
   const amountTomanInput = useMoneyInput();
   const amountToman = amountTomanInput.value;
@@ -158,8 +131,8 @@ export default function AddRemittanceScreen() {
   const [feePreview, setFeePreview] = useState<FeePreview | null>(null);
 
   const selectedRate = useMemo(
-    () => exchangeRates.find((rate) => Number(rate.id) === selectedRateId) || null,
-    [exchangeRates, selectedRateId]
+    () => exchangeRates.find((rate) => rate.source_currency === selectedSourceCurrency && rate.destination_currency === selectedDestinationCurrency) || null,
+    [exchangeRates, selectedDestinationCurrency, selectedSourceCurrency]
   );
 
   const selectedCountry = useMemo(
@@ -170,13 +143,8 @@ export default function AddRemittanceScreen() {
   const availableDestinationCurrencies = selectedCountry?.destination_currencies || destinationCurrencies;
 
   const isFixedRatePair = useMemo(
-    () => fixedRatePairs.some(
-      (pair) =>
-        pair.source_currency === selectedSourceCurrency
-        && pair.destination_currency === selectedDestinationCurrency
-        && pair.country_code === selectedDestinationCountry
-    ),
-    [fixedRatePairs, selectedDestinationCountry, selectedDestinationCurrency, selectedSourceCurrency]
+    () => Boolean(selectedCountry && selectedRate && availableDestinationCurrencies.some((currency) => currency.code === selectedDestinationCurrency)),
+    [availableDestinationCurrencies, selectedCountry, selectedDestinationCurrency, selectedRate]
   );
 
   const selectedSourceCurrencyName = sourceCurrencies.find((currency) => currency.code === selectedSourceCurrency)?.name || selectedSourceCurrency;
@@ -234,7 +202,6 @@ export default function AddRemittanceScreen() {
 
       if (ratesRes?.success && Array.isArray(ratesList)) {
         setExchangeRates(ratesList);
-        if (ratesList.length > 0) setSelectedRateId(Number(ratesList[0].id));
       } else {
         setError('خطا در دریافت نرخ ارز');
       }
@@ -244,7 +211,6 @@ export default function AddRemittanceScreen() {
         setDestinationCountryGroups(metadata.groups);
         setSourceCurrencies(metadata.source_currencies || [{ code: 'IRT', name: 'تومان' }]);
         setDestinationCurrencies(metadata.destination_currencies || []);
-        setFixedRatePairs(metadata.fixed_rate_pairs || []);
       } else {
         setError('خطا در دریافت فهرست کشورهای مقصد');
       }
@@ -278,13 +244,12 @@ export default function AddRemittanceScreen() {
       setAmountAfghani('');
       return;
     }
-    const rate = Number(selectedRate.toman_per_afn);
+    const rate = Number(selectedRate.exchange_rate);
     if (!Number.isFinite(rate) || rate <= 0) {
       setAmountAfghani('');
       return;
     }
-    const calculated = parseFloat(cleanAmountToman || '0') / rate;
-    setAmountAfghani(Number.isFinite(calculated) ? calculated.toFixed(2) : '');
+    setAmountAfghani(calculateDestinationAmount(cleanAmountToman, selectedRate.exchange_rate, selectedRate.commission_percentage ?? 0));
   }, [amountToman, isFixedRatePair, selectedRate]);
 
   useEffect(() => {
@@ -365,7 +330,7 @@ export default function AddRemittanceScreen() {
     const selectedAgency = agencies.find((a) => String(a.id) === String(selectedAgencyId));
     const cleanAmountToman = normalizeMoneyInput(amountToman);
     const calculatedAmountAfghani = selectedRate
-      ? calculateAfghaniAmount(cleanAmountToman, selectedRate.toman_per_afn)
+      ? calculateDestinationAmount(cleanAmountToman, selectedRate.exchange_rate, selectedRate.commission_percentage ?? 0)
       : '';
 
     if (!selectedAgency) return showError('خطا', 'لطفاً یک نمایندگی انتخاب کنید.');
@@ -374,7 +339,7 @@ export default function AddRemittanceScreen() {
       await handleOpenVariableRateWhatsApp();
       return;
     }
-    if (!selectedRate || !Number.isFinite(Number(selectedRate.toman_per_afn)) || Number(selectedRate.toman_per_afn) <= 0) return showError('خطا', 'نرخ ارز معتبر یافت نشد. لطفاً فرم را دوباره بارگذاری کنید.');
+    if (!selectedRate || !Number.isFinite(Number(selectedRate.exchange_rate)) || Number(selectedRate.exchange_rate) <= 0) return showError('خطا', 'برای این جفت ارز نرخ فعال و معتبری وجود ندارد.');
     if (!cleanAmountToman || !Number.isFinite(Number(cleanAmountToman)) || Number(cleanAmountToman) <= 0) return showError('خطا', 'مبلغ تومان را وارد کنید.');
     if (!resolvedUserId) return showError('خطا', 'شناسه کاربر یافت نشد. دوباره وارد شوید.');
     if (!apiToken) return showError('خطای احراز هویت', 'نشست شما معتبر نیست. لطفاً دوباره وارد شوید.');
@@ -404,7 +369,7 @@ export default function AddRemittanceScreen() {
       const sendRemittance = (rate: ExchangeRate, afnAmount: string) => {
         const requestPayload = new URLSearchParams(payload);
         requestPayload.set('rate_id', String(rate.id));
-        requestPayload.set('rate_value', String(rate.toman_per_afn));
+        requestPayload.set('rate_value', String(rate.exchange_rate));
         requestPayload.set('amount_afn', afnAmount);
         return fetchJson<Record<string, any>>('add_remittance.php', {
           method: 'POST',
@@ -434,24 +399,34 @@ export default function AddRemittanceScreen() {
             isRecord(rate)
             && (typeof rate.id === 'string' || typeof rate.id === 'number')
             && Number.isInteger(Number(rate.id)) && Number(rate.id) > 0
-            && (typeof rate.toman_per_afn === 'string' || typeof rate.toman_per_afn === 'number')
-            && Number.isFinite(Number(rate.toman_per_afn)) && Number(rate.toman_per_afn) > 0
-          ) : []).sort((left, right) => Number(right.id) - Number(left.id));
+            && typeof rate.source_currency === 'string'
+            && typeof rate.destination_currency === 'string'
+            && (typeof rate.exchange_rate === 'string' || typeof rate.exchange_rate === 'number')
+            && Number.isFinite(Number(rate.exchange_rate)) && Number(rate.exchange_rate) > 0
+          ) : []);
           if (ratesData.success !== true || refreshedRates.length === 0) throw new Error('No active exchange rate');
         } catch {
           showError('نرخ ارز به‌روز شد', 'نرخ حواله تغییر کرد، اما تلاش مجدد انجام نشد. اطلاعات فرم حفظ شده است؛ لطفاً دوباره ثبت را بزنید.');
           return;
         }
 
-        submissionRate = refreshedRates[0];
-        submittedAmountAfghani = calculateAfghaniAmount(cleanAmountToman, submissionRate.toman_per_afn);
+        const refreshedPairRate = refreshedRates.find((rate) =>
+          rate.source_currency === selectedSourceCurrency && rate.destination_currency === selectedDestinationCurrency
+        );
+        if (!refreshedPairRate) {
+          setExchangeRates(refreshedRates);
+          setAmountAfghani('');
+          await handleOpenVariableRateWhatsApp();
+          return;
+        }
+        submissionRate = refreshedPairRate;
+        submittedAmountAfghani = calculateDestinationAmount(cleanAmountToman, submissionRate.exchange_rate, submissionRate.commission_percentage ?? 0);
         if (!submittedAmountAfghani) {
           showError('نرخ ارز به‌روز شد', 'مبلغ افغانی با نرخ جدید محاسبه نشد. اطلاعات فرم حفظ شده است.');
           return;
         }
 
         setExchangeRates(refreshedRates);
-        setSelectedRateId(Number(submissionRate.id));
         setAmountAfghani(submittedAmountAfghani);
         result = await sendRemittance(submissionRate, submittedAmountAfghani);
       }
@@ -514,6 +489,11 @@ export default function AddRemittanceScreen() {
           receiver: String(receiptData.receiver ?? receiverName.trim()),
           amountAfghani: receiptData.amount_afghani ?? submittedAmountAfghani,
           amountToman: receiptData.amount_toman ?? cleanAmountToman,
+          sourceCurrency: String(receiptData.source_currency ?? selectedSourceCurrency),
+          destinationCurrency: String(receiptData.destination_currency ?? selectedDestinationCurrency),
+          destinationCurrencyPrecision: Number(receiptData.destination_currency_precision ?? 2),
+          commissionPercentage: receiptData.commission_percentage ?? selectedRate?.commission_percentage ?? 0,
+          exchangeRate: receiptData.exchange_rate ?? selectedRate?.exchange_rate,
           feeAmount: receiptData.fee?.fee_amount ?? 0,
           totalCharged: receiptData.fee?.total_amount ?? cleanAmountToman,
           feeType: receiptData.fee?.fee_type ?? 'fixed',
@@ -642,6 +622,18 @@ export default function AddRemittanceScreen() {
                 </Picker>
               </View>
 
+              <Text style={styles.label}>ارز مبدأ</Text>
+              <View style={styles.pickerContainer}>
+                <Picker
+                  style={styles.picker}
+                  selectedValue={selectedSourceCurrency}
+                  onValueChange={(value) => setSelectedSourceCurrency(String(value))}>
+                  {sourceCurrencies.map((currency) => (
+                    <Picker.Item key={currency.code} label={`${currency.name} (${currency.code})`} value={currency.code} />
+                  ))}
+                </Picker>
+              </View>
+
               <Text style={styles.label}>ارز مقصد</Text>
               <View style={styles.pickerContainer}>
                 <Picker
@@ -671,8 +663,9 @@ export default function AddRemittanceScreen() {
                   <Text style={styles.label}>نرخ ارز امروز</Text>
                   <View style={styles.readonlyBox}>
                     <Text style={styles.readonlyText}>
-                      {selectedRate ? `${toPersianNum(selectedRate.toman_per_afn)} تومان به ازای هر افغانی` : '-'}
+                      {selectedRate ? `۱ ${selectedRate.source_currency} = ${toPersianNum(selectedRate.exchange_rate)} ${selectedRate.destination_currency}` : '-'}
                     </Text>
+                    {selectedRate && Number(selectedRate.commission_percentage || 0) > 0 && <Text style={styles.readonlyText}>کارمزد تبدیل: {toPersianNum(selectedRate.commission_percentage || 0)}٪</Text>}
                   </View>
                 </>
               ) : (
@@ -694,7 +687,7 @@ export default function AddRemittanceScreen() {
               {isFixedRatePair && (
                 <View style={styles.row}>
                   <View style={styles.half}>
-                    <Text style={styles.label}>مبلغ (تومان)</Text>
+                    <Text style={styles.label}>مبلغ ({selectedSourceCurrencyName})</Text>
                     <TextInput
                       style={styles.input}
                       keyboardType="numeric"
@@ -708,7 +701,7 @@ export default function AddRemittanceScreen() {
                     {!!moneyInputWords(amountToman) && <Text style={styles.amountWords}>{moneyInputWords(amountToman)}</Text>}
                   </View>
                   <View style={styles.half}>
-                    <Text style={styles.label}>معادل (افغانی)</Text>
+                    <Text style={styles.label}>مبلغ دریافتی ({selectedDestinationCurrencyName})</Text>
                     <TextInput
                       style={[styles.input, styles.disabledInput]}
                       editable={false}
@@ -741,9 +734,9 @@ export default function AddRemittanceScreen() {
                   <View style={styles.spacer} />
 
                   <View style={styles.feeBox}>
-                    <View style={styles.feeRow}><Text style={styles.feeLabel}>مبلغ حواله</Text><Text style={styles.feeValue}>{toPersianNum(Number(normalizeMoneyInput(amountToman) || 0).toLocaleString('en-US'))} تومان</Text></View>
-                    <View style={styles.feeRow}><Text style={styles.feeLabel}>کارمزد</Text><Text style={styles.feeValue}>{toPersianNum(Number(feePreview?.fee_amount || 0).toLocaleString('en-US'))} تومان</Text></View>
-                    <View style={[styles.feeRow, styles.feeTotalRow]}><Text style={styles.feeTotalLabel}>مبلغ نهایی قابل پرداخت</Text><Text style={styles.feeTotalValue}>{toPersianNum(Number(feePreview?.total_amount || normalizeMoneyInput(amountToman) || 0).toLocaleString('en-US'))} تومان</Text></View>
+                    <View style={styles.feeRow}><Text style={styles.feeLabel}>مبلغ حواله</Text><Text style={styles.feeValue}>{toPersianNum(Number(normalizeMoneyInput(amountToman) || 0).toLocaleString('en-US'))} {selectedSourceCurrencyName}</Text></View>
+                    <View style={styles.feeRow}><Text style={styles.feeLabel}>کارمزد خدمات</Text><Text style={styles.feeValue}>{toPersianNum(Number(feePreview?.fee_amount || 0).toLocaleString('en-US'))} {selectedSourceCurrencyName}</Text></View>
+                    <View style={[styles.feeRow, styles.feeTotalRow]}><Text style={styles.feeTotalLabel}>مبلغ نهایی قابل پرداخت</Text><Text style={styles.feeTotalValue}>{toPersianNum(Number(feePreview?.total_amount || normalizeMoneyInput(amountToman) || 0).toLocaleString('en-US'))} {selectedSourceCurrencyName}</Text></View>
                   </View>
 
                   <TouchableOpacity

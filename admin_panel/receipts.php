@@ -7,11 +7,17 @@ require_once __DIR__ . '/balance_view_helpers.php';
 require_once __DIR__ . '/debt_service.php';
 require_once __DIR__ . '/receipt_image_helper.php';
 require_once __DIR__ . '/money_input_helpers.php';
+require_once __DIR__ . '/receipt_currency_helpers.php';
+require_once __DIR__ . '/../API/includes/remittance_currencies.php';
 
 require_login();
 require_permission('view');
 
 $flash = get_flash();
+$receiptCurrencies = remittance_source_currencies() + remittance_destination_currencies();
+$receiptPrecisions = ['IRT' => 2, 'AFN' => 2, 'USD' => 2, 'EUR' => 2, 'GBP' => 2, 'TRY' => 2, 'CAD' => 2, 'CNY' => 2, 'RUB' => 2, 'PKR' => 2, 'TJS' => 2, 'UZS' => 0, 'TMT' => 2, 'KZT' => 2, 'AED' => 2, 'SAR' => 2, 'QAR' => 2, 'OMR' => 3, 'KWD' => 3, 'BHD' => 3, 'IQD' => 3];
+$receiptCurrencyColumnReady = table_exists('transactions') && in_array('currency_code', db()->query('SHOW COLUMNS FROM transactions')->fetchAll(PDO::FETCH_COLUMN, 0), true);
+$receiptWalletReady = table_exists('currency_wallets');
 
 if (!table_exists('transactions')) {
     render_page_start('فیش های واریزی', 'receipts');
@@ -19,6 +25,14 @@ if (!table_exists('transactions')) {
     render_page_end();
     exit;
 }
+
+if (!$receiptCurrencyColumnReady || !$receiptWalletReady) {
+    render_page_start('فیش‌های واریزی', 'receipts');
+    echo '<div class="receipt-alert error">برای فعال‌سازی امن ثبت رسید چندارزی، migration شماره 023 را اجرا کنید.</div>';
+    render_page_end();
+    exit;
+}
+
 
 function receipt_status_class(string $status): string
 {
@@ -65,7 +79,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         try {
             $transactionColumns = db()->query('SHOW COLUMNS FROM transactions')->fetchAll(PDO::FETCH_COLUMN, 0);
             $hasBalanceApplied = in_array('balance_applied', $transactionColumns, true);
-            $selectFields = $hasBalanceApplied ? 'user_id, amount, status, balance_applied' : 'user_id, amount, status';
+            $hasCurrency = in_array('currency_code', $transactionColumns, true);
+            $selectFields = 'user_id, amount, status' . ($hasBalanceApplied ? ', balance_applied' : '') . ($hasCurrency ? ', currency_code' : '');
             $currentStmt = db()->prepare("SELECT {$selectFields} FROM transactions WHERE id = ? AND type = 'deposit' FOR UPDATE");
             $currentStmt->execute([$id]);
             $transaction = $currentStmt->fetch();
@@ -80,18 +95,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $previousStatus = (string)($transaction['status'] ?? '');
             $userId = (int)($transaction['user_id'] ?? 0);
             $amount = (string)($transaction['amount'] ?? '0');
-            $alreadyApplied = $previousStatus === 'approved'
-                || ($hasBalanceApplied && (int)($transaction['balance_applied'] ?? 0) === 1);
+            $alreadyApplied = $previousStatus === 'approved' || ($hasBalanceApplied && (int)($transaction['balance_applied'] ?? 0) === 1);
+            $currency = strtoupper((string)($transaction['currency_code'] ?? 'IRT'));
+            if ($alreadyApplied && !in_array($status, ['approved', 'paid'], true)) {
+                throw new DomainException('CREDITED_RECEIPT_CANNOT_BE_REJECTED');
+            }
 
             $setParts = ['status = ?'];
             $updateValues = [$status];
 
             if ($status === 'approved' && !$alreadyApplied) {
-                $result = debt_apply_user_credit(db(), $userId, $amount, $id, 'deposit_receipt');
+                if (in_array('approved_by_admin_id', $transactionColumns, true)) { $setParts[] = 'approved_by_admin_id = ?'; $updateValues[] = (int)($_SESSION['admin_id'] ?? 0); }
+                if (in_array('approved_at', $transactionColumns, true)) $setParts[] = 'approved_at = NOW()';
+                if ($currency === 'IRT') {
+                    $result = debt_apply_user_credit(db(), $userId, $amount, $id, 'deposit_receipt');
+                } else {
+                    if (!$receiptWalletReady) throw new RuntimeException('CURRENCY_WALLET_MIGRATION_REQUIRED');
+                    $customerLock = db()->prepare('SELECT id FROM users WHERE id=? FOR UPDATE');
+                    $customerLock->execute([$userId]);
+                    if (!$customerLock->fetchColumn()) throw new DomainException('USER_NOT_FOUND');
+                    $walletUpsert = db()->prepare('INSERT INTO currency_wallets (user_id,currency_code,balance) VALUES (?,?,0) ON DUPLICATE KEY UPDATE user_id=VALUES(user_id)');
+                    $walletUpsert->execute([$userId, $currency]);
+                    $walletLock = db()->prepare('SELECT balance FROM currency_wallets WHERE user_id=? AND currency_code=? FOR UPDATE');
+                    $walletLock->execute([$userId, $currency]);
+                    $walletLock->fetchColumn();
+                    $walletUpdate = db()->prepare('UPDATE currency_wallets SET balance=balance+? WHERE user_id=? AND currency_code=?');
+                    $walletUpdate->execute([$amount, $userId, $currency]);
+                    $walletAfter = db()->prepare('SELECT balance FROM currency_wallets WHERE user_id=? AND currency_code=?');
+                    $walletAfter->execute([$userId, $currency]);
+                    $result = ['balance_after' => (string)$walletAfter->fetchColumn()];
+                }
                 if ($hasBalanceApplied) {
                     $setParts[] = 'balance_applied = 1';
                 }
-                if (in_array('balance_after', $transactionColumns, true)) {
+                if ($currency === 'IRT' && in_array('balance_after', $transactionColumns, true)) {
                     $setParts[] = 'balance_after = ?';
                     $updateValues[] = $result['balance_after'];
                 }
@@ -121,10 +158,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'add_receipt') {
         $username = trim((string)($_POST['username'] ?? ''));
         $amountInput = trim((string)($_POST['amount'] ?? ''));
-        $amount = normalize_admin_money_amount($amountInput);
+        $currency = strtoupper(trim((string)($_POST['currency_code'] ?? 'IRT')));
+        $amount = receipt_normalize_currency_amount($amountInput, (int)($receiptPrecisions[$currency] ?? 2));
         $trackingCode = trim((string)($_POST['tracking_code'] ?? ''));
         $status = trim((string)($_POST['status'] ?? 'pending'));
         $description = trim((string)($_POST['description'] ?? ''));
+        $paymentDateInput = trim((string)($_POST['payment_datetime'] ?? ''));
+        $paymentDate = null;
+        if ($paymentDateInput !== '') {
+            $parsedPaymentDate = DateTimeImmutable::createFromFormat('!Y-m-d\\TH:i', $paymentDateInput);
+            $dateErrors = DateTimeImmutable::getLastErrors();
+            if (!$parsedPaymentDate || (is_array($dateErrors) && ($dateErrors['warning_count'] > 0 || $dateErrors['error_count'] > 0))) {
+                flash('error', 'تاریخ و ساعت رسید معتبر نیست.'); header('Location: receipts.php'); exit;
+            }
+            $paymentDate = $parsedPaymentDate->format('Y-m-d H:i:s');
+        }
+        if (!$receiptCurrencyColumnReady || !$receiptWalletReady) { flash('error', 'لطفاً migration شماره 023 را اجرا کنید.'); header('Location: receipts.php'); exit; }
+        if (!isset($receiptCurrencies[$currency])) { flash('error', 'ارز انتخاب‌شده معتبر نیست.'); header('Location: receipts.php'); exit; }
 
         $allowedStatuses = ['pending', 'approved', 'rejected', 'paid'];
 
@@ -159,16 +209,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $status = 'pending';
         }
 
-        if (
-            !isset($_FILES['receipt_image']) ||
-            !is_array($_FILES['receipt_image']) ||
-            ($_FILES['receipt_image']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK
-        ) {
-            flash('error', 'لطفاً عکس فیش را انتخاب کنید.');
-            header('Location: receipts.php');
-            exit;
-        }
-
+        $receiptImagePath = null;
+        $destination = null;
+        $uploadError = $_FILES['receipt_image']['error'] ?? UPLOAD_ERR_NO_FILE;
+        if (!in_array($uploadError, [UPLOAD_ERR_NO_FILE, UPLOAD_ERR_OK], true)) { flash('error', 'بارگذاری فایل انجام نشد.'); header('Location: receipts.php'); exit; }
+        if ($uploadError === UPLOAD_ERR_OK) {
         $file = $_FILES['receipt_image'];
         $maxSize = 5 * 1024 * 1024;
 
@@ -217,35 +262,50 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $receiptImagePath = 'uploads/receipts/' . $fileName;
+        }
 
         db()->beginTransaction();
         try {
+            $customerLock = db()->prepare('SELECT id FROM users WHERE id=? FOR UPDATE');
+            $customerLock->execute([$userId]);
+            if (!$customerLock->fetchColumn()) throw new DomainException('USER_NOT_FOUND');
             $stmt = db()->prepare("
                 INSERT INTO transactions
-                    (user_id, amount, tracking_code, type, status, receipt_image, description, created_at)
+                    (user_id, amount, currency_code, tracking_code, type, status, receipt_image, description, created_at, created_by_admin_id, receipt_paid_at)
                 VALUES
-                    (?, ?, ?, 'deposit', ?, ?, ?, NOW())
+                    (?, ?, ?, ?, 'deposit', ?, ?, ?, NOW(), ?, ?)
             ");
 
             $stmt->execute([
                 $userId,
                 $amount,
+                $currency,
                 $trackingCode,
                 $status,
                 $receiptImagePath,
                 $description,
+                (int)($_SESSION['admin_id'] ?? 0),
+                $paymentDate,
             ]);
 
             $newId = (int)db()->lastInsertId();
             if ($status === 'approved') {
                 $transactionColumns = db()->query('SHOW COLUMNS FROM transactions')->fetchAll(PDO::FETCH_COLUMN, 0);
-                $result = debt_apply_user_credit(db(), $userId, (string)$amount, $newId, 'admin_receipt');
+                if ($currency === 'IRT') { $result = debt_apply_user_credit(db(), $userId, (string)$amount, $newId, 'admin_receipt'); } else {
+                    $walletUpsert = db()->prepare('INSERT INTO currency_wallets (user_id,currency_code,balance) VALUES (?,?,0) ON DUPLICATE KEY UPDATE user_id=VALUES(user_id)'); $walletUpsert->execute([$userId,$currency]);
+                    $walletLock = db()->prepare('SELECT balance FROM currency_wallets WHERE user_id=? AND currency_code=? FOR UPDATE'); $walletLock->execute([$userId,$currency]); $walletLock->fetchColumn();
+                    db()->prepare('UPDATE currency_wallets SET balance=balance+? WHERE user_id=? AND currency_code=?')->execute([$amount,$userId,$currency]);
+                    $walletAfter=db()->prepare('SELECT balance FROM currency_wallets WHERE user_id=? AND currency_code=?'); $walletAfter->execute([$userId,$currency]);
+                    $result=['balance_after'=>(string)$walletAfter->fetchColumn()];
+                }
                 $setParts = [];
                 $values = [];
+                if (in_array('approved_by_admin_id', $transactionColumns, true)) { $setParts[] = 'approved_by_admin_id = ?'; $values[] = (int)($_SESSION['admin_id'] ?? 0); }
+                if (in_array('approved_at', $transactionColumns, true)) $setParts[] = 'approved_at = NOW()';
                 if (in_array('balance_applied', $transactionColumns, true)) {
                     $setParts[] = 'balance_applied = 1';
                 }
-                if (in_array('balance_after', $transactionColumns, true)) {
+                if ($currency === 'IRT' && in_array('balance_after', $transactionColumns, true)) {
                     $setParts[] = 'balance_after = ?';
                     $values[] = $result['balance_after'];
                 }
@@ -259,7 +319,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (db()->inTransaction()) {
                 db()->rollBack();
             }
-            if (is_file($destination)) {
+            if (is_string($destination) && is_file($destination)) {
                 @unlink($destination);
             }
             flash('error', $e->getMessage() === 'DEBT_SCHEMA_MISSING' ? 'ابتدا migration بدهی کاربران را اجرا کنید.' : 'ثبت فیش واریزی انجام نشد.');
@@ -277,6 +337,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 $q = trim((string)($_GET['q'] ?? ''));
 $statusFilter = trim((string)($_GET['status'] ?? ''));
+$currencyFilter = strtoupper(trim((string)($_GET['currency'] ?? '')));
 $typeFilter = 'deposit';
 $startDate = trim((string)($_GET['start_date'] ?? ''));
 $endDate = trim((string)($_GET['end_date'] ?? ''));
@@ -295,6 +356,11 @@ $params[] = $typeFilter;
 if ($statusFilter !== '') {
     $where[] = "t.status = ?";
     $params[] = $statusFilter;
+}
+
+if ($currencyFilter !== '' && isset($receiptCurrencies[$currencyFilter])) {
+    $where[] = 't.currency_code = ?';
+    $params[] = $currencyFilter;
 }
 
 if ($q !== '') {
@@ -336,7 +402,7 @@ if ($page > $totalPages) {
 $limit = (int)$perPage;
 $offset = (int)$offset;
 $listSql = "
-    SELECT t.id, t.user_id, t.amount, t.tracking_code, t.type, t.status, t.receipt_image, t.created_at, t.description, u.mobile as user_mobile, u.balance AS user_balance
+    SELECT t.id, t.user_id, t.amount, t.currency_code, t.balance_applied, t.receipt_paid_at, t.tracking_code, t.type, t.status, t.receipt_image, t.created_at, t.description, u.mobile as user_mobile, u.balance AS user_balance, (SELECT cw.balance FROM currency_wallets cw WHERE cw.user_id=t.user_id AND cw.currency_code=t.currency_code LIMIT 1) AS currency_balance
     FROM transactions t
     LEFT JOIN users u ON t.user_id = u.id
     {$whereSql}
@@ -347,13 +413,13 @@ $listStmt = db()->prepare($listSql);
 $listStmt->execute($params);
 $receipts = $listStmt->fetchAll();
 
-$sumStmt = db()->prepare("SELECT COALESCE(SUM(t.amount), 0) FROM transactions t LEFT JOIN users u ON t.user_id = u.id {$whereSql}");
+$sumStmt = db()->prepare("SELECT t.currency_code, COALESCE(SUM(t.amount), 0) AS total_amount FROM transactions t LEFT JOIN users u ON t.user_id = u.id {$whereSql} GROUP BY t.currency_code");
 $sumStmt->execute($params);
-$totalAmount = (float)$sumStmt->fetchColumn();
+$currencyTotals = $sumStmt->fetchAll(PDO::FETCH_KEY_PAIR);
 
 if ($exportExcel) {
     $exportStmt = db()->prepare("
-        SELECT t.id, t.user_id, t.amount, t.tracking_code, t.type, t.status, t.receipt_image, t.created_at, t.description, u.mobile as user_mobile, u.balance AS user_balance
+        SELECT t.id, t.user_id, t.amount, t.currency_code, t.tracking_code, t.type, t.status, t.receipt_image, t.created_at, t.description, u.mobile as user_mobile, u.balance AS user_balance
         FROM transactions t
         LEFT JOIN users u ON t.user_id = u.id
         {$whereSql}
@@ -367,7 +433,7 @@ if ($exportExcel) {
             trim((string)($row['receipt_image'] ?? '')) !== '' ? (string)$row['receipt_image'] : 'بدون عکس',
             (string)($row['user_mobile'] ?? 'نامشخص'),
             admin_balance_with_unit($row['user_balance'] ?? null),
-            (string)$row['amount'],
+            (string)$row['amount'] . ' ' . (string)($row['currency_code'] ?? 'IRT'),
             (string)($row['tracking_code'] ?? ''),
             (string)($row['type'] === 'withdraw' ? 'برداشت' : 'واریز'),
             status_fa((string)$row['status']),
@@ -385,7 +451,7 @@ if ($exportExcel) {
 
 if ($exportPrint) {
     $printStmt = db()->prepare("
-        SELECT t.id, t.user_id, t.amount, t.tracking_code, t.type, t.status, t.receipt_image, t.created_at, t.description, u.mobile as user_mobile, u.balance AS user_balance
+        SELECT t.id, t.user_id, t.amount, t.currency_code, t.tracking_code, t.type, t.status, t.receipt_image, t.created_at, t.description, u.mobile as user_mobile, u.balance AS user_balance
         FROM transactions t
         LEFT JOIN users u ON t.user_id = u.id
         {$whereSql}
@@ -399,7 +465,7 @@ if ($exportPrint) {
             trim((string)($row['receipt_image'] ?? '')) !== '' ? 'تصویر موجود' : 'بدون عکس',
             (string)($row['user_mobile'] ?? 'نامشخص'),
             admin_balance_with_unit($row['user_balance'] ?? null),
-            (string)$row['amount'],
+            (string)$row['amount'] . ' ' . (string)($row['currency_code'] ?? 'IRT'),
             (string)($row['tracking_code'] ?? ''),
             (string)($row['type'] === 'withdraw' ? 'برداشت' : 'واریز'),
             status_fa((string)$row['status']),
@@ -1364,7 +1430,7 @@ render_page_start('فیش های واریزی', 'receipts');
         <div class="receipt-stat-card">
             <div class="receipt-stat-info">
                 <div class="receipt-stat-label">جمع مبلغ</div>
-                <div class="receipt-stat-value"><?= number_format($totalAmount) ?> <span style="font-size:14px;color:#64748b;">تومان</span></div>
+                <div class="receipt-stat-value" style="font-size:14px"><?php foreach ($currencyTotals as $code => $sum): ?><?= e(receipt_format_currency_amount($sum, (string)$code, $receiptPrecisions)) ?> <?= e((string)$code) ?>&nbsp; <?php endforeach; ?></div>
             </div>
             <div class="receipt-stat-icon">تومان</div>
         </div>
@@ -1426,6 +1492,12 @@ render_page_start('فیش های واریزی', 'receipts');
                         </div>
 
                         <div class="receipt-field">
+                            <label for="add_payment_datetime">تاریخ و ساعت دریافت</label>
+                            <input type="datetime-local" id="add_payment_datetime" name="payment_datetime" class="receipt-input" dir="ltr">
+                            <small>در صورت خالی‌بودن، زمان ثبت در سامانه استفاده می‌شود.</small>
+                        </div>
+
+                        <div class="receipt-field">
                             <label for="add_status">وضعیت</label>
                             <select id="add_status" name="status" class="receipt-select">
                                 <option value="pending">در انتظار</option>
@@ -1443,8 +1515,14 @@ render_page_start('فیش های واریزی', 'receipts');
                                 name="receipt_image"
                                 class="receipt-input"
                                 accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
-                                required
                             >
+                        </div>
+
+                        <div class="receipt-field">
+                            <label for="add_currency">ارز دریافتی</label>
+                            <select id="add_currency" name="currency_code" class="receipt-select" required onchange="updateReceiptAmountStep(this.value)">
+                                <?php foreach ($receiptCurrencies as $code => $currency): ?><option value="<?= e($code) ?>"><?= e($currency['name']) ?> (<?= e($code) ?>)</option><?php endforeach; ?>
+                            </select>
                         </div>
 
                         <div class="receipt-field receipt-field-full">
@@ -1496,6 +1574,10 @@ render_page_start('فیش های واریزی', 'receipts');
                 <input type="hidden" name="q" value="<?= e($q) ?>">
                 <input type="hidden" name="type" value="<?= e($typeFilter) ?>">
                 <input type="hidden" name="status" value="<?= e($statusFilter) ?>">
+                <select name="currency" class="receipt-filter-control" aria-label="فیلتر ارز">
+                    <option value="">همه ارزها</option>
+                    <?php foreach ($receiptCurrencies as $code => $currency): ?><option value="<?= e($code) ?>" <?= (($_GET['currency'] ?? '') === $code) ? 'selected' : '' ?>><?= e($currency['name']) ?> (<?= e($code) ?>)</option><?php endforeach; ?>
+                </select>
                 <input type="hidden" name="page" value="1">
                 <input type="text" name="start_date" class="receipt-filter-control js-persian-date" value="<?= e($startDate) ?>" placeholder="از تاریخ..." aria-label="از تاریخ" style="width:200px; max-width:200px;">
                 <input type="text" name="end_date" class="receipt-filter-control js-persian-date" value="<?= e($endDate) ?>" placeholder="تا تاریخ..." aria-label="تا تاریخ" style="width:200px; max-width:200px;">
@@ -1614,11 +1696,11 @@ render_page_start('فیش های واریزی', 'receipts');
                                     <span class="receipt-mobile"><?= e((string)($row['user_mobile'] ?? 'نامشخص')) ?></span>
                                 </td>
 
-                                <td><span class="receipt-current-balance"><?= e(admin_balance_with_unit($row['user_balance'] ?? null)) ?></span></td>
+                                <td><span class="receipt-current-balance"><?= e(admin_balance_number(($row['currency_code'] ?? 'IRT') === 'IRT' ? ($row['user_balance'] ?? null) : ($row['currency_balance'] ?? '0'))) ?> <?= e((string)($row['currency_code'] ?? 'IRT')) ?></span></td>
 
                                 <td>
                                     <span class="receipt-amount">
-                                        <?= number_format((float)$row['amount']) ?> تومان
+                                        <?= e(receipt_format_currency_amount($row['amount'], (string)($row['currency_code'] ?? 'IRT'), $receiptPrecisions)) ?> <?= e((string)($row['currency_code'] ?? 'IRT')) ?>
                                     </span>
                                 </td>
 
@@ -1638,6 +1720,7 @@ render_page_start('فیش های واریزی', 'receipts');
                                     <span class="receipt-badge <?= e(receipt_status_class((string)$row['status'])) ?>">
                                         <?= e($statusText) ?>
                                     </span>
+                                    <?php if ((int)($row['balance_applied'] ?? 0) === 1): ?><small style="display:block;color:#047857;margin-top:4px">اعتبار ثبت شده</small><?php else: ?><small style="display:block;color:#64748b;margin-top:4px">بدون اعتبار کیف‌پول</small><?php endif; ?>
                                 </td>
 
                                 <td>
@@ -1652,7 +1735,7 @@ render_page_start('فیش های واریزی', 'receipts');
 
                                 <td>
                                     <span class="receipt-date">
-                                        <?= e((string)$row['created_at']) ?>
+                                        <?= e((string)($row['receipt_paid_at'] ?: $row['created_at'])) ?>
                                     </span>
                                 </td>
 
@@ -1716,6 +1799,7 @@ render_page_start('فیش های واریزی', 'receipts');
 </div>
 
 <script>
+    function updateReceiptAmountStep(code){const p=<?= json_encode($receiptPrecisions, JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_HEX_AMP) ?>;const input=document.getElementById('add_amount');if(input){input.step=p[code]===0?'1':'0.'+'0'.repeat(Math.max(0,(p[code]||2)-1))+'1';input.placeholder=(p[code]===0?'عدد صحیح':'حداکثر '+(p[code]||2)+' رقم اعشار');}}
     function openModal(modalId) {
         var modal = document.getElementById(modalId);
         if (modal) {

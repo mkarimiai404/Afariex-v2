@@ -20,8 +20,8 @@ $exportPrint = (string)($_GET['export'] ?? '') === 'print';
 $destinationCountries = remittance_destination_countries();
 
 // دریافت نرخ فعال تبدیل افغانی به تومان
-$activeRateRow = db()->query('SELECT rate FROM exchange_rates WHERE is_active = 1 ORDER BY id DESC LIMIT 1')->fetch();
-$activeRate = $activeRateRow ? (float)$activeRateRow['rate'] : 0;
+$activeRateRow = db()->query("SELECT afn_to_toman FROM exchange_rates WHERE source_currency = 'IRT' AND destination_currency = 'AFN' AND is_active = 1 AND effective_date <= CURRENT_DATE ORDER BY effective_date DESC, id DESC LIMIT 1")->fetch();
+$activeRate = $activeRateRow ? (float)$activeRateRow['afn_to_toman'] : 0;
 
 // دریافت لیست نمایندگی‌ها
 $agencies = db()->query('SELECT name FROM agencies ORDER BY name ASC')->fetchAll(PDO::FETCH_COLUMN);
@@ -296,7 +296,7 @@ $limit = (int)$perPage;
 $offset = (int)$offset;
 
 $stmtSql = "
-    SELECT r.id, r.user_id, u.mobile, u.balance AS user_balance, r.agency, r.destination_country, r.sender, r.receiver, r.amount_toman, r.amount_afghani, r.status, r.created_at
+    SELECT r.id, r.user_id, u.mobile, u.balance AS user_balance, r.agency, r.destination_country, r.sender, r.receiver, r.amount_toman, r.amount_afghani, r.source_currency, r.destination_currency, r.status, r.created_at
     FROM remittances r
     LEFT JOIN users u ON r.user_id = u.id
     {$whereSql}
@@ -309,7 +309,7 @@ $rows = $stmt->fetchAll();
 
 if ($exportExcel) {
     $exportStmt = db()->prepare("
-        SELECT r.id, r.user_id, u.mobile, u.balance AS user_balance, r.agency, r.destination_country, r.sender, r.receiver, r.amount_toman, r.amount_afghani, r.status, r.created_at
+        SELECT r.id, r.user_id, u.mobile, u.balance AS user_balance, r.agency, r.destination_country, r.sender, r.receiver, r.amount_toman, r.amount_afghani, r.source_currency, r.destination_currency, r.status, r.created_at
         FROM remittances r
         LEFT JOIN users u ON r.user_id = u.id
         {$whereSql}
@@ -326,8 +326,8 @@ if ($exportExcel) {
             $destinationCountries[(string)($row['destination_country'] ?? '')] ?? '',
             (string)$row['sender'],
             (string)$row['receiver'],
-            number_format((float)$row['amount_toman']),
-            number_format((float)$row['amount_afghani']),
+            number_format((float)$row['amount_toman']) . ' ' . (string)($row['source_currency'] ?: 'IRT'),
+            number_format((float)$row['amount_afghani']) . ' ' . (string)($row['destination_currency'] ?: 'AFN'),
             status_fa((string)$row['status']),
             to_jalali_datetime((string)$row['created_at']),
         ];
@@ -335,14 +335,14 @@ if ($exportExcel) {
 
     export_xls_table(
         'Remittances_Report_' . date('Ymd_His') . '.xls',
-        ['شناسه', 'موبایل کاربر', 'موجودی فعلی کاربر', 'نمایندگی', 'کشور مقصد', 'فرستنده', 'گیرنده', 'مبلغ حواله (تومان)', 'مبلغ حواله (افغانی)', 'وضعیت', 'تاریخ'],
+        ['شناسه', 'موبایل کاربر', 'موجودی فعلی کاربر', 'نمایندگی', 'کشور مقصد', 'فرستنده', 'گیرنده', 'مبلغ ارز مبدأ', 'مبلغ ارز مقصد', 'وضعیت', 'تاریخ'],
         $exportRows
     );
 }
 
 if ($exportPrint) {
     $printStmt = db()->prepare("
-        SELECT r.id, r.user_id, u.mobile, u.balance AS user_balance, r.agency, r.destination_country, r.sender, r.receiver, r.amount_toman, r.amount_afghani, r.status, r.created_at
+        SELECT r.id, r.user_id, u.mobile, u.balance AS user_balance, r.agency, r.destination_country, r.sender, r.receiver, r.amount_toman, r.amount_afghani, r.source_currency, r.destination_currency, r.status, r.created_at
         FROM remittances r
         LEFT JOIN users u ON r.user_id = u.id
         {$whereSql}
@@ -359,8 +359,8 @@ if ($exportPrint) {
             $destinationCountries[(string)($row['destination_country'] ?? '')] ?? '',
             (string)$row['sender'],
             (string)$row['receiver'],
-            number_format((float)$row['amount_toman']),
-            number_format((float)$row['amount_afghani']),
+            number_format((float)$row['amount_toman']) . ' ' . (string)($row['source_currency'] ?: 'IRT'),
+            number_format((float)$row['amount_afghani']) . ' ' . (string)($row['destination_currency'] ?: 'AFN'),
             status_fa((string)$row['status']),
             to_jalali_datetime((string)$row['created_at']),
         ];
@@ -368,7 +368,7 @@ if ($exportPrint) {
 
     render_print_table_view(
         'گزارش حواله‌ها',
-        ['شناسه', 'موبایل کاربر', 'موجودی فعلی کاربر', 'نمایندگی', 'کشور مقصد', 'فرستنده', 'گیرنده', 'مبلغ حواله (تومان)', 'مبلغ حواله (افغانی)', 'وضعیت', 'تاریخ'],
+        ['شناسه', 'موبایل کاربر', 'موجودی فعلی کاربر', 'نمایندگی', 'کشور مقصد', 'فرستنده', 'گیرنده', 'مبلغ ارز مبدأ', 'مبلغ ارز مقصد', 'وضعیت', 'تاریخ'],
         $printRows,
         'فیلتر بازه تاریخ اعمال شده است.'
     );
@@ -566,8 +566,8 @@ render_page_start('مدیریت حواله‌ها', 'remittances');
                         <th>کشور مقصد</th>
                         <th>فرستنده</th>
                         <th>گیرنده</th>
-                        <th>مبلغ (تومان)</th>
-                        <th>مبلغ (افغانی)</th>
+                        <th>مبلغ ارز مبدأ</th>
+                        <th>مبلغ ارز مقصد</th>
                         <th>وضعیت</th>
                         <th>تاریخ</th>
                         <th>عملیات</th>
@@ -600,8 +600,8 @@ render_page_start('مدیریت حواله‌ها', 'remittances');
                                 <td><?= e($destinationCountries[(string)($row['destination_country'] ?? '')] ?? '—') ?></td>
                                 <td><?= e($row['sender']) ?></td>
                                 <td><?= e($row['receiver']) ?></td>
-                                <td><strong><?= number_format((float)$row['amount_toman']) ?></strong></td>
-                                <td><strong><?= number_format((float)$row['amount_afghani']) ?></strong></td>
+                                <td><strong><?= number_format((float)$row['amount_toman']) ?> <?= e((string)($row['source_currency'] ?: 'IRT')) ?></strong></td>
+                                <td><strong><?= number_format((float)$row['amount_afghani']) ?> <?= e((string)($row['destination_currency'] ?: 'AFN')) ?></strong></td>
                                 <td>
                                     <form method="post" class="rm-status-form">
                                         <input type="hidden" name="csrf_token" value="<?= e($csrf) ?>">

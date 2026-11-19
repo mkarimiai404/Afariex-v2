@@ -39,13 +39,23 @@ function statement_xlsx_parts(array $report, ?string $from, ?string $to): array
         ['موبایل', (string)$user['mobile']],
         ['زمان صدور', $generatedAt],
         ['بازه گزارش', ($from ?: 'ابتدا') . ' تا ' . ($to ?: 'امروز')],
-        ['موجودی کیف پول (تومان)', (string)$summary['wallet_balance']],
-        ['بدهی باز (تومان)', (string)$summary['outstanding_debt']],
-        ['موقعیت خالص حساب (تومان)', (string)$summary['final_balance']],
-        ['طبقه‌بندی موقعیت', (float)$summary['final_balance'] > 0 ? 'بستانکار' : ((float)$summary['final_balance'] < 0 ? 'بدهکار' : 'تسویه')],
-        [],
-        $columns,
+        ['خلاصه مانده به تفکیک ارز'],
+        ['ارز', 'موجودی کیف پول', 'بدهی باز', 'موقعیت خالص', 'تعداد ردیف فعالیت'],
     ];
+    $currencySummaryStart = count($rows);
+    foreach (($summary['currencies'] ?? []) as $currency) {
+        $rows[] = [
+            (string)$currency['code'] . ' — ' . (string)$currency['name'],
+            $currency['wallet_tracked'] ? (string)$currency['wallet_balance'] : '',
+            (string)$currency['outstanding_debt'],
+            $currency['net_balance'] === null ? '' : (string)$currency['net_balance'],
+            (string)($currency['activity']['count'] ?? 0),
+        ];
+    }
+    $currencySummaryEnd = count($rows);
+    $rows[] = [];
+    $rows[] = $columns;
+    $firstActivityRowIndex = count($rows);
     foreach ($report['rows'] as $index => $row) {
         $rows[] = [
             (string)($index + 1),
@@ -53,10 +63,10 @@ function statement_xlsx_parts(array $report, ?string $from, ?string $to): array
             statement_type_fa((string)$row['type']),
             (string)$row['description'],
             (string)$row['amount'],
-            'تومان',
+            (string)($row['currency'] ?? 'IRT'),
             statement_direction_fa((string)$row['direction']),
             statement_status_fa((string)$row['status']),
-            $row['balance_after'] === null ? '' : (string)$row['balance_after'],
+            empty($row['balance_tracked']) ? '' : (string)($row['running_balance'] ?? ''),
             (string)$row['reference'],
         ];
     }
@@ -67,9 +77,10 @@ function statement_xlsx_parts(array $report, ?string $from, ?string $to): array
         foreach (array_values($row) as $columnIndex => $value) {
             $cellRef = statement_xlsx_column($columnIndex + 1) . ($rowIndex + 1);
             $text = (string)$value;
-            $isTransactionRow = $rowIndex >= 11;
+            $isTransactionRow = $rowIndex >= $firstActivityRowIndex;
+            $isCurrencySummaryRow = $rowIndex >= $currencySummaryStart && $rowIndex < $currencySummaryEnd;
             $isNumeric = ($isTransactionRow && in_array($columnIndex, [0, 4, 8], true))
-                || (in_array($rowIndex, [5, 6, 7], true) && $columnIndex === 1);
+                || ($isCurrencySummaryRow && in_array($columnIndex, [1, 2, 3, 4], true));
             if ($isNumeric && preg_match('/^-?\d+(?:\.\d+)?$/D', $text) === 1) {
                 $xmlCells .= '<c r="' . $cellRef . '"><v>' . $text . '</v></c>';
             } else {

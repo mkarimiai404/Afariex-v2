@@ -26,6 +26,11 @@ type ReceiptOrder = {
     receiver?: string;
     amount_afghani?: string | number;
     amount_toman?: string | number;
+    source_currency?: string;
+    destination_currency?: string;
+    destination_currency_precision?: number;
+    exchange_commission_percentage?: string | number;
+    exchange_rate_value?: string | number | null;
     fee_amount?: string | number;
     total_amount?: string | number;
     fee_type?: string;
@@ -82,6 +87,11 @@ export default function RemittanceReceiptScreen() {
         receiver: metadata.receiver,
         amountAfghani: metadata.amount_afghani ?? 0,
         amountToman: metadata.amount_toman ?? 0,
+        sourceCurrency: metadata.source_currency ?? 'IRT',
+        destinationCurrency: metadata.destination_currency ?? 'AFN',
+        destinationCurrencyPrecision: metadata.destination_currency_precision ?? 2,
+        commissionPercentage: metadata.exchange_commission_percentage ?? 0,
+        exchangeRate: metadata.exchange_rate_value ?? undefined,
         feeAmount: metadata.fee_amount ?? 0,
         totalCharged: metadata.total_amount ?? metadata.amount_toman ?? 0,
         feeType: metadata.fee_type ?? 'fixed',

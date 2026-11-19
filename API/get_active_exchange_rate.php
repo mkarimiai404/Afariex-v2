@@ -20,7 +20,12 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
 try {
     $row = null;
     if (table_exists('exchange_rates')) {
-        $stmt = db()->query('SELECT id, rate, afn_to_toman, toman_to_afn, effective_date FROM exchange_rates WHERE is_active = 1 ORDER BY id DESC LIMIT 1');
+        $columns = db()->query('SHOW COLUMNS FROM exchange_rates')->fetchAll(PDO::FETCH_COLUMN, 0);
+        $where = in_array('source_currency', $columns, true) && in_array('destination_currency', $columns, true)
+            ? "source_currency = 'IRT' AND destination_currency = 'AFN' AND effective_date <= CURRENT_DATE AND "
+            : '';
+        $order = in_array('effective_date', $columns, true) ? 'effective_date DESC, id DESC' : 'id DESC';
+        $stmt = db()->query('SELECT id, rate, afn_to_toman, toman_to_afn, effective_date FROM exchange_rates WHERE ' . $where . 'is_active = 1 ORDER BY ' . $order . ' LIMIT 1');
         $row = $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
     }
     echo json_encode(['success' => true, 'data' => $row], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
