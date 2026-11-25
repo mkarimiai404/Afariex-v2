@@ -33,6 +33,7 @@ function statement_xlsx_parts(array $report, ?string $from, ?string $to): array
         'ردیف', 'تاریخ و ساعت', 'نوع فعالیت', 'شرح فعالیت', 'مبلغ',
         'واحد', 'جهت', 'وضعیت', 'مانده پس از تراکنش', 'کد رهگیری',
     ];
+    array_splice($columns, 8, 0, ['مانده پیش از تراکنش']);
     $rows = [
         ['AFARIEX - صورتحساب مالی'],
         ['کاربر', trim((string)($user['first_name'] ?? '') . ' ' . (string)($user['last_name'] ?? '')) ?: (string)$user['mobile']],
@@ -66,6 +67,7 @@ function statement_xlsx_parts(array $report, ?string $from, ?string $to): array
             (string)($row['currency'] ?? 'IRT'),
             statement_direction_fa((string)$row['direction']),
             statement_status_fa((string)$row['status']),
+            empty($row['balance_tracked']) ? '' : (string)($row['running_balance_before'] ?? ''),
             empty($row['balance_tracked']) ? '' : (string)($row['running_balance'] ?? ''),
             (string)$row['reference'],
         ];
@@ -79,7 +81,7 @@ function statement_xlsx_parts(array $report, ?string $from, ?string $to): array
             $text = (string)$value;
             $isTransactionRow = $rowIndex >= $firstActivityRowIndex;
             $isCurrencySummaryRow = $rowIndex >= $currencySummaryStart && $rowIndex < $currencySummaryEnd;
-            $isNumeric = ($isTransactionRow && in_array($columnIndex, [0, 4, 8], true))
+            $isNumeric = ($isTransactionRow && in_array($columnIndex, [0, 4, 8, 9], true))
                 || ($isCurrencySummaryRow && in_array($columnIndex, [1, 2, 3, 4], true));
             if ($isNumeric && preg_match('/^-?\d+(?:\.\d+)?$/D', $text) === 1) {
                 $xmlCells .= '<c r="' . $cellRef . '"><v>' . $text . '</v></c>';
@@ -91,7 +93,7 @@ function statement_xlsx_parts(array $report, ?string $from, ?string $to): array
         $xmlRows .= '<row r="' . ($rowIndex + 1) . '">' . $xmlCells . '</row>';
     }
 
-    $widths = [9, 22, 22, 48, 18, 14, 18, 20, 24, 24];
+    $widths = [9, 22, 22, 48, 18, 14, 18, 20, 24, 24, 24];
     $xmlWidths = '';
     foreach ($widths as $index => $width) {
         $column = $index + 1;

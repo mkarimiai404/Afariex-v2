@@ -1,19 +1,21 @@
 <?php
 declare(strict_types=1);
 
-function normalize_admin_money_amount(string $value): ?string
+function normalize_admin_money_amount(string $value, int $precision = 2): ?string
 {
     $normalized = normalize_persian_digits(trim($value));
     $normalized = str_replace(['٫', '٬'], ['.', ','], $normalized);
-    if (preg_match('/^(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?$/', $normalized) !== 1) {
+    $precision = max(0, min(4, $precision));
+    $decimalPattern = $precision === 0 ? '' : '(?:\.\d{1,' . $precision . '})?';
+    if (preg_match('/^(?:\d{1,3}(?:,\d{3})+|\d+)' . $decimalPattern . '$/D', $normalized) !== 1) {
         return null;
     }
     $numeric = str_replace(',', '', $normalized);
     [$integer, $fraction] = array_pad(explode('.', $numeric, 2), 2, '');
-    $integer = ltrim($integer, '0');
-    if ($integer === '' && rtrim($fraction, '0') === '') {
+    if (strlen(ltrim($integer, '0')) > 16 || !is_finite((float)$numeric) || (float)$numeric <= 0) {
         return null;
     }
+    $integer = ltrim($integer, '0');
     $integer = $integer === '' ? '0' : $integer;
     return $fraction === '' ? $integer : $integer . '.' . $fraction;
 }
@@ -33,24 +35,29 @@ function render_money_input_helpers(): void
         const hundreds = ['', 'یکصد', 'دویست', 'سیصد', 'چهارصد', 'پانصد', 'ششصد', 'هفتصد', 'هشتصد', 'نهصد'];
         const scales = ['', 'هزار', 'میلیون', 'میلیارد', 'تریلیون', 'کوادریلیون'];
 
-        function clean(value) {
+        function translateDigits(value) {
           return String(value ?? '')
             .replace(/[۰-۹]/g, digit => String(persianDigits.indexOf(digit)))
-            .replace(/[٠-٩]/g, digit => String(arabicDigits.indexOf(digit)))
-            .replace(/[ ,٬\s]/g, '')
-            .replace(/\D/g, '')
-            .replace(/^0+(?=\d)/, '');
+            .replace(/[٠-٩]/g, digit => String(arabicDigits.indexOf(digit)));
+        }
+
+        function clean(value) {
+          return translateDigits(value).replace(/[ ,٬\s]/g, '').replace(/\D/g, '').replace(/^0+(?=\d)/, '');
         }
 
         function cleanDecimal(value) {
-          const translated = String(value ?? '')
-            .replace(/[۰-۹]/g, digit => String(persianDigits.indexOf(digit)))
-            .replace(/[٠-٩]/g, digit => String(arabicDigits.indexOf(digit)))
-            .replace(/٫/g, '.')
-            .replace(/[,٬\s]/g, '');
-          if (!/^\d*(?:\.\d*)?$/.test(translated)) return translated;
+          const translated = translateDigits(value).replace(/٫/g, '.').replace(/٬/g, ',');
           const pieces = translated.split('.');
-          return pieces.join('.');
+          if (pieces.length > 2 || !/^(?:\d{1,3}(?:,\d{3})+|\d+)$/.test(pieces[0]) || (pieces.length === 2 && !/^\d*$/.test(pieces[1]))) return translated;
+          const integer = pieces[0].replace(/,/g, '');
+          return pieces.length === 2 ? `${integer}.${pieces[1]}` : integer;
+        }
+
+        // Remove visual grouping only when editing; do not rewrite the value on each keystroke.
+        function ungroupForEditing(value, decimalInput) {
+          let translated = translateDigits(value).replace(/٫/g, '.').replace(/٬/g, ',');
+          translated = translated.replace(/,/g, '');
+          return decimalInput ? translated : translated.replace(/\D/g, '');
         }
 
         function format(value) {
@@ -70,13 +77,8 @@ function render_money_input_helpers(): void
           const hundred = Math.floor(value / 100);
           const remainder = value % 100;
           if (hundred) parts.push(hundreds[hundred]);
-          if (remainder < 20) {
-            if (remainder) parts.push(ones[remainder]);
-          } else {
-            parts.push(tens[Math.floor(remainder / 10)]);
-            const one = remainder % 10;
-            if (one) parts.push(ones[one]);
-          }
+          if (remainder < 20) { if (remainder) parts.push(ones[remainder]); }
+          else { parts.push(tens[Math.floor(remainder / 10)]); const one = remainder % 10; if (one) parts.push(ones[one]); }
           return parts.join(' و ');
         }
 
@@ -95,7 +97,7 @@ function render_money_input_helpers(): void
 
         function words(value, unit = 'تومان', allowDecimal = false) {
           const decimal = allowDecimal ? cleanDecimal(value) : clean(value);
-          if (!decimal) return '';
+          if (!decimal || (allowDecimal && !/^\d*(?:\.\d*)?$/.test(decimal))) return '';
           const pieces = decimal.split('.');
           const whole = integerWords(pieces[0] || '0');
           if (!whole) return 'مبلغ خارج از محدوده نوشتاری';
@@ -104,45 +106,45 @@ function render_money_input_helpers(): void
           return `${whole}${fractionWords} ${unit}`;
         }
 
-        function refresh(input) {
-          if (!input) return;
-          const oldValue = input.value;
-          const start = input.selectionStart ?? oldValue.length;
-          const end = input.selectionEnd ?? start;
-          const decimalInput = input.hasAttribute('data-money-decimal');
-          const newValue = decimalInput ? formatDecimal(oldValue) : format(oldValue);
-          if (decimalInput && !/^\d*(?:\.\d*)?$/.test(cleanDecimal(oldValue))) {
-            const invalidTarget = input.dataset.moneyWordsTarget ? document.getElementById(input.dataset.moneyWordsTarget) : input.parentElement?.querySelector('.money-amount-words, .persian-amount');
-            if (invalidTarget) invalidTarget.textContent = '';
-            return;
-          }
-          if (oldValue !== newValue) {
-            const digitCleaner = decimalInput ? cleanDecimal : clean;
-            const startCount = digitCleaner(oldValue.slice(0, start)).replace('.', '').length;
-            const endCount = digitCleaner(oldValue.slice(0, end)).replace('.', '').length;
-            input.value = newValue;
-            const positionAfterDigits = count => {
-              if (!count) return 0;
-              let found = 0;
-              for (let index = 0; index < newValue.length; index += 1) {
-                if (/\d/.test(newValue[index])) found += 1;
-                if (found === count) return index + 1;
-              }
-              return newValue.length;
-            };
-            input.setSelectionRange(positionAfterDigits(startCount), positionAfterDigits(endCount));
-          }
+        function wordsTarget(input) {
           const targetId = input.dataset.moneyWordsTarget;
-          const target = targetId ? document.getElementById(targetId) : input.parentElement?.querySelector('.money-amount-words, .persian-amount');
-          if (target) target.textContent = words(input.value, input.dataset.moneyUnit || 'تومان', decimalInput);
+          return targetId ? document.getElementById(targetId) : input.parentElement?.querySelector('.money-amount-words, .persian-amount');
+        }
+
+        function refresh(input, formatValue = true) {
+          if (!input) return;
+          const decimalInput = input.hasAttribute('data-money-decimal');
+          if (formatValue) {
+            const newValue = decimalInput ? formatDecimal(input.value) : format(input.value);
+            if (newValue !== input.value) input.value = newValue;
+          }
+          const current = input.value;
+          const valid = decimalInput ? /^\d*(?:\.\d*)?$/.test(cleanDecimal(current)) : true;
+          const target = wordsTarget(input);
+          if (target) target.textContent = valid ? words(current, input.dataset.moneyUnit || 'تومان', decimalInput) : '';
         }
 
         function apply(root) {
           (root || document).querySelectorAll('input[data-money-input], input[data-money-decimal]').forEach(function (input) {
-            refresh(input);
+            refresh(input, true);
             if (input.dataset.moneyInputReady === '1') return;
             input.dataset.moneyInputReady = '1';
-            input.addEventListener('input', function () { refresh(input); });
+            input.addEventListener('focus', function () {
+              const decimalInput = input.hasAttribute('data-money-decimal');
+              const oldValue = input.value;
+              const caret = input.selectionStart ?? oldValue.length;
+              const before = ungroupForEditing(oldValue.slice(0, caret), decimalInput);
+              const editable = ungroupForEditing(oldValue, decimalInput);
+              if (editable !== oldValue) {
+                input.value = editable;
+                const position = Math.min(before.length, editable.length);
+                try { input.setSelectionRange(position, position); } catch (_) {}
+              }
+            });
+            // Leave the user's text and caret untouched while typing; this avoids keystroke
+            // feedback loops and lets arbitrarily long digit sequences be entered normally.
+            input.addEventListener('input', function () { refresh(input, false); });
+            input.addEventListener('blur', function () { refresh(input, true); });
           });
           (root || document).querySelectorAll('form').forEach(function (form) {
             if (form.dataset.moneySubmitReady === '1') return;

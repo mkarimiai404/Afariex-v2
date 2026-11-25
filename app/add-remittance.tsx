@@ -263,7 +263,7 @@ export default function AddRemittanceScreen() {
         const payload = new URLSearchParams({
           api_token: apiToken,
           service_code: 'remittance',
-          amount: String(Math.round(amount)),
+          amount: String(Math.trunc(amount)),
         });
         const response = await fetch(apiUrl('service-fee-preview.php'), {
           method: 'POST',
@@ -438,8 +438,8 @@ export default function AddRemittanceScreen() {
           return;
         }
         if (responseCode === 'DAILY_TRANSACTION_LIMIT_EXCEEDED') {
-          const limit = Number(result.data?.daily_limit || 0).toLocaleString('en-US');
-          const remaining = Number(result.data?.remaining_today || 0).toLocaleString('en-US');
+          const limit = Math.trunc(Number(result.data?.daily_limit || 0)).toLocaleString('en-US');
+          const remaining = Math.trunc(Number(result.data?.remaining_today || 0)).toLocaleString('en-US');
           showError('سقف تراکنش روزانه', `سقف روزانه شما ${limit} تومان است و ${remaining} تومان باقی مانده است.`);
           router.push('/access-level' as any);
           return;
@@ -532,8 +532,8 @@ export default function AddRemittanceScreen() {
         if (err.responseCode === 'INSUFFICIENT_BALANCE') {
           setInsufficientBalanceVisible(true);
         } else if (err.responseCode === 'DAILY_TRANSACTION_LIMIT_EXCEEDED') {
-          const limit = Number(data.daily_limit || 0).toLocaleString('en-US');
-          const remaining = Number(data.remaining_today || 0).toLocaleString('en-US');
+          const limit = Math.trunc(Number(data.daily_limit || 0)).toLocaleString('en-US');
+          const remaining = Math.trunc(Number(data.remaining_today || 0)).toLocaleString('en-US');
           showError('سقف تراکنش روزانه', `سقف روزانه شما ${limit} تومان است و ${remaining} تومان باقی مانده است.`);
           router.push('/access-level' as any);
         } else if (err.responseCode === 'CUSTOM_REMITTANCE_LIMIT_EXCEEDED') {
@@ -663,7 +663,7 @@ export default function AddRemittanceScreen() {
                   <Text style={styles.label}>نرخ ارز امروز</Text>
                   <View style={styles.readonlyBox}>
                     <Text style={styles.readonlyText}>
-                      {selectedRate ? `۱ ${selectedRate.source_currency} = ${toPersianNum(selectedRate.exchange_rate)} ${selectedRate.destination_currency}` : '-'}
+                      {selectedRate ? (selectedRate.source_currency === 'IRT' && selectedRate.destination_currency === 'AFN' ? `هر ۱ افغانی = ${toPersianNum(Number((selectedRate as ExchangeRate & { toman_per_afn?: string | number }).toman_per_afn || (1 / Number(selectedRate.exchange_rate))).toLocaleString('en-US', {maximumFractionDigits: 6}))} تومان (مبلغ تومان ÷ نرخ)` : `۱ ${selectedRate.source_currency} = ${toPersianNum(String(selectedRate.exchange_rate).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, ''))} ${selectedRate.destination_currency}`) : '-'}
                     </Text>
                     {selectedRate && Number(selectedRate.commission_percentage || 0) > 0 && <Text style={styles.readonlyText}>کارمزد تبدیل: {toPersianNum(selectedRate.commission_percentage || 0)}٪</Text>}
                   </View>

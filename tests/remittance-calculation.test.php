@@ -21,6 +21,9 @@ $assert(exchange_rate_calculate_destination_amount('10000000', $legacyRate['exch
 $assert(exchange_rate_calculate_destination_amount('10000000', $legacyRate['exchange_rate'], '10.00') === '2115.16', 'conversion commission is applied once before rounding');
 $assert(exchange_rate_calculate_destination_amount('1', '4255', '0') === '4255.00', 'ordinary directional rate remains destination units per source unit');
 $assert(exchange_rate_calculate_destination_amount('100000', '0.000025', '0') === '2.50', 'another supported directional rate keeps its existing behavior');
+$assert(exchange_rate_calculate_destination_amount('2', '4200', '0', 2, 0) === '8400', 'two AFN at 4200 Toman per AFN converts to an integer IRT amount');
+$assert(exchange_rate_calculate_destination_amount('2', '0.000238095238', '0', 2, 0, true) === '8400', 'inverse IRT-to-AFN rate converts AFN back to integer IRT');
+$assert(exchange_rate_calculate_destination_amount('1.125', '4200', '0', 3, 0) === '4725', 'three-decimal source currency retains its precision before IRT rounding');
 $assert(exchange_rate_client_amount_matches_calculation('2350.18', '2350.18'), 'client amount matching the server calculation is accepted');
 $assert(!exchange_rate_client_amount_matches_calculation('42550000000', '2350.18'), 'client-submitted amount cannot replace the server calculation');
 
@@ -37,6 +40,7 @@ foreach (['0', '-1', '1.234', '12abc', '99999999999999999'] as $invalidAmount) {
 }
 $assert(exchange_rate_calculate_destination_amount('100', '0', '0') === null, 'zero rate is rejected');
 $assert(exchange_rate_calculate_destination_amount('100', '-1', '0') === null, 'negative rate is rejected');
+$assert(exchange_rate_calculate_destination_amount('2', '0', '0', 2, 0, true) === null, 'zero inverse rate is rejected');
 $assert(exchange_rate_calculate_destination_amount('100', '1', '100.01') === null, 'commission above 100 percent is rejected');
 $assert(exchange_rate_calculate_destination_amount('100', '1', 'oops') === null, 'malformed commission is rejected');
 $assert(exchange_rate_parse_minor_units('10000000000000000') === null, 'excessively large amount is rejected without integer overflow');

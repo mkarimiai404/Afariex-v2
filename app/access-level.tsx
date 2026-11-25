@@ -15,7 +15,7 @@ const LEVELS = [
   { key: 'gold', title: 'طلایی', color: '#ca8a04' },
 ];
 
-const money = (value: unknown) => value === null || value === undefined ? 'تنظیم نشده' : `${Number(value || 0).toLocaleString('en-US')} تومان`;
+const money = (value: unknown) => value === null || value === undefined ? 'تنظیم نشده' : `${Math.trunc(Number(value || 0)).toLocaleString('en-US')} تومان`;
 
 export default function AccessLevelScreen() {
   const router = useRouter();

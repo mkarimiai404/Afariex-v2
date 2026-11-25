@@ -7,6 +7,7 @@ require_once __DIR__ . '/service_fee_service.php';
 require_once __DIR__ . '/../API/includes/remittance_destination_countries.php';
 require_once __DIR__ . '/../API/includes/remittance_currencies.php';
 require_once __DIR__ . '/receipt_currency_helpers.php';
+require_once __DIR__ . '/exchange_rate_service.php';
 $moneyInputHelpersPath = __DIR__ . '/money_input_helpers.php';
 if (is_file($moneyInputHelpersPath)) {
     require_once $moneyInputHelpersPath;
@@ -62,15 +63,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             header('Location: users.php?page=' . $page);
             exit;
         } else {
-            $amountPrecision = $manualAction === 'remittance' ? 2 : remittance_currency_precision($currencyCode);
-            $amountInput = (string)(receipt_normalize_currency_amount($amountInput, $amountPrecision) ?? '');
+            $amountPrecision = $currencyCode === 'IRT' ? 2 : remittance_currency_precision($currencyCode);
+            $amountInput = normalize_admin_money_amount($amountInput, $amountPrecision) ?? '';
             if ($manualDescription === '') {
                 flash('error', 'وارد کردن شرح برای واریز یا برداشت دستی الزامی است.');
-                header('Location: users.php?page=' . $page);
-                exit;
-            }
-            if ($currencyCode !== 'IRT' && !table_exists('currency_wallets')) {
-                flash('error', 'برای عملیات چندارزی، migration شماره ۰۲۳ اجرا نشده است.');
                 header('Location: users.php?page=' . $page);
                 exit;
             }
@@ -110,9 +106,50 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $userBalance = (string)($userRow['balance'] ?? '0');
             $mobile = (string)($userRow['mobile'] ?? '');
-            $manualWalletBefore = null;
-            $manualWalletAfter = null;
+            $walletAmount = $amountInput;
+            $transactionCurrencyCode = $currencyCode;
+            $transactionDescription = $manualDescription;
             $verification = verification_state($userId, true);
+
+            if (in_array($manualAction, ['increase', 'decrease'], true) && $currencyCode !== 'IRT') {
+                $rateRow = exchange_rate_current_pair($currencyCode, 'IRT', true);
+                $conversionRate = '';
+                $invertRate = false;
+                $rateDescription = '';
+                if ($rateRow !== null) {
+                    $conversionRate = trim((string)($rateRow['exchange_rate'] ?? ''));
+                    $rateDescription = "۱ {$currencyCode} = {$conversionRate} IRT";
+                } else {
+                    $rateRow = exchange_rate_current_pair('IRT', $currencyCode, true);
+                    if ($rateRow !== null && $currencyCode === 'AFN'
+                        && exchange_rate_decimal_is_valid(trim((string)($rateRow['toman_per_afn'] ?? '')))) {
+                        $conversionRate = trim((string)$rateRow['toman_per_afn']);
+                        $rateDescription = "۱ AFN = {$conversionRate} IRT";
+                    } elseif ($rateRow !== null) {
+                        $conversionRate = trim((string)($rateRow['exchange_rate'] ?? ''));
+                        $invertRate = true;
+                        $rateDescription = "۱ {$currencyCode} = ۱ / {$conversionRate} IRT (نرخ ثبت‌شده: ۱ IRT = {$conversionRate} {$currencyCode})";
+                    }
+                }
+
+                if ($rateRow === null || !exchange_rate_decimal_is_valid($conversionRate)) {
+                    throw new RuntimeException('MANUAL_CONVERSION_RATE_MISSING');
+                }
+                $walletAmount = exchange_rate_calculate_destination_amount(
+                    $amountInput,
+                    $conversionRate,
+                    '0',
+                    $amountPrecision,
+                    0,
+                    $invertRate
+                ) ?? '';
+                if ($walletAmount === '' || !preg_match('/^[1-9]\d{0,17}$/D', $walletAmount)) {
+                    throw new RuntimeException('MANUAL_CONVERSION_AMOUNT_INVALID');
+                }
+                $transactionCurrencyCode = 'IRT';
+                $transactionDescription = trim($manualDescription)
+                    . " | تبدیل دستی: {$amountInput} {$currencyCode} به {$walletAmount} IRT؛ {$rateDescription}؛ گردکردن به تومان صحیح";
+            }
 
             if ($manualAction === 'remittance') {
                 $usedToday = daily_transaction_usage($userId, true);
@@ -130,7 +167,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit;
             }
 
-            if ($manualAction === 'decrease' && $currencyCode === 'IRT' && (float)$amountInput > (float)$verification['withdrawal_limit']) {
+            if ($manualAction === 'decrease' && $transactionCurrencyCode === 'IRT' && (float)$walletAmount > (float)$verification['withdrawal_limit']) {
                 db()->rollBack();
                 flash('error', 'سقف برداشت سطح فعلی کاربر ' . number_format((float)$verification['withdrawal_limit']) . ' تومان است.');
                 header('Location: users.php?page=' . $page);
@@ -145,51 +182,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $sufficientBalance = true;
-            if ($manualAction === 'decrease' && $currencyCode !== 'IRT') {
-                $sufficientStmt = db()->prepare('SELECT balance FROM currency_wallets WHERE user_id = ? AND currency_code = ? AND balance >= ? FOR UPDATE');
-                $sufficientStmt->execute([$userId, $currencyCode, $amountInput]);
-                $manualWalletBefore = $sufficientStmt->fetchColumn();
-                $sufficientBalance = $manualWalletBefore !== false;
-            } elseif (in_array($manualAction, ['decrease', 'remittance'], true)) {
+            if (in_array($manualAction, ['decrease', 'remittance'], true)) {
                 $sufficientStmt = db()->prepare('SELECT id FROM users WHERE id = ? AND balance >= ?');
-                $sufficientStmt->execute([$userId, $manualAction === 'remittance' ? $manualTotalDeduction : $amountInput]);
+                $sufficientStmt->execute([$userId, $manualAction === 'remittance' ? $manualTotalDeduction : $walletAmount]);
                 $sufficientBalance = (bool)$sufficientStmt->fetchColumn();
             }
             if (!$sufficientBalance) {
                 db()->rollBack();
-                flash('error', $currencyCode === 'IRT' ? 'موجودی کیف‌پول تومان کافی نیست.' : 'موجودی کیف‌پول ' . $currencyCode . ' کافی نیست.');
+                flash('error', 'موجودی کیف‌پول تومان برای مبلغ تبدیل‌شده کافی نیست.');
                 header('Location: users.php?page=' . $page);
                 exit;
             }
 
             $creditResult = null;
             if ($manualAction === 'increase') {
-                if ($currencyCode === 'IRT') {
-                    $creditResult = debt_apply_user_credit(db(), $userId, $amountInput, null, 'admin_manual_increase');
-                    $transactionType = 'manual_deposit';
-                } else {
-                    db()->prepare('INSERT INTO currency_wallets (user_id, currency_code, balance) VALUES (?, ?, 0) ON DUPLICATE KEY UPDATE user_id = VALUES(user_id)')->execute([$userId, $currencyCode]);
-                    $walletStmt = db()->prepare('SELECT balance FROM currency_wallets WHERE user_id = ? AND currency_code = ? FOR UPDATE');
-                    $walletStmt->execute([$userId, $currencyCode]);
-                    $manualWalletBefore = (string)$walletStmt->fetchColumn();
-                    db()->prepare('UPDATE currency_wallets SET balance = balance + ? WHERE user_id = ? AND currency_code = ?')->execute([$amountInput, $userId, $currencyCode]);
-                    $walletStmt->execute([$userId, $currencyCode]);
-                    $manualWalletAfter = (string)$walletStmt->fetchColumn();
-                    $transactionType = 'manual_deposit';
-                }
+                $creditResult = debt_apply_user_credit(db(), $userId, $walletAmount, null, 'admin_manual_increase');
+                $transactionType = 'manual_deposit';
             } elseif ($manualAction === 'decrease') {
-                if ($currencyCode === 'IRT') {
-                    $updateStmt = db()->prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?');
-                    $updateStmt->execute([$amountInput, $userId, $amountInput]);
-                    if ($updateStmt->rowCount() !== 1) throw new RuntimeException('Insufficient wallet balance.');
-                } else {
-                    $updateStmt = db()->prepare('UPDATE currency_wallets SET balance = balance - ? WHERE user_id = ? AND currency_code = ? AND balance >= ?');
-                    $updateStmt->execute([$amountInput, $userId, $currencyCode, $amountInput]);
-                    if ($updateStmt->rowCount() !== 1) throw new RuntimeException('Insufficient balance in ' . $currencyCode . ' wallet.');
-                    $walletStmt = db()->prepare('SELECT balance FROM currency_wallets WHERE user_id = ? AND currency_code = ?');
-                    $walletStmt->execute([$userId, $currencyCode]);
-                    $manualWalletAfter = (string)$walletStmt->fetchColumn();
-                }
+                $updateStmt = db()->prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?');
+                $updateStmt->execute([$walletAmount, $userId, $walletAmount]);
+                if ($updateStmt->rowCount() !== 1) throw new RuntimeException('Insufficient wallet balance.');
                 $transactionType = 'manual_withdrawal';
             } else {
                 $updateStmt = db()->prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?');
@@ -200,7 +212,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $balanceStmt = db()->prepare('SELECT balance FROM users WHERE id = ?');
             $balanceStmt->execute([$userId]);
-            $balanceAfter = $currencyCode === 'IRT' ? (string)$balanceStmt->fetchColumn() : (string)$manualWalletAfter;
+            $balanceAfter = (string)$balanceStmt->fetchColumn();
 
             $manualRemittanceId = null;
             if ($manualAction === 'remittance') {
@@ -244,24 +256,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $transactionColumns = db()->query('SHOW COLUMNS FROM transactions')
                 ->fetchAll(PDO::FETCH_COLUMN, 0);
+            $manualRequiredTransactionColumns = ['id', 'user_id', 'amount', 'type', 'status', 'created_at', 'currency_code', 'description'];
             if (in_array($manualAction, ['increase', 'decrease'], true)
-                && (!in_array('currency_code', $transactionColumns, true) || !in_array('description', $transactionColumns, true))) {
+                && array_diff($manualRequiredTransactionColumns, $transactionColumns) !== []) {
                 throw new RuntimeException('MANUAL_OPERATION_SCHEMA_MISSING');
             }
 
             $transactionData = [
                 'user_id' => $userId,
-                'amount' => $manualAction === 'remittance' ? $manualTotalDeduction : $amountInput,
+                'amount' => $manualAction === 'remittance' ? $manualTotalDeduction : $walletAmount,
                 'type' => $transactionType,
                 'status' => 'approved',
             ];
             if (in_array('currency_code', $transactionColumns, true)) {
-                $transactionData['currency_code'] = $currencyCode;
+                $transactionData['currency_code'] = $transactionCurrencyCode;
             }
             if (in_array('description', $transactionColumns, true)) {
                 $transactionData['description'] = $manualAction === 'remittance'
                     ? "Remittance {$agency} / {$sender} / {$receiver}"
-                    : $manualDescription;
+                    : $transactionDescription;
             }
 
             if (in_array('balance_applied', $transactionColumns, true)) {
@@ -280,7 +293,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $transactionData['created_at'] = date('Y-m-d H:i:s');
             }
             if (in_array('balance_before', $transactionColumns, true)) {
-                $transactionData['balance_before'] = $currencyCode === 'IRT' ? $userBalance : $manualWalletBefore;
+                $transactionData['balance_before'] = $userBalance;
             }
             if (in_array('balance_after', $transactionColumns, true)) {
                 $transactionData['balance_after'] = $balanceAfter;
@@ -302,8 +315,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $transactionPlaceholders = array_fill(0, count($transactionFields), '?');
             $transactionSql = 'INSERT INTO transactions (' . implode(', ', $transactionFields) . ') VALUES (' . implode(', ', $transactionPlaceholders) . ')';
             $transactionStmt = db()->prepare($transactionSql);
-            $transactionStmt->execute(array_values($transactionData));
+            $transactionValues = array_values($transactionData);
+            if (!$transactionStmt->execute($transactionValues)) {
+                $transactionError = $transactionStmt->errorInfo();
+                error_log('MANUAL_TRANSACTION_INSERT_FAILED SQLSTATE=' . ($transactionError[0] ?? 'unknown') . ' driver_code=' . ($transactionError[1] ?? 'unknown') . ' driver_message=' . ($transactionError[2] ?? 'unknown'));
+                throw new RuntimeException('MANUAL_TRANSACTION_INSERT_FAILED');
+            }
             $manualTransactionId = (int)db()->lastInsertId();
+            if (in_array($manualAction, ['increase', 'decrease'], true) && $manualTransactionId <= 0) {
+                throw new RuntimeException('MANUAL_TRANSACTION_INSERT_FAILED');
+            }
+            // Type/status checks are intentionally avoided because triggers or legacy normalization may transform those fields after insert.
+            if (in_array($manualAction, ['increase', 'decrease'], true)) {
+                $verifyTransactionStmt = db()->prepare('SELECT id FROM transactions WHERE id = ? AND user_id = ? LIMIT 1');
+                $verifyTransactionStmt->execute([$manualTransactionId, $userId]);
+                if ((int)$verifyTransactionStmt->fetchColumn() !== $manualTransactionId) {
+                    throw new RuntimeException('MANUAL_TRANSACTION_INSERT_FAILED');
+                }
+            }
             if ($manualAction === 'increase' && is_array($creditResult) && !empty($creditResult['settlements'])) {
                 $paymentIds = array_values(array_filter(array_map(
                     static fn (array $settlement): int => (int)($settlement['payment_id'] ?? 0),
@@ -320,7 +349,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'manual_operation',
                 'users',
                 $userId,
-                "عملیات دستی {$manualAction} برای کاربر {$mobile} به مبلغ {$amountInput}"
+                "عملیات دستی {$manualAction} برای کاربر {$mobile} به مبلغ {$walletAmount} IRT"
             );
             db()->commit();
             unset($_SESSION['manual_operation_nonce']);
@@ -333,9 +362,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (str_starts_with($errorMessage, 'Insufficient balance in ')) {
                 flash('error', 'موجودی کیف‌پول ' . $currencyCode . ' برای این برداشت کافی نیست.');
             } elseif ($errorMessage === 'Insufficient wallet balance.') {
-                flash('error', 'موجودی کیف‌پول تومان کافی نیست.');
+                flash('error', 'موجودی کیف‌پول تومان برای مبلغ تبدیل‌شده کافی نیست.');
+            } elseif ($errorMessage === 'MANUAL_CONVERSION_RATE_MISSING') {
+                flash('error', 'نرخ تبدیل فعال برای ارز انتخاب‌شده یافت نشد.');
+            } elseif ($errorMessage === 'MANUAL_CONVERSION_AMOUNT_INVALID') {
+                flash('error', 'محاسبه مبلغ تومانی از نرخ ثبت‌شده ممکن نشد.');
             } elseif ($errorMessage === 'MANUAL_OPERATION_SCHEMA_MISSING') {
-                flash('error', 'برای عملیات چندارزی، migration شماره ۰۲۳ را اجرا کنید.');
+                flash('error', 'ساختار جدول تراکنش‌ها برای ثبت عملیات دستی کامل نیست.');
             } elseif ($errorMessage === 'DEBT_SCHEMA_MISSING') {
                 flash('error', 'migration مدیریت بدهی کاربران اجرا نشده است.');
             } elseif ($errorMessage === 'SERVICE_FEE_SCHEMA_MISSING') {
@@ -982,14 +1015,15 @@ render_page_start('مدیریت کاربران', 'users');
           <label class="field-label" for="manualOperationCurrency">ارز کیف‌پول</label>
           <select class="select" id="manualOperationCurrency" name="currency_code" onchange="updateManualCurrencyLabel(this.value)">
             <?php foreach ($manualCurrencyOptions as $code => $currency): ?>
-              <option value="<?= e($code) ?>"><?= e($currency['name']) ?> (<?= e($code) ?>)</option>
+              <option value="<?= e($code) ?>" data-money-unit="<?= e($currency['name']) ?>"><?= e($currency['name']) ?> (<?= e($code) ?>)</option>
             <?php endforeach; ?>
           </select>
           <small>برای حواله، ارز مبدأ طبق روال فعلی تومان است.</small>
         </div>
         <div class="col-6">
           <label class="field-label" id="manualOperationAmountLabel">مبلغ</label>
-          <input class="input" name="amount" type="text" inputmode="decimal" dir="ltr" data-money-input data-money-decimal data-money-words-target="manualOperationAmountWords" required>
+          <input class="input" name="amount" type="text" inputmode="decimal" dir="ltr" data-money-input data-money-decimal data-money-unit="تومان" data-money-words-target="manualOperationAmountWords" required>
+          <small id="manualOperationCurrencyHint">مبلغ واردشده مستقیماً به تومان اعمال می‌شود.</small>
           <div class="money-amount-words" id="manualOperationAmountWords"></div>
         </div>
         <div class="col-12 manual-adjustment-field" id="manualDescriptionField">
@@ -1177,7 +1211,20 @@ render_page_start('مدیریت کاربران', 'users');
 
   function updateManualCurrencyLabel(code) {
     const label = document.getElementById('manualOperationAmountLabel');
+    const hint = document.getElementById('manualOperationCurrencyHint');
     if (label) label.textContent = 'مبلغ (' + code + ')';
+    if (hint) {
+      hint.textContent = code === 'IRT'
+        ? 'مبلغ واردشده مستقیماً به تومان اعمال می‌شود.'
+        : 'مبلغ واردشده بر اساس ارز انتخاب‌شده است و با نرخ فعال به تومان تبدیل می‌شود.';
+    }
+    const amountInput = document.querySelector('#manualOperationsModal input[name="amount"]');
+    const currencySelect = document.getElementById('manualOperationCurrency');
+    if (amountInput) {
+      const selectedOption = currencySelect?.selectedOptions?.[0];
+      amountInput.dataset.moneyUnit = code === 'IRT' ? 'تومان' : (selectedOption?.dataset.moneyUnit || code);
+      window.AfariexMoneyInputs?.refresh(amountInput);
+    }
   }
 
   (function () {

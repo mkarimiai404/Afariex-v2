@@ -71,7 +71,7 @@ const toPersianNum = (num: string | number) => {
 };
 
 const formatPrice = (value: number) => {
-  const safeValue = Number.isFinite(value) ? Math.abs(Math.round(value)) : 0;
+  const safeValue = Number.isFinite(value) ? Math.abs(Math.trunc(value)) : 0;
   const formatted = safeValue.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   return toPersianNum(formatted);
 };

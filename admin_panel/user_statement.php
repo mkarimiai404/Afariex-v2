@@ -7,6 +7,7 @@ require_once __DIR__ . '/../API/includes/remittance_currencies.php';
 require_once __DIR__ . '/balance_view_helpers.php';
 require_once __DIR__ . '/debt_service.php';
 require_once __DIR__ . '/statement_export.php';
+require_once __DIR__ . '/statement_balance_helpers.php';
 
 require_login();
 require_permission('view');
@@ -229,6 +230,7 @@ function statement_add_row(array &$rows, array $row): void
         'amount' => 0.0,
         'effect' => 0.0,
         'running_balance' => 0.0,
+        'balance_before' => null,
         'balance_after' => null,
         'status' => '',
         'source_rank' => 0,
@@ -278,7 +280,16 @@ function statement_build_rows(int $userId): array
         if (statement_has_columns('transactions', ['id', 'user_id', 'amount', 'type', 'status', 'created_at'])) {
             $columns = statement_columns('transactions');
             $descriptionSelect = in_array('description', $columns, true) ? "COALESCE(t.description, '')" : "''";
+            $balanceBeforeSelect = in_array('balance_before', $columns, true) ? 't.balance_before' : 'NULL AS balance_before';
             $balanceAfterSelect = in_array('balance_after', $columns, true) ? 't.balance_after' : 'NULL AS balance_after';
+            $adminIdColumn = null;
+            foreach (['created_by_admin_id', 'operator_id', 'admin_id', 'approved_by_admin_id'] as $candidate) {
+                if (in_array($candidate, $columns, true)) {
+                    $adminIdColumn = $candidate;
+                    break;
+                }
+            }
+            $adminIdSelect = $adminIdColumn !== null ? 't.`' . $adminIdColumn . '` AS admin_id' : 'NULL AS admin_id';
             $providerReferenceSelect = in_array('provider_ref_code', $columns, true) ? "COALESCE(t.provider_ref_code, '') AS provider_reference" : "'' AS provider_reference";
             $trackingSelect = in_array('withdrawal_reference', $columns, true) && in_array('tracking_code', $columns, true)
                 ? "CASE WHEN t.type IN ('withdraw', 'withdrawal') THEN COALESCE(NULLIF(t.withdrawal_reference, ''), t.tracking_code) ELSE t.tracking_code END"
@@ -288,7 +299,7 @@ function statement_build_rows(int $userId): array
             $rechargeSelect = ", '' AS recharge_trans_id, '' AS recharge_ref_code, '' AS recharge_error_code, '' AS recharge_error_msg";
             $rechargeColumns = statement_columns('mobile_recharges');
             if (in_array('idempotency_key', $columns, true) && in_array('order_id', $rechargeColumns, true)) {
-                $rechargeJoin = ' LEFT JOIN mobile_recharges mr ON mr.order_id = t.idempotency_key AND t.type = \'topup\'';
+                $rechargeJoin = ' LEFT JOIN mobile_recharges mr ON mr.order_id COLLATE utf8mb4_unicode_ci = t.idempotency_key COLLATE utf8mb4_unicode_ci AND t.type = \'topup\'';
                 $rechargeSelect = ', '
                     . (in_array('trans_id', $rechargeColumns, true) ? "COALESCE(mr.trans_id, '')" : "''") . ' AS recharge_trans_id, '
                     . (in_array('ref_code', $rechargeColumns, true) ? "COALESCE(mr.ref_code, '')" : "''") . ' AS recharge_ref_code, '
@@ -297,8 +308,8 @@ function statement_build_rows(int $userId): array
             }
             $feeReady = statement_has_columns('service_fee_transactions', ['source_type', 'source_id', 'fee_amount', 'total_amount']);
             $feeSelect = $feeReady ? ', COALESCE(sft.fee_amount, 0) AS fee_amount, COALESCE(sft.total_amount, t.amount) AS total_amount' : ', 0 AS fee_amount, t.amount AS total_amount';
-            $feeJoin = $feeReady ? " LEFT JOIN service_fee_transactions sft ON sft.source_type = CASE WHEN t.type IN ('withdraw', 'withdrawal') THEN 'withdrawal' ELSE t.type END AND sft.source_id = t.id" : '';
-            $stmt = db()->prepare("SELECT t.id, t.amount, t.type, t.status, t.created_at, {$currencySelect} AS currency, {$descriptionSelect} AS description, {$trackingSelect} AS reference, {$balanceAfterSelect}, {$providerReferenceSelect}{$feeSelect}{$rechargeSelect} FROM transactions t{$feeJoin}{$rechargeJoin} WHERE t.user_id = ? ORDER BY t.created_at ASC, t.id ASC");
+            $feeJoin = $feeReady ? " LEFT JOIN service_fee_transactions sft ON sft.source_type COLLATE utf8mb4_unicode_ci = CASE WHEN t.type IN ('withdraw', 'withdrawal') THEN 'withdrawal' ELSE t.type END COLLATE utf8mb4_unicode_ci AND sft.source_id = t.id" : '';
+            $stmt = db()->prepare("SELECT t.id, t.amount, t.type, t.status, t.created_at, {$currencySelect} AS currency, {$descriptionSelect} AS description, {$trackingSelect} AS reference, {$balanceBeforeSelect}, {$balanceAfterSelect}, {$adminIdSelect}, {$providerReferenceSelect}{$feeSelect}{$rechargeSelect} FROM transactions t{$feeJoin}{$rechargeJoin} WHERE t.user_id = ? ORDER BY t.created_at ASC, t.id ASC");
             $stmt->execute([$userId]);
             $sourceRows = $stmt->fetchAll();
             error_log('[USER_STATEMENT_DEBUG] user_id=' . $userId . ' transactions rows=' . count($sourceRows));
@@ -342,6 +353,10 @@ function statement_build_rows(int $userId): array
                 if ($type === 'topup' && trim((string)($row['recharge_error_msg'] ?? '')) !== '') {
                     $description .= ' / شرح خطای شارژ: ' . trim((string)$row['recharge_error_msg']);
                 }
+                $adminId = (int)($row['admin_id'] ?? 0);
+                if (in_array($type, ['manual_deposit', 'manual_withdrawal'], true) && $adminId > 0) {
+                    $description .= ' / مدیر #' . $adminId;
+                }
                 $topupReference = trim((string)($row['recharge_ref_code'] ?? '')) ?: trim((string)($row['recharge_trans_id'] ?? ''));
                 statement_add_row($rows, [
                     'date' => (string)($row['created_at'] ?? ''),
@@ -355,6 +370,7 @@ function statement_build_rows(int $userId): array
                         ? ($row['total_amount'] ?? $row['amount'] ?? '0')
                         : ($row['amount'] ?? '0')),
                     'effect' => $effect,
+                    'balance_before' => $row['balance_before'] === null ? null : (string)$row['balance_before'],
                     'balance_after' => ($type === 'topup' && in_array($status, ['failed', 'refunded'], true)) || $row['balance_after'] === null
                         ? null
                         : (string)$row['balance_after'],
@@ -624,29 +640,7 @@ function statement_filtered_report(array $user, ?string $from, ?string $to, ?str
         ];
     }
 
-    $effectsByCurrency = [];
-    foreach ($allRows as $row) {
-        $code = statement_currency_code($row['currency'] ?? 'IRT');
-        $effectsByCurrency[$code] = ($effectsByCurrency[$code] ?? 0.0) + (float)($row['effect'] ?? 0);
-    }
-    $runningByCurrency = [];
-    foreach ($currencySummaries as $code => $currencySummary) {
-        $runningByCurrency[$code] = $currencySummary['wallet_tracked']
-            ? (float)$currencySummary['wallet_balance'] - (float)($effectsByCurrency[$code] ?? 0)
-            : 0.0;
-    }
-    foreach ($allRows as &$row) {
-        $code = statement_currency_code($row['currency'] ?? 'IRT');
-        $tracked = (bool)($currencySummaries[$code]['wallet_tracked'] ?? false);
-        if ($tracked && $row['balance_after'] !== null && is_numeric($row['balance_after'])) {
-            $runningByCurrency[$code] = (float)$row['balance_after'];
-        } else {
-            $runningByCurrency[$code] = ($runningByCurrency[$code] ?? 0.0) + (float)($row['effect'] ?? 0);
-        }
-        $row['running_balance'] = $runningByCurrency[$code];
-        $row['balance_tracked'] = $tracked;
-    }
-    unset($row);
+    $allRows = statement_assign_running_balances($allRows, $currencySummaries);
 
     $fromSql = statement_date_sql($from, false);
     $toSql = statement_date_sql($to, true);
@@ -695,6 +689,7 @@ function statement_export_rows(array $rows, int $offset = 0): array
             statement_currency_code($row['currency'] ?? 'IRT'),
             statement_direction_fa((string)$row['direction']),
             statement_status_fa((string)$row['status']),
+            empty($row['balance_tracked']) ? '—' : statement_money((float)($row['running_balance_before'] ?? 0), statement_currency_code($row['currency'] ?? 'IRT')),
             empty($row['balance_tracked']) ? '—' : statement_money((float)($row['running_balance'] ?? 0), statement_currency_code($row['currency'] ?? 'IRT')),
             (string)$row['reference'],
         ];
@@ -784,7 +779,7 @@ function statement_render_print(array $report, ?string $from, ?string $to): void
             </div>
             <table>
                 <thead>
-                    <tr><th>ردیف</th><th>تاریخ</th><th>نوع فعالیت</th><th>شرح فعالیت</th><th>مبلغ</th><th>ارز</th><th>جهت</th><th>وضعیت</th><th>مانده پس از تراکنش</th><th>کد رهگیری</th></tr>
+                    <tr><th>ردیف</th><th>تاریخ</th><th>نوع فعالیت</th><th>شرح فعالیت</th><th>مبلغ</th><th>ارز</th><th>جهت</th><th>وضعیت</th><th>مانده قبل از تراکنش</th><th>مانده پس از تراکنش</th><th>کد رهگیری</th></tr>
                 </thead>
                 <tbody>
                     <?php foreach (statement_export_rows($report['rows']) as $row): ?>
@@ -795,7 +790,7 @@ function statement_render_print(array $report, ?string $from, ?string $to): void
                         </tr>
                     <?php endforeach; ?>
                     <?php if (!$report['rows']): ?>
-                        <tr><td colspan="10" style="text-align:center;color:#64748b;padding:18px;">فعالیت مالی برای این کاربر ثبت نشده است.</td></tr>
+                        <tr><td colspan="11" style="text-align:center;color:#64748b;padding:18px;">فعالیت مالی برای این کاربر ثبت نشده است.</td></tr>
                     <?php endif; ?>
                 </tbody>
             </table>
@@ -951,11 +946,11 @@ render_page_start('صورتحساب کاربر', 'users');
   </div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>ردیف</th><th>تاریخ</th><th>نوع فعالیت</th><th>شرح فعالیت</th><th>مبلغ</th><th>ارز</th><th>جهت</th><th>وضعیت</th><th>مانده پس از تراکنش</th><th>کد رهگیری</th></tr></thead>
+      <thead><tr><th>ردیف</th><th>تاریخ</th><th>نوع فعالیت</th><th>شرح فعالیت</th><th>مبلغ</th><th>ارز</th><th>جهت</th><th>وضعیت</th><th>مانده قبل از تراکنش</th><th>مانده پس از تراکنش</th><th>کد رهگیری</th></tr></thead>
       <tbody>
       <?php $displayRows = statement_export_rows($pageRows, ($pageData['page'] - 1) * $pageData['page_size']); ?>
       <?php if (!$displayRows): ?>
-        <tr><td colspan="10" style="text-align:center;color:#64748b;padding:20px;">فعالیت مالی برای این کاربر ثبت نشده است.</td></tr>
+        <tr><td colspan="11" style="text-align:center;color:#64748b;padding:20px;">فعالیت مالی برای این کاربر ثبت نشده است.</td></tr>
       <?php endif; ?>
       <?php foreach ($displayRows as $row): ?>
         <tr>

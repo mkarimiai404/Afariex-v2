@@ -45,7 +45,7 @@ function exchange_rate_greatest_common_divisor(int $left, int $right): int
 
 function exchange_rate_parse_minor_units(string $value, int $precision = 2): ?int
 {
-    $precision = max(0, min(2, $precision));
+    $precision = max(0, min(4, $precision));
     $fractionPattern = $precision === 0 ? '' : '(?:\\.(\\d{1,' . $precision . '}))?';
     if (preg_match('/^(0|[1-9]\\d{0,15})' . $fractionPattern . '$/', trim($value), $parts) !== 1) return null;
     $whole = (int)$parts[1];
@@ -66,9 +66,18 @@ function exchange_rate_client_amount_matches_calculation(string $clientAmount, s
 }
 
 /** Calculate destination minor units with integer ratio arithmetic and one half-up rounding. */
-function exchange_rate_calculate_destination_amount(string $sourceAmount, string $rate, string $commission = '0'): ?string
+function exchange_rate_calculate_destination_amount(
+    string $sourceAmount,
+    string $rate,
+    string $commission = '0',
+    int $sourcePrecision = 2,
+    int $destinationPrecision = 2,
+    bool $invertRate = false
+): ?string
 {
-    $sourceMinorUnits = exchange_rate_parse_minor_units($sourceAmount, 2);
+    $sourcePrecision = max(0, min(4, $sourcePrecision));
+    $destinationPrecision = max(0, min(4, $destinationPrecision));
+    $sourceMinorUnits = exchange_rate_parse_minor_units($sourceAmount, $sourcePrecision);
     if ($sourceMinorUnits === null || $sourceMinorUnits <= 0) return null;
     if (preg_match('/^(0|[1-9]\\d{0,17})(?:\\.(\\d{1,12}))?$/', trim($rate), $rateParts) !== 1) return null;
     if (preg_match('/^(0|[1-9]\\d{0,2})(?:\\.(\\d{1,4}))?$/', trim($commission), $commissionParts) !== 1) return null;
@@ -90,8 +99,14 @@ function exchange_rate_calculate_destination_amount(string $sourceAmount, string
     if ($commissionFactor < 0) return null;
 
     // Reduce before multiplying so valid financial values stay within PHP_INT_MAX.
-    $numeratorFactors = [$sourceMinorUnits, $rateNumerator, $commissionFactor];
-    $denominatorFactors = [$rateScale, $commissionDenominator];
+    $sourceScale = 10 ** $sourcePrecision;
+    $destinationScale = 10 ** $destinationPrecision;
+    $numeratorFactors = $invertRate
+        ? [$sourceMinorUnits, $rateScale, $commissionFactor, $destinationScale]
+        : [$sourceMinorUnits, $rateNumerator, $commissionFactor, $destinationScale];
+    $denominatorFactors = $invertRate
+        ? [$sourceScale, $rateNumerator, $commissionDenominator]
+        : [$sourceScale, $rateScale, $commissionDenominator];
     foreach ($numeratorFactors as $numeratorIndex => $numeratorFactor) {
         foreach ($denominatorFactors as $denominatorIndex => $denominatorFactor) {
             $gcd = exchange_rate_greatest_common_divisor($numeratorFactor, $denominatorFactor);
@@ -118,7 +133,9 @@ function exchange_rate_calculate_destination_amount(string $sourceAmount, string
     if ($remainder >= $denominator - $remainder) $minorUnits++;
     if ($minorUnits <= 0) return null;
 
-    return intdiv($minorUnits, 100) . '.' . str_pad((string)($minorUnits % 100), 2, '0', STR_PAD_LEFT);
+    $whole = intdiv($minorUnits, $destinationScale);
+    if ($destinationPrecision === 0) return (string)$whole;
+    return $whole . '.' . str_pad((string)($minorUnits % $destinationScale), $destinationPrecision, '0', STR_PAD_LEFT);
 }
 
 function exchange_rate_current_pair(string $source, string $destination, bool $forUpdate = false): ?array

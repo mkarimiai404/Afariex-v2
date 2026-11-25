@@ -33,7 +33,7 @@ const iconByType: Record<string, keyof typeof Ionicons.glyphMap> = {
   remittance: 'send-outline', deposit: 'wallet-outline', withdrawal: 'arrow-down-circle-outline', exchange: 'swap-horizontal-outline',
 };
 
-const formatAmount = (value: number) => `${Number(value || 0).toLocaleString('fa-IR')} تومان`;
+const formatAmount = (value: number) => `${Math.trunc(Number(value || 0)).toLocaleString('fa-IR')} تومان`;
 
 const formatDate = (value: string | null) => {
   if (!value) return 'تاریخ ثبت نشده';

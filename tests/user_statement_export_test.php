@@ -41,14 +41,18 @@ $report = [
     'rows' => [[
         'date' => '2026-10-12 10:00:00', 'type' => 'deposit', 'description' => '=1+1 <tag>',
         'amount' => '1000.00', 'direction' => 'credit', 'status' => 'approved',
-        'balance_after' => '1200.00', 'reference' => '',
+        'balance_before' => '200.00', 'balance_after' => '1200.00',
+        'running_balance_before' => 200.0, 'running_balance' => 1200.0,
+        'balance_tracked' => true, 'reference' => '',
     ]],
 ];
 $parts = statement_xlsx_parts($report, null, null);
 $sheet = $parts['xl/worksheets/sheet1.xml'];
 expect(isset($parts['[Content_Types].xml'], $parts['xl/workbook.xml']), 'OOXML package parts exist');
 expect(str_contains($sheet, '<c r="B3" t="inlineStr">'), 'mobile number is stored as text');
-expect(str_contains($sheet, '<c r="E12"><v>1000.00</v></c>'), 'amount is an exact numeric cell');
+expect(str_contains($sheet, '<c r="E10"><v>1000.00</v></c>'), 'amount is an exact numeric cell');
+expect(str_contains($sheet, '<c r="I10"><v>200</v></c>'), 'running balance before is exported');
+expect(str_contains($sheet, '<c r="J10"><v>1200</v></c>'), 'running balance after is exported');
 expect(str_contains($sheet, '<c r="B2" t="inlineStr">'), 'formula-like user value is stored as text');
 expect(!str_contains($sheet, '<f>'), 'user text cannot become an Excel formula');
 expect(str_contains($sheet, '=1+1 &lt;tag&gt;'), 'XML text is escaped');

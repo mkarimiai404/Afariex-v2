@@ -5,6 +5,8 @@ require_once __DIR__ . '/layout.php';
 require_once __DIR__ . '/balance_view_helpers.php';
 require_once __DIR__ . '/service_fee_service.php';
 require_once __DIR__ . '/money_input_helpers.php';
+require_once __DIR__ . '/exchange_rate_service.php';
+require_once __DIR__ . '/../API/includes/remittance_currencies.php';
 require_once __DIR__ . '/../API/includes/remittance_destination_countries.php';
 
 require_login();
@@ -19,9 +21,79 @@ $exportExcel = (string)($_GET['export'] ?? '') === 'excel';
 $exportPrint = (string)($_GET['export'] ?? '') === 'print';
 $destinationCountries = remittance_destination_countries();
 
+function remittance_table_columns(PDO $pdo, string $table): array
+{
+    $statement = $pdo->prepare('SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?');
+    $statement->execute([$table]);
+    return $statement->fetchAll(PDO::FETCH_COLUMN, 0);
+}
+
+function remittance_clean_amount(string $value): ?string
+{
+    $value = normalize_persian_digits(trim($value));
+    $value = str_replace([',', '٬', ' '], '', $value);
+    return preg_match('/^(?:0|[1-9]\d{0,15})(?:\.\d{1,4})?$/', $value) === 1 && (float)$value > 0 ? $value : null;
+}
+
+function remittance_amount_matches(string $submitted, string $calculated, int $precision): bool
+{
+    $submittedMinor = exchange_rate_parse_minor_units($submitted, $precision);
+    $calculatedMinor = exchange_rate_parse_minor_units($calculated, $precision);
+    return $submittedMinor !== null && $calculatedMinor !== null && abs($submittedMinor - $calculatedMinor) <= 1;
+}
+
+function remittance_active_pair(PDO $pdo, string $source, string $destination, bool $lock = false): ?array
+{
+    $columns = remittance_table_columns($pdo, 'exchange_rates');
+    if (!in_array('source_currency', $columns, true) || !in_array('destination_currency', $columns, true)
+        || !in_array('exchange_rate', $columns, true) || !in_array('is_active', $columns, true)
+        || !in_array('effective_date', $columns, true)) return null;
+    $sql = 'SELECT id, source_currency, destination_currency, exchange_rate, commission_percentage FROM exchange_rates WHERE source_currency = ? AND destination_currency = ? AND is_active = 1 AND effective_date <= CURRENT_DATE ORDER BY effective_date DESC, id DESC LIMIT 1';
+    if ($lock) $sql .= ' FOR UPDATE';
+    $statement = $pdo->prepare($sql);
+    $statement->execute([$source, $destination]);
+    $row = $statement->fetch(PDO::FETCH_ASSOC) ?: null;
+    return $row ? exchange_rate_normalize_directional_row($row) : null;
+}
+
+function remittance_amount_to_irt(PDO $pdo, string $currency, string $amount): ?string
+{
+    if ($currency === 'IRT') return number_format((float)$amount, 2, '.', '');
+    $pair = remittance_active_pair($pdo, $currency, 'IRT', true);
+    $invert = false;
+    if (!$pair) {
+        $pair = remittance_active_pair($pdo, 'IRT', $currency, true);
+        $invert = true;
+    }
+    if (!$pair || (float)$pair['exchange_rate'] <= 0) return null;
+    $value = (float)$amount * (float)$pair['exchange_rate'];
+    if ($invert) $value = (float)$amount / (float)$pair['exchange_rate'];
+    return is_finite($value) && $value > 0 ? number_format($value, 2, '.', '') : null;
+}
+
+function remittance_insert_transaction(PDO $pdo, array $columns, int $userId, float $amountIrt, string $type, string $description, string $currency = 'IRT'): void
+{
+    $fields = ['user_id', 'amount', 'type', 'status', 'balance_applied', 'description'];
+    $values = [$userId, $amountIrt, $type, 'approved', 1, $description];
+    if (in_array('currency_code', $columns, true)) {
+        $fields[] = 'currency_code';
+        $values[] = $currency;
+    }
+    $sql = 'INSERT INTO transactions (' . implode(', ', $fields) . ') VALUES (' . implode(', ', array_fill(0, count($fields), '?')) . ')';
+    $pdo->prepare($sql)->execute($values);
+}
+
+if (($_GET['ajax'] ?? '') === 'pair-rate') {
+    header('Content-Type: application/json; charset=utf-8');
+    $source = strtoupper(trim((string)($_GET['source'] ?? '')));
+    $destination = strtoupper(trim((string)($_GET['destination'] ?? '')));
+    $pair = remittance_active_pair(db(), $source, $destination);
+    echo json_encode($pair ? ['success' => true, 'data' => $pair] : ['success' => false, 'message' => 'نرخ فعال برای این جفت ارز موجود نیست.'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
 // دریافت نرخ فعال تبدیل افغانی به تومان
-$activeRateRow = db()->query("SELECT afn_to_toman FROM exchange_rates WHERE source_currency = 'IRT' AND destination_currency = 'AFN' AND is_active = 1 AND effective_date <= CURRENT_DATE ORDER BY effective_date DESC, id DESC LIMIT 1")->fetch();
-$activeRate = $activeRateRow ? (float)$activeRateRow['afn_to_toman'] : 0;
+$activeRate = 0;
 
 // دریافت لیست نمایندگی‌ها
 $agencies = db()->query('SELECT name FROM agencies ORDER BY name ASC')->fetchAll(PDO::FETCH_COLUMN);
@@ -36,11 +108,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $destinationCountry = strtoupper(trim((string)($_POST['destination_country'] ?? '')));
         $sender = trim($_POST['sender'] ?? '');
         $receiver = trim($_POST['receiver'] ?? '');
-        $amountToman = trim((string)($_POST['amount_toman'] ?? ''));
-        $amountAfghani = trim((string)($_POST['amount_afghani'] ?? ''));
-        $isValidRemittanceAmount = static function (string $value): bool {
-            return preg_match('/^(?:0|[1-9]\d*)(?:\.\d+)?$/', $value) === 1 && (float)$value > 0;
-        };
+        $amountSource = remittance_clean_amount((string)($_POST['amount_toman'] ?? ''));
+        $amountDestination = trim((string)($_POST['amount_afghani'] ?? ''));
+        $sourceCurrency = strtoupper(trim((string)($_POST['source_currency'] ?? 'IRT')));
+        $destinationCurrency = strtoupper(trim((string)($_POST['destination_currency'] ?? 'AFN')));
         $status = trim($_POST['status'] ?? 'pending');
         $allowedStatuses = ['pending', 'approved', 'rejected', 'paid'];
 
@@ -63,7 +134,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 header('Location: remittances.php?page=' . $page);
                 exit;
             }
-            if ($agency === '' || !remittance_destination_country_is_supported($destinationCountry) || $sender === '' || $receiver === '' || !$isValidRemittanceAmount($amountToman) || !$isValidRemittanceAmount($amountAfghani) || $status === '') {
+            if ($agency === '' || !remittance_destination_country_is_supported($destinationCountry) || $sender === '' || $receiver === '' || !$amountSource || !$amountDestination || !isset(exchange_rate_supported_currencies()[$sourceCurrency]) || !isset(exchange_rate_supported_currencies()[$destinationCurrency]) || $sourceCurrency === $destinationCurrency || $status === '') {
                 flash('error', 'لطفاً تمام فیلدهای ضروری را وارد کنید.');
             } else {
                 if (!in_array($status, $allowedStatuses, true)) {
@@ -72,6 +143,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     db()->beginTransaction();
 
                     try {
+                        $rate = remittance_active_pair(db(), $sourceCurrency, $destinationCurrency, true);
+                        if (!$rate) throw new RuntimeException('REMITTANCE_RATE_UNAVAILABLE');
+                        $calculatedDestination = exchange_rate_calculate_destination_amount($amountSource, (string)$rate['exchange_rate'], (string)($rate['commission_percentage'] ?? '0'), remittance_currency_precision($sourceCurrency), remittance_currency_precision($destinationCurrency));
+                        if ($calculatedDestination === null || !remittance_amount_matches($amountDestination, $calculatedDestination, remittance_currency_precision($destinationCurrency))) throw new RuntimeException('REMITTANCE_AMOUNT_MISMATCH');
+                        $walletAmount = remittance_amount_to_irt(db(), $sourceCurrency, $amountSource);
+                        if ($walletAmount === null) throw new RuntimeException('REMITTANCE_WALLET_CONVERSION_UNAVAILABLE');
+                        $remittanceColumns = remittance_table_columns(db(), 'remittances');
+                        if (!in_array('source_currency', $remittanceColumns, true) || !in_array('destination_currency', $remittanceColumns, true) || !in_array('wallet_amount_irt', $remittanceColumns, true)) throw new RuntimeException('REMITTANCE_SCHEMA_MIGRATION_REQUIRED');
                         $userStmt = db()->prepare('SELECT id, balance FROM users WHERE mobile = ? FOR UPDATE');
                         $userStmt->execute([$mobile]);
                         $userRow = $userStmt->fetch();
@@ -85,25 +164,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                         $currentBalance = (float)($userRow['balance'] ?? 0);
 
-                        $fee = service_fee_calculate('remittance', (int)$amountToman, db());
-                        $totalDeduction = (string)$fee['total_amount'];
+                        $fee = service_fee_calculate('remittance', (int)round((float)$walletAmount), db());
+                        $feeAmount = (int)$fee['fee_amount'];
+                        $totalDeduction = (float)$walletAmount + $feeAmount;
                         $shouldChargeWallet = $status !== 'rejected';
                         if ($shouldChargeWallet) {
-                            $sufficientStmt = db()->prepare('SELECT id FROM users WHERE id = ? AND balance >= ?');
-                            $sufficientStmt->execute([$userId, $totalDeduction]);
-                            if (!$sufficientStmt->fetchColumn()) {
+                            if ($currentBalance + 0.000001 < $totalDeduction) {
                                 db()->rollBack();
                                 flash('error', 'موجودی کاربر برای مبلغ حواله و کارمزد کافی نیست.');
                                 header('Location: remittances.php?page=' . $page);
                                 exit;
                             }
 
-                            $deductStmt = db()->prepare('UPDATE users SET balance = balance - ? WHERE id = ?');
-                            $deductStmt->execute([$totalDeduction, $userId]);
+                            db()->prepare('UPDATE users SET balance = balance - ? WHERE id = ?')->execute([$totalDeduction, $userId]);
                         }
 
-                        $stmt = db()->prepare('INSERT INTO remittances (user_id, agency, destination_country, sender, receiver, amount_toman, amount_afghani, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())');
-                        $stmt->execute([$userId, $agency, $destinationCountry, $sender, $receiver, $amountToman, $amountAfghani, $status]);
+                        $insert = ['user_id' => $userId, 'agency' => $agency, 'destination_country' => $destinationCountry, 'sender' => $sender, 'receiver' => $receiver, 'amount_toman' => $amountSource, 'amount_afghani' => $calculatedDestination, 'status' => $status, 'created_at' => date('Y-m-d H:i:s'), 'source_currency' => $sourceCurrency, 'destination_currency' => $destinationCurrency, 'exchange_rate_id' => (int)$rate['id'], 'exchange_rate_value' => (string)$rate['exchange_rate'], 'exchange_commission_percentage' => (string)($rate['commission_percentage'] ?? '0'), 'wallet_amount_irt' => $walletAmount];
+                        $insert = array_intersect_key($insert, array_flip($remittanceColumns));
+                        $insertStmt = db()->prepare('INSERT INTO remittances (' . implode(', ', array_map(static fn(string $column): string => '`' . $column . '`', array_keys($insert))) . ') VALUES (' . implode(', ', array_fill(0, count($insert), '?')) . ')');
+                        $insertStmt->execute(array_values($insert));
                         $remittanceId = (int)db()->lastInsertId();
                         if ($shouldChargeWallet) {
                             $feeStatus = in_array($status, ['approved', 'paid'], true) ? 'collected' : 'pending';
@@ -111,12 +190,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
 
                         if ($shouldChargeWallet) {
-                            $transactionStmt = db()->prepare("
-                                INSERT INTO transactions
-                                    (user_id, amount, type, status, balance_applied, description)
-                                VALUES (?, ?, 'remittance', 'approved', 1, ?)
-                            ");
-                            $transactionStmt->execute([$userId, $totalDeduction, "رسید حواله #{$remittanceId}"]);
+                            remittance_insert_transaction(db(), remittance_table_columns(db(), 'transactions'), $userId, $totalDeduction, 'remittance', "رسید حواله #{$remittanceId}");
                         }
 
                         log_activity('create', 'remittances', $remittanceId, "ایجاد حواله برای کاربر {$mobile}");
@@ -127,7 +201,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         if (db()->inTransaction()) {
                             db()->rollBack();
                         }
-                        throw $e;
+                        if (str_contains($e->getMessage(), 'REMITTANCE_')) {
+                            flash('error', match ($e->getMessage()) {
+                                'REMITTANCE_RATE_UNAVAILABLE' => 'برای این جفت ارز نرخ فعال و معتبر پیدا نشد.',
+                                'REMITTANCE_AMOUNT_MISMATCH' => 'مبلغ مقصد با نرخ فعال مطابقت ندارد؛ نرخ را تازه کنید.',
+                                'REMITTANCE_WALLET_CONVERSION_UNAVAILABLE' => 'تبدیل ارز مبدا به تومان برای کسر از کیف پول در دسترس نیست.',
+                                default => 'ابتدا مایگریشن حواله‌های چندارزی را اجرا کنید.',
+                            });
+                        } else {
+                            throw $e;
+                        }
                     }
                 }
             }
@@ -135,7 +218,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             require_permission('edit');
             $id = (int)($_POST['id'] ?? 0);
             $destinationCountry = strtoupper(trim((string)($_POST['destination_country'] ?? '')));
-            if ($id <= 0 || $agency === '' || ($destinationCountry !== '' && !remittance_destination_country_is_supported($destinationCountry)) || $sender === '' || $receiver === '' || !$isValidRemittanceAmount($amountToman) || !$isValidRemittanceAmount($amountAfghani) || $status === '') {
+            if ($id <= 0 || $agency === '' || ($destinationCountry !== '' && !remittance_destination_country_is_supported($destinationCountry)) || $sender === '' || $receiver === '' || !$amountSource || !$amountDestination || !isset(exchange_rate_supported_currencies()[$sourceCurrency]) || !isset(exchange_rate_supported_currencies()[$destinationCurrency]) || $sourceCurrency === $destinationCurrency || $status === '') {
                 flash('error', 'اطلاعات ویرایش نامعتبر است.');
             } else {
                 if (!in_array($status, $allowedStatuses, true)) {
@@ -144,7 +227,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     db()->beginTransaction();
 
                     try {
-                        $remittanceStmt = db()->prepare('SELECT user_id, amount_toman, status, destination_country FROM remittances WHERE id = ? FOR UPDATE');
+                        $remittanceColumns = remittance_table_columns(db(), 'remittances');
+                        if (!in_array('source_currency', $remittanceColumns, true) || !in_array('destination_currency', $remittanceColumns, true) || !in_array('wallet_amount_irt', $remittanceColumns, true)) throw new RuntimeException('REMITTANCE_SCHEMA_MIGRATION_REQUIRED');
+                        $rate = remittance_active_pair(db(), $sourceCurrency, $destinationCurrency, true);
+                        if (!$rate) throw new RuntimeException('REMITTANCE_RATE_UNAVAILABLE');
+                        $calculatedDestination = exchange_rate_calculate_destination_amount($amountSource, (string)$rate['exchange_rate'], (string)($rate['commission_percentage'] ?? '0'), remittance_currency_precision($sourceCurrency), remittance_currency_precision($destinationCurrency));
+                        if ($calculatedDestination === null || !remittance_amount_matches($amountDestination, $calculatedDestination, remittance_currency_precision($destinationCurrency))) throw new RuntimeException('REMITTANCE_AMOUNT_MISMATCH');
+                        $walletAmount = remittance_amount_to_irt(db(), $sourceCurrency, $amountSource);
+                        if ($walletAmount === null) throw new RuntimeException('REMITTANCE_WALLET_CONVERSION_UNAVAILABLE');
+                        $remittanceStmt = db()->prepare('SELECT user_id, amount_toman, status, destination_country, source_currency, wallet_amount_irt FROM remittances WHERE id = ? FOR UPDATE');
                         $remittanceStmt->execute([$id]);
                         $existingRemittance = $remittanceStmt->fetch();
 
@@ -156,14 +247,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
 
                         $currentStatus = (string)($existingRemittance['status'] ?? '');
-                        $remittanceAmount = (float)($existingRemittance['amount_toman'] ?? 0);
+                        $remittanceAmount = (float)($existingRemittance['wallet_amount_irt'] ?? $existingRemittance['amount_toman'] ?? 0);
                         $ownerUserId = (int)($existingRemittance['user_id'] ?? 0);
+                        if ($ownerUserId !== $userId) throw new RuntimeException('REMITTANCE_OWNER_CHANGE_NOT_ALLOWED');
 
                         $destinationCountry = $destinationCountry !== '' ? $destinationCountry : (string)($existingRemittance['destination_country'] ?? '');
-                        $stmt = db()->prepare('UPDATE remittances SET user_id = ?, agency = ?, destination_country = ?, sender = ?, receiver = ?, amount_toman = ?, amount_afghani = ?, status = ? WHERE id = ?');
-                        $stmt->execute([$userId, $agency, $destinationCountry !== '' ? $destinationCountry : null, $sender, $receiver, $amountToman, $amountAfghani, $status, $id]);
-
-                        if ($status === 'rejected' && $currentStatus !== 'rejected' && $ownerUserId > 0) {
+                        $fee = service_fee_calculate('remittance', (int)round((float)$walletAmount), db());
+                        $oldFee = service_fee_for_source('remittance', $id, db());
+                        $oldTotal = $remittanceAmount + (float)($oldFee['fee_amount'] ?? 0);
+                        $newTotal = (float)$walletAmount + (float)$fee['fee_amount'];
+                        $wasCharged = $currentStatus !== 'rejected';
+                        $willCharge = $status !== 'rejected';
+                        if ($wasCharged && $willCharge) {
+                            $delta = round($newTotal - $oldTotal, 2);
+                            if ($delta > 0) {
+                                $lock = db()->prepare('SELECT balance FROM users WHERE id = ? FOR UPDATE');
+                                $lock->execute([$ownerUserId]);
+                                if ((float)$lock->fetchColumn() + 0.000001 < $delta) throw new RuntimeException('REMITTANCE_INSUFFICIENT_BALANCE');
+                                db()->prepare('UPDATE users SET balance = balance - ? WHERE id = ?')->execute([$delta, $ownerUserId]);
+                                remittance_insert_transaction(db(), remittance_table_columns(db(), 'transactions'), $ownerUserId, $delta, 'remittance', "اصلاح مبلغ حواله #{$id}");
+                            } elseif ($delta < 0) {
+                                db()->prepare('UPDATE users SET balance = balance + ? WHERE id = ?')->execute([abs($delta), $ownerUserId]);
+                                remittance_insert_transaction(db(), remittance_table_columns(db(), 'transactions'), $ownerUserId, abs($delta), 'refund', "اصلاح مبلغ حواله #{$id}");
+                            }
+                        } elseif ($wasCharged && !$willCharge) {
                             $userStmt = db()->prepare('SELECT id, balance FROM users WHERE id = ? FOR UPDATE');
                             $userStmt->execute([$ownerUserId]);
                             $userRow = $userStmt->fetch();
@@ -177,18 +284,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                             $feeRow = service_fee_for_source('remittance', $id, db());
                             $feeAmount = $feeRow ? (int)$feeRow['fee_amount'] : 0;
-                            $refundAmount = $remittanceAmount + $feeAmount;
+                            $refundAmount = $oldTotal;
                             $refundStmt = db()->prepare('UPDATE users SET balance = balance + ? WHERE id = ?');
                             $refundStmt->execute([$refundAmount, $ownerUserId]);
                             service_fee_update_status(db(), 'remittance', $id, 'refunded');
 
-                            $transactionStmt = db()->prepare("
-                                INSERT INTO transactions
-                                    (user_id, amount, type, status, balance_applied, description)
-                                VALUES (?, ?, 'refund', 'approved', 1, 'برگشت وجه بابت رد حواله')
-                            ");
-                            $transactionStmt->execute([$ownerUserId, $remittanceAmount]);
-                        } elseif ($status === 'approved' && $currentStatus === 'rejected' && $ownerUserId > 0) {
+                            remittance_insert_transaction(db(), remittance_table_columns(db(), 'transactions'), $ownerUserId, $refundAmount, 'refund', 'برگشت وجه بابت رد حواله');
+                        } elseif (!$wasCharged && $willCharge) {
                             $userStmt = db()->prepare('SELECT id, balance FROM users WHERE id = ? FOR UPDATE');
                             $userStmt->execute([$ownerUserId]);
                             $userRow = $userStmt->fetch();
@@ -201,9 +303,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             }
 
                             $feeRow = service_fee_for_source('remittance', $id, db());
-                            $calculatedFee = $feeRow ? null : service_fee_calculate('remittance', (int)$remittanceAmount, db());
-                            $feeAmount = $feeRow ? (int)$feeRow['fee_amount'] : (int)$calculatedFee['fee_amount'];
-                            $totalDeduction = $remittanceAmount + $feeAmount;
+                            $feeAmount = (int)$fee['fee_amount'];
+                            $totalDeduction = $newTotal;
                             $userBalance = (float)($userRow['balance'] ?? 0);
 
                             if ($userBalance < $totalDeduction) {
@@ -217,16 +318,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             $deductStmt->execute([$totalDeduction, $ownerUserId]);
                             if ($feeRow) {
                                 service_fee_update_status(db(), 'remittance', $id, 'collected');
-                            } elseif (is_array($calculatedFee)) {
-                                service_fee_record(db(), $ownerUserId, $calculatedFee, 'remittance', $id, 'collected');
+                            } else {
+                                service_fee_record(db(), $ownerUserId, $fee, 'remittance', $id, in_array($status, ['approved', 'paid'], true) ? 'collected' : 'pending');
                             }
 
-                            $transactionStmt = db()->prepare("
-                                INSERT INTO transactions
-                                    (user_id, amount, type, status, balance_applied, description)
-                                VALUES (?, ?, 'remittance', 'approved', 1, 'کسر مجدد وجه بابت تایید حواله')
-                            ");
-                            $transactionStmt->execute([$ownerUserId, $remittanceAmount]);
+                            remittance_insert_transaction(db(), remittance_table_columns(db(), 'transactions'), $ownerUserId, $totalDeduction, 'remittance', 'کسر مجدد وجه بابت تایید حواله');
+                        }
+
+                        $updates = ['user_id' => $userId, 'agency' => $agency, 'destination_country' => $destinationCountry !== '' ? $destinationCountry : null, 'sender' => $sender, 'receiver' => $receiver, 'amount_toman' => $amountSource, 'amount_afghani' => $calculatedDestination, 'status' => $status, 'source_currency' => $sourceCurrency, 'destination_currency' => $destinationCurrency, 'exchange_rate_id' => (int)$rate['id'], 'exchange_rate_value' => (string)$rate['exchange_rate'], 'exchange_commission_percentage' => (string)($rate['commission_percentage'] ?? '0'), 'wallet_amount_irt' => $walletAmount];
+                        $updates = array_intersect_key($updates, array_flip($remittanceColumns));
+                        $setSql = implode(', ', array_map(static fn(string $column): string => '`' . $column . '` = ?', array_keys($updates)));
+                        db()->prepare('UPDATE remittances SET ' . $setSql . ' WHERE id = ?')->execute([...array_values($updates), $id]);
+
+                        if ($willCharge) {
+                            $feeStatus = in_array($status, ['approved', 'paid'], true) ? 'collected' : 'pending';
+                            if ($oldFee) {
+                                db()->prepare('UPDATE service_fee_transactions SET original_amount = ?, configured_fee_type = ?, configured_fee_value = ?, fee_amount = ?, total_amount = ?, status = ?, status_updated_at = NOW() WHERE id = ?')
+                                    ->execute([$fee['original_amount'], $fee['fee_type'], $fee['fee_value'], $fee['fee_amount'], $fee['total_amount'], $feeStatus, $oldFee['id']]);
+                                if ($feeStatus === 'collected') service_fee_update_status(db(), 'remittance', $id, 'collected');
+                            } else {
+                                service_fee_record(db(), $ownerUserId, $fee, 'remittance', $id, $feeStatus);
+                            }
                         }
 
                         if (in_array($status, ['approved', 'paid'], true)) {
@@ -242,7 +354,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         if (db()->inTransaction()) {
                             db()->rollBack();
                         }
-                        throw $e;
+                        if (str_contains($e->getMessage(), 'REMITTANCE_')) {
+                            flash('error', match ($e->getMessage()) {
+                                'REMITTANCE_RATE_UNAVAILABLE' => 'برای این جفت ارز نرخ فعال و معتبر پیدا نشد.',
+                                'REMITTANCE_AMOUNT_MISMATCH' => 'مبلغ مقصد با نرخ فعال مطابقت ندارد؛ نرخ را تازه کنید.',
+                                'REMITTANCE_WALLET_CONVERSION_UNAVAILABLE' => 'تبدیل ارز مبدا به تومان برای کسر از کیف پول در دسترس نیست.',
+                                'REMITTANCE_INSUFFICIENT_BALANCE' => 'موجودی کاربر برای اصلاح مبلغ حواله کافی نیست.',
+                                'REMITTANCE_OWNER_CHANGE_NOT_ALLOWED' => 'مالک حواله پس از ثبت قابل تغییر نیست.',
+                                default => 'ابتدا مایگریشن حواله‌های چندارزی را اجرا کنید.',
+                            });
+                        } else {
+                            throw $e;
+                        }
                     }
                 }
             }
@@ -614,6 +737,8 @@ render_page_start('مدیریت حواله‌ها', 'remittances');
                                         <input type="hidden" name="receiver" value="<?= e((string)$row['receiver']) ?>">
                                         <input type="hidden" name="amount_toman" value="<?= e((string)$row['amount_toman']) ?>">
                                         <input type="hidden" name="amount_afghani" value="<?= e((string)$row['amount_afghani']) ?>">
+                                        <input type="hidden" name="source_currency" value="<?= e((string)($row['source_currency'] ?: 'IRT')) ?>">
+                                        <input type="hidden" name="destination_currency" value="<?= e((string)($row['destination_currency'] ?: 'AFN')) ?>">
                                         <select name="status" class="rm-status-select">
                                             <option value="pending" <?= (string)$row['status'] === 'pending' ? 'selected' : '' ?>>انتظار</option>
                                             <option value="approved" <?= (string)$row['status'] === 'approved' ? 'selected' : '' ?>>تایید</option>
@@ -636,6 +761,8 @@ render_page_start('مدیریت حواله‌ها', 'remittances');
                                                     data-receiver="<?= e($row['receiver']) ?>"
                                                     data-amount_toman="<?= e((string)$row['amount_toman']) ?>" 
                                                     data-amount_afghani="<?= e((string)$row['amount_afghani']) ?>"
+                                                    data-source_currency="<?= e((string)($row['source_currency'] ?: 'IRT')) ?>"
+                                                    data-destination_currency="<?= e((string)($row['destination_currency'] ?: 'AFN')) ?>"
                                                     data-status="<?= e($row['status']) ?>" 
                                                     onclick="prepareEditModal(this)">ویرایش</button>
                                         <?php endif; ?>
@@ -699,6 +826,22 @@ render_page_start('مدیریت حواله‌ها', 'remittances');
                     </select>
                 </div>
                 <div class="rm-field">
+                    <label>ارز مبدا</label>
+                    <select class="rm-select remittance-source-currency" name="source_currency" required>
+                        <?php foreach (exchange_rate_supported_currencies() as $code => $currency): ?>
+                            <option value="<?= e($code) ?>" <?= $code === 'IRT' ? 'selected' : '' ?>><?= e($currency['name'] . ' (' . $code . ')') ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="rm-field">
+                    <label>ارز مقصد</label>
+                    <select class="rm-select remittance-destination-currency" name="destination_currency" required>
+                        <?php foreach (exchange_rate_supported_currencies() as $code => $currency): ?>
+                            <option value="<?= e($code) ?>" <?= $code === 'AFN' ? 'selected' : '' ?>><?= e($currency['name'] . ' (' . $code . ')') ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="rm-field">
                     <label>کشور مقصد</label>
                     <select class="rm-select" name="destination_country" required>
                         <option value="">انتخاب کشور...</option>
@@ -728,13 +871,14 @@ render_page_start('مدیریت حواله‌ها', 'remittances');
                 </div>
                 
                 <div class="rm-field">
-                    <label>مبلغ (تومان)</label>
+                    <label>مبلغ ارز مبدا</label>
                     <input class="rm-input amount-toman" type="text" inputmode="numeric" dir="ltr" name="amount_toman" data-money-input required>
                     <div class="persian-amount toman-word"></div>
                 </div>
                 <div class="rm-field">
-                    <label>مبلغ (افغانی)</label>
-                    <input class="rm-input amount-afghani" type="text" inputmode="decimal" dir="ltr" name="amount_afghani" data-money-decimal data-money-unit="افغانی" data-money-words-target="createRemittanceAfghaniWords" required>
+                    <label>مبلغ ارز مقصد (محاسبه شده)</label>
+                    <input class="rm-input amount-afghani" type="text" inputmode="decimal" dir="ltr" name="amount_afghani" readonly required>
+                    <div class="persian-amount remittance-rate-status">برای دریافت نرخ، ارزها را انتخاب کنید.</div>
                     <div class="money-amount-words persian-amount" id="createRemittanceAfghaniWords"></div>
                 </div>
                 
@@ -779,6 +923,22 @@ render_page_start('مدیریت حواله‌ها', 'remittances');
                     </select>
                 </div>
                 <div class="rm-field">
+                    <label>ارز مبدا</label>
+                    <select class="rm-select remittance-source-currency" id="editRemittanceSourceCurrency" name="source_currency" required>
+                        <?php foreach (exchange_rate_supported_currencies() as $code => $currency): ?>
+                            <option value="<?= e($code) ?>"><?= e($currency['name'] . ' (' . $code . ')') ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="rm-field">
+                    <label>ارز مقصد</label>
+                    <select class="rm-select remittance-destination-currency" id="editRemittanceDestinationCurrency" name="destination_currency" required>
+                        <?php foreach (exchange_rate_supported_currencies() as $code => $currency): ?>
+                            <option value="<?= e($code) ?>"><?= e($currency['name'] . ' (' . $code . ')') ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="rm-field">
                     <label>کشور مقصد</label>
                     <select class="rm-select" id="editRemittanceCountry" name="destination_country">
                         <option value="">بدون تغییر / حواله قدیمی</option>
@@ -807,13 +967,14 @@ render_page_start('مدیریت حواله‌ها', 'remittances');
                     <input class="rm-input" id="editRemittanceReceiver" name="receiver" required>
                 </div>
                 <div class="rm-field">
-                    <label>مبلغ (تومان)</label>
+                    <label>مبلغ ارز مبدا</label>
                     <input class="rm-input amount-toman" type="text" inputmode="numeric" dir="ltr" id="editRemittanceToman" name="amount_toman" data-money-input required>
                     <div class="persian-amount toman-word"></div>
                 </div>
                 <div class="rm-field">
-                    <label>مبلغ (افغانی)</label>
-                    <input class="rm-input amount-afghani" type="text" inputmode="decimal" dir="ltr" id="editRemittanceAfghani" name="amount_afghani" data-money-decimal data-money-unit="افغانی" data-money-words-target="editRemittanceAfghaniWords" required>
+                    <label>مبلغ ارز مقصد (محاسبه شده)</label>
+                    <input class="rm-input amount-afghani" type="text" inputmode="decimal" dir="ltr" id="editRemittanceAfghani" name="amount_afghani" readonly required>
+                    <div class="persian-amount remittance-rate-status">برای دریافت نرخ، ارزها را انتخاب کنید.</div>
                     <div class="money-amount-words persian-amount" id="editRemittanceAfghaniWords"></div>
                 </div>
                 
@@ -831,6 +992,37 @@ render_page_start('مدیریت حواله‌ها', 'remittances');
 
 <script>
     const ACTIVE_RATE = <?= $activeRate ?>;
+
+    const currencyPrecision = code => ['IRT', 'UZS'].includes(code) ? 0 : ['BHD', 'IQD', 'KWD', 'OMR'].includes(code) ? 3 : 2;
+    const cleanSourceAmount = value => window.AfariexMoneyInputs ? window.AfariexMoneyInputs.cleanDecimal(value) : String(value).replace(/[,_\s٬]/g, '');
+    const calculateDynamicRemittance = async form => {
+        const source = form.querySelector('[name="source_currency"]');
+        const destination = form.querySelector('[name="destination_currency"]');
+        const amount = form.querySelector('.amount-toman');
+        const output = form.querySelector('.amount-afghani');
+        const status = form.querySelector('.remittance-rate-status');
+        const sourceCode = source.value;
+        const destinationCode = destination.value;
+        output.value = '';
+        if (sourceCode === destinationCode) {
+            status.textContent = 'ارز مبدا و مقصد باید متفاوت باشند.';
+            return;
+        }
+        status.textContent = 'در حال دریافت نرخ فعال...';
+        try {
+            const response = await fetch(`remittances.php?ajax=pair-rate&source=${encodeURIComponent(sourceCode)}&destination=${encodeURIComponent(destinationCode)}`, {headers: {'Accept': 'application/json'}});
+            const result = await response.json();
+            if (!response.ok || !result.success || !result.data) throw new Error(result.message || 'نرخ فعال یافت نشد.');
+            const numericAmount = Number(cleanSourceAmount(amount.value));
+            const commission = Number(result.data.commission_percentage || 0);
+            if (Number.isFinite(numericAmount) && numericAmount > 0) output.value = (numericAmount * Number(result.data.exchange_rate) * (1 - commission / 100)).toFixed(currencyPrecision(destinationCode));
+            status.textContent = `نرخ فعال: ۱ ${sourceCode} = ${result.data.exchange_rate} ${destinationCode} | کارمزد تبدیل ${commission}٪`;
+        } catch (error) {
+            status.textContent = error.message || 'نرخ فعال برای این جفت ارز در دسترس نیست.';
+        }
+    };
+    document.querySelectorAll('.remittance-source-currency, .remittance-destination-currency').forEach(select => select.addEventListener('change', () => calculateDynamicRemittance(select.closest('form'))));
+    document.querySelectorAll('.amount-toman').forEach(input => input.addEventListener('input', () => calculateDynamicRemittance(input.closest('form'))));
 
     // توابع تبدیل ارز
     document.querySelectorAll('.amount-toman').forEach(input => {
@@ -892,6 +1084,8 @@ render_page_start('مدیریت حواله‌ها', 'remittances');
         document.getElementById('editRemittanceMobile').value = btn.dataset.mobile || '';
         document.getElementById('editRemittanceBalance').textContent = 'موجودی فعلی کاربر: ' + (btn.dataset.user_balance || '—');
         document.getElementById('editRemittanceAgency').value = btn.dataset.agency || '';
+        document.getElementById('editRemittanceSourceCurrency').value = btn.dataset.source_currency || 'IRT';
+        document.getElementById('editRemittanceDestinationCurrency').value = btn.dataset.destination_currency || 'AFN';
         document.getElementById('editRemittanceCountry').value = btn.dataset.destination_country || '';
         document.getElementById('editRemittanceSender').value = btn.dataset.sender || '';
         document.getElementById('editRemittanceReceiver').value = btn.dataset.receiver || '';
@@ -902,6 +1096,7 @@ render_page_start('مدیریت حواله‌ها', 'remittances');
         // تریگر کردن ایونت برای نمایش عدد به حروف هنگام لود ویرایش
         const event = new Event('input');
         document.getElementById('editRemittanceToman').dispatchEvent(event);
+        calculateDynamicRemittance(document.getElementById('editRemittanceToman').closest('form'));
         if (window.AfariexMoneyInputs) window.AfariexMoneyInputs.refresh(document.getElementById('editRemittanceAfghani'));
 
         openModal('editRemittanceModal');
