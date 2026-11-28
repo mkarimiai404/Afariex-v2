@@ -201,6 +201,22 @@ try {
         }
     }
 
+    if (table_exists('inax_internet_orders')) {
+        $stmt = $pdo->prepare('SELECT id,order_id,product_title,operator,mobile,amount,fee_amount,total_cost,status,provider_ref_code,created_at FROM inax_internet_orders WHERE user_id=? ORDER BY id DESC LIMIT 200');
+        $stmt->execute([$userId]);
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $item) {
+            $orders[] = [
+                'id'=>'internet-'.(int)$item['id'], 'type'=>'internet_package',
+                'title'=>'خرید بسته اینترنت', 'amount'=>(int)$item['total_cost'], 'currency'=>'تومان',
+                'status'=>$item['status']==='completed'?'success':($item['status']==='refunded'?'refunded':'pending'),
+                'created_at'=>$item['created_at'], 'description'=>$item['product_title'],
+                'metadata'=>['order_id'=>$item['order_id'],'operator'=>$item['operator'],
+                    'mobile'=>$item['mobile'],'package_amount'=>(int)$item['amount'],
+                    'fee_amount'=>(int)$item['fee_amount'],'total_amount'=>(int)$item['total_cost'],
+                    'tracking_code'=>$item['provider_ref_code']],
+            ];
+        }
+    }
     usort($orders, static fn (array $left, array $right): int => strcmp((string)($right['created_at'] ?? ''), (string)($left['created_at'] ?? '')));
     json_response([
         'success' => true,

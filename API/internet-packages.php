@@ -1,22 +1,9 @@
 <?php
 declare(strict_types=1);
-
-require_once __DIR__ . '/lib/topup_common.php';
-
-topup_headers();
-if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
-    http_response_code(204);
-    exit;
-}
-if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
-    topup_json(['success' => false, 'code' => 'METHOD_NOT_ALLOWED', 'message' => 'روش درخواست مجاز نیست.'], 405);
-}
-
-topup_authenticate_user(topup_request_data());
-topup_json([
-    'success' => false,
-    'status' => 'failed',
-    'code' => 'INTERNET_PROVIDER_UNAVAILABLE',
-    'message' => 'فهرست بسته‌های اینترنت از سرویس‌دهنده پیکربندی نشده است.',
-    'data' => ['packages' => []],
-], 503);
+require_once __DIR__.'/lib/internet_common.php';
+[$data,$user]=internet_require_request();
+$pdo=db();
+$s=$pdo->query("SELECT product_id AS id,title,operator,internet_type,sim_type,amount FROM inax_internet_catalog WHERE is_active=1 ORDER BY operator,internet_type,amount LIMIT 500");
+$packages=$s->fetchAll(PDO::FETCH_ASSOC);
+foreach($packages as &$p) $p['amount']=(int)$p['amount']; unset($p);
+topup_json(['success'=>true,'data'=>['packages'=>$packages]]);

@@ -65,13 +65,48 @@ final class InaxClient
                 'payment_status' => 'paid', 'trans_id' => $transId ?: 'MOCK-' . $orderId,
                 'ref_code' => 'MOCK-' . $orderId, 'mock' => true];
         }
+        // Inax documents order_id OR trans_id as sufficient for trans_status.
+        // An interrupted purchase may have a local order_id without a provider trans_id.
+        $orderId = trim($orderId);
         $transId = is_string($transId) ? trim($transId) : '';
-        if ($transId === '' || strlen($transId) > 50 || preg_match('/[\x00-\x1F\x7F]/', $transId)) {
-            throw new InvalidArgumentException('INAX_TRANS_ID_REQUIRED');
+        $validId = static fn(string $id): bool => $id !== ''
+            && strlen($id) <= 50
+            && preg_match('/[\x00-\x1F\x7F]/', $id) !== 1;
+        if (!$validId($orderId) && !$validId($transId)) {
+            throw new InvalidArgumentException('INAX_TRANSACTION_REFERENCE_REQUIRED');
         }
-        $parameters = ['method' => 'trans_status', 'order_id' => $orderId, 'trans_id' => $transId];
+        if ($transId !== '' && !$validId($transId)) {
+            throw new InvalidArgumentException('INAX_TRANS_ID_INVALID');
+        }
+        $parameters = ['method' => 'trans_status'];
+        if ($validId($orderId)) $parameters['order_id'] = $orderId;
+        if ($transId !== '') $parameters['trans_id'] = $transId;
         return $this->request($parameters, self::TOPUP_OPERATION_TIMEOUT_SECONDS);
     }
+    /** Creates an INAX-hosted payment URL; does not use the user's Afariex wallet. */
+    public function addFund(int $amountToman): array
+    {
+        if($amountToman<1000 || $amountToman>1000000000) throw new InvalidArgumentException('INVALID_ADDFUND_AMOUNT');
+        if($this->mockGateway) throw new InaxConfigurationException('ADDFUND_UNAVAILABLE_IN_MOCK');
+        return $this->request(['method'=>'addfund','amount'=>$amountToman]);
+    }
+
+    /** Read-only INAX product list; never purchases anything. */
+    public function products(): array
+    {
+        if ($this->mockGateway) return ['code'=>1,'products'=>[],'mock'=>true];
+        return $this->request(['method'=>'products']);
+    }
+
+    /** Charges vendor balance. Only call from a committed, unique paid reservation. */
+    public function internet(string $productId,string $operator,string $mobile,string $internetType,string $simType,string $orderId): array
+    {
+        if ($this->mockGateway) return ['code'=>1,'msg'=>'INTERNET_TEST_MOCK','ref_code'=>'MOCK-'.$orderId,'mock'=>true];
+        return $this->request(['method'=>'internet','product_id'=>$productId,'operator'=>$operator,
+            'mobile'=>$mobile,'internet_type'=>$internetType,'sim_type'=>$simType,
+            'order_id'=>$orderId,'pay_type'=>'credit'],self::TOPUP_OPERATION_TIMEOUT_SECONDS);
+    }
+
     public function credit(): array { return $this->request(['method' => 'credit']); }
 
     private function request(array $parameters, ?int $timeoutOverride = null): array
@@ -137,6 +172,15 @@ final class InaxClient
                 $sanitized[$key] = '[REDACTED]';
             } elseif (in_array($normalizedKey, ['mobile', 'phone', 'msisdn'], true)) {
                 $sanitized[$key] = '[REDACTED]';
+            } elseif ($normalizedKey === 'url' && is_string($value)) {
+                // Keep a trusted payment URL usable by admin, but never log it.
+                $parts = parse_url($value);
+                $host = strtolower((string)($parts['host'] ?? ''));
+                $sanitized[$key] = is_array($parts)
+                    && ($parts['scheme'] ?? '') === 'https'
+                    && in_array($host, ['inax.ir', 'www.inax.ir'], true)
+                    && !isset($parts['user']) && !isset($parts['pass'])
+                    ? $value : '[UNTRUSTED_URL]';
             } elseif (is_array($value)) {
                 $sanitized[$key] = $this->sanitizeProviderData($value);
             } elseif (is_string($value)) {

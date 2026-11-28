@@ -3,20 +3,18 @@ export const toPersianDigits = (value: string | number) => String(value).replace
 export const formatPersianAmount = (input: number | string) => {
   const numeric = Number(input) || 0;
   return toPersianDigits(new Intl.NumberFormat('en-US', {
-    minimumFractionDigits: Number.isInteger(numeric) ? 0 : 2,
-    maximumFractionDigits: 2,
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 0,
   }).format(numeric));
 };
 
 export const formatPersianCurrencyAmount = (input: number | string, currency: string, registeredPrecision?: number) => {
   const match = String(input).trim().match(/^(-?)(\d+)(?:\.(\d+))?$/);
   if (!match) return '۰';
-  const precision = Number.isInteger(registeredPrecision)
-    ? Math.max(0, Math.min(4, Number(registeredPrecision)))
-    : currency.toUpperCase() === 'IRT' ? 0 : 2;
+  const precision = 0;
   const integer = match[2].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   const meaningfulFraction = (match[3] || '').replace(/0+$/, '');
-  const fractionalDigits = Math.max(precision, meaningfulFraction.length);
+  const fractionalDigits = 0;
   const fraction = fractionalDigits > 0
     ? (match[3] || '').padEnd(fractionalDigits, '0').slice(0, fractionalDigits)
     : '';

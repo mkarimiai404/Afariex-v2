@@ -22,9 +22,9 @@ type ChargeType = 'normal' | 'amazing';
 type FeePreview = { fee_amount: number; total_amount: number };
 
 const fallbackOperators: Record<string, Operator> = {
-  MCI: { title: topupOperatorLabel('MCI'), min_amount: 20000, max_amount: 500000 },
-  MTN: { title: topupOperatorLabel('MTN'), min_amount: 22000, max_amount: 1000000 },
-  RTL: { title: topupOperatorLabel('RTL'), min_amount: 22000, max_amount: 500000 },
+  MCI: { title: topupOperatorLabel('MCI'), min_amount: 50000, max_amount: 500000 },
+  MTN: { title: topupOperatorLabel('MTN'), min_amount: 55000, max_amount: 1000000 },
+  RTL: { title: topupOperatorLabel('RTL'), min_amount: 20000, max_amount: 1000000 },
 };
 
 const normalizeDigits = (value: string) => value
@@ -170,7 +170,7 @@ export default function TopupScreen() {
   }, [userId, token]);
 
   const selectedOperator = operators[operator] || fallbackOperators[operator];
-  const quickAmounts = useMemo(() => [20000, 50000, 100000, 200000], []);
+  const quickAmounts = useMemo(() => chargeType === 'amazing' ? [20000, 50000] : [50000, 100000, 200000, 500000].filter((value) => value >= selectedOperator.min_amount && value <= selectedOperator.max_amount), [chargeType, selectedOperator.min_amount, selectedOperator.max_amount]);
   const cleanMobile = normalizeIranMobile(mobile);
   const cleanAmount = normalizeMoneyInput(amount);
   const numericAmount = Number(cleanAmount) || 0;
@@ -180,7 +180,7 @@ export default function TopupScreen() {
   const updateMobile = (value: string) => {
     setMobile(value);
     const detected = detectOperator(value);
-    if (detected && !operatorManuallySelected.current) setOperator(detected);
+    if (detected && !operatorManuallySelected.current) { setOperator(detected); if (detected !== 'RTL') setChargeType('normal'); }
   };
 
   const refreshPreflightBalance = () => {
@@ -232,6 +232,8 @@ export default function TopupScreen() {
     if (!/^09\d{9}$/.test(cleanMobile)) return 'شماره موبایل باید به شکل ۰۹xxxxxxxxx باشد.';
     const numericAmount = Number(cleanAmount);
     if (!Number.isInteger(numericAmount) || numericAmount < selectedOperator.min_amount || numericAmount > selectedOperator.max_amount) return `مبلغ باید بین ${selectedOperator.min_amount.toLocaleString('fa-IR')} تا ${selectedOperator.max_amount.toLocaleString('fa-IR')} تومان باشد.`;
+    if (operator === 'MCI' && numericAmount % 10 !== 0) return 'مبلغ شارژ همراه اول باید مضربی از ۱۰ تومان باشد.';
+    if (chargeType === 'amazing' && (operator !== 'RTL' || ![20000, 50000].includes(numericAmount))) return 'شارژ شورانگیز رایتل فقط با مبالغ ۲۰٬۰۰۰ و ۵۰٬۰۰۰ تومان مجاز است.';
     return '';
   };
 
@@ -458,11 +460,11 @@ export default function TopupScreen() {
           <TextInput value={mobile} onChangeText={updateMobile} placeholder="۰۹xxxxxxxxx" placeholderTextColor={appColors.textMuted} keyboardType="phone-pad" style={styles.input} maxLength={16} textAlign="right" />
           <Text style={styles.label}>اپراتور</Text>
           {!!detectOperator(cleanMobile) && <Text style={styles.detectedOperator}>اپراتور پیشنهادی بر اساس پیش‌شماره: {topupOperatorLabel(detectOperator(cleanMobile) ?? '')} (در صورت نیاز دستی تغییر دهید)</Text>}
-          <View style={styles.operatorRow}>{Object.entries(operators).map(([key, item]) => <TouchableOpacity key={key} onPress={() => { operatorManuallySelected.current = true; setOperator(key); }} style={[styles.operator, operator === key && styles.operatorActive]}><Text style={[styles.operatorText, operator === key && styles.operatorTextActive]}>{item.title}</Text></TouchableOpacity>)}</View>
+          <View style={styles.operatorRow}>{Object.entries(operators).map(([key, item]) => <TouchableOpacity key={key} onPress={() => { operatorManuallySelected.current = true; setOperator(key); if (key !== 'RTL') setChargeType('normal'); }} style={[styles.operator, operator === key && styles.operatorActive]}><Text style={[styles.operatorText, operator === key && styles.operatorTextActive]}>{item.title}</Text></TouchableOpacity>)}</View>
           <Text style={styles.label}>نوع شارژ</Text>
           <View style={styles.operatorRow}>
             <TouchableOpacity onPress={() => setChargeType('normal')} style={[styles.operator, chargeType === 'normal' && styles.operatorActive]}><Text style={[styles.operatorText, chargeType === 'normal' && styles.operatorTextActive]}>عادی</Text></TouchableOpacity>
-            <TouchableOpacity onPress={() => setChargeType('amazing')} style={[styles.operator, chargeType === 'amazing' && styles.operatorActive]}><Text style={[styles.operatorText, chargeType === 'amazing' && styles.operatorTextActive]}>شگفت‌انگیز / مستقیم</Text></TouchableOpacity>
+            <TouchableOpacity disabled={operator !== 'RTL'} onPress={() => setChargeType('amazing')} style={[styles.operator, chargeType === 'amazing' && styles.operatorActive, operator !== 'RTL' && styles.disabledButton]}><Text style={[styles.operatorText, chargeType === 'amazing' && styles.operatorTextActive]}>شگفت‌انگیز / مستقیم</Text></TouchableOpacity>
           </View>
           <Text style={styles.label}>مبلغ به تومان</Text>
           <View style={styles.quickRow}>{quickAmounts.map((value) => <TouchableOpacity key={value} onPress={() => setAmount(String(value))} style={[styles.quick, Number(cleanAmount) === value && styles.quickActive]}><Text style={[styles.quickText, Number(cleanAmount) === value && styles.quickTextActive]}>{value.toLocaleString('fa-IR')}</Text></TouchableOpacity>)}</View>

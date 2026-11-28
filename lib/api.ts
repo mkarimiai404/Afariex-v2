@@ -11,7 +11,7 @@ const LOCAL_BASE_URL = 'https://afariex.ir/API/';
 const PROD_BASE_URL = 'https://afariex.ir/API/';
 const TIMEOUT_MS = 18000;
 // Creation outlasts Inax's 30-second provider timeout plus backend finalization; status checks get a smaller margin.
-const ENDPOINT_TIMEOUTS: Record<string, number> = { 'topup.php': 60000, 'topup-create.php': 60000, 'topup-status.php': 45000 };
+const ENDPOINT_TIMEOUTS: Record<string, number> = { 'topup.php': 60000, 'topup-create.php': 60000, 'topup-status.php': 45000, 'internet-package-create.php': 60000, 'internet-package-status.php': 45000 };
 // Financial create calls stay single-attempt; status checks reconcile uncertain outcomes without duplicate purchases.
 const MAX_ATTEMPTS = 1;
 let authExpiryHandler: (() => void | Promise<void>) | null = null;
@@ -137,7 +137,7 @@ const toNetworkError = (endpoint: string, finalUrl: string, error: unknown) => {
     const timeoutError = new ApiTimeoutError(
       endpoint,
       ENDPOINT_TIMEOUTS[endpoint] || TIMEOUT_MS,
-      ['topup.php', 'topup-create.php'].includes(endpoint)
+      ['topup.php', 'topup-create.php', 'internet-package-create.php'].includes(endpoint)
     );
     (timeoutError as Error & { cause?: unknown }).cause = details.cause ?? error;
     return timeoutError;

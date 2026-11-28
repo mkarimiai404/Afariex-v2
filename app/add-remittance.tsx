@@ -384,7 +384,8 @@ export default function AddRemittanceScreen() {
       } catch (error) {
         const rateConflict = error instanceof ApiResponseError
           && error.status === 409
-          && error.responseCode === 'EXCHANGE_RATE_CHANGED';
+          && (error.responseCode === 'EXCHANGE_RATE_CHANGED'
+            || /نرخ|مبلغ دریافتی/.test(error.safeMessage || error.message));
         if (!rateConflict) throw error;
 
         let refreshedRates: ExchangeRate[];
@@ -460,7 +461,7 @@ export default function AddRemittanceScreen() {
           showError('نشست منقضی شده', 'لطفاً دوباره وارد حساب خود شوید.');
           return;
         }
-        showError('ثبت حواله انجام نشد', 'اطلاعات حواله یا نرخ ارز معتبر نیست. فرم را بررسی و دوباره تلاش کنید.');
+        showError('ثبت حواله انجام نشد', String(result.message || result.data?.message || 'اطلاعات حواله معتبر نیست.'));
         return;
       }
 
@@ -545,7 +546,7 @@ export default function AddRemittanceScreen() {
         } else if (err.responseCode === 'AUTHENTICATION_REQUIRED' || err.responseCode === 'AUTHENTICATION_FAILED') {
           showError('نشست منقضی شده', 'لطفاً دوباره وارد حساب خود شوید.');
         } else {
-          showError('ثبت حواله انجام نشد', 'اطلاعات حواله یا نرخ ارز معتبر نیست. فرم را بررسی و دوباره تلاش کنید.');
+          showError('ثبت حواله انجام نشد', err.safeMessage || 'اطلاعات حواله معتبر نیست. فرم را بررسی کنید.');
         }
       } else {
         showError('خطای ارتباط', 'ارتباط با سرور برقرار نشد یا پاسخ معتبر نبود. اطلاعات فرم حفظ شده است.');

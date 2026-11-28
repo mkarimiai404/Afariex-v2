@@ -61,7 +61,7 @@ render_page_start('مدیریت کارمزد خدمات', 'service_fees');
   .fee-badge{display:inline-flex;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:800}
   .fee-on{background:#ecfdf5;color:#047857;border:1px solid #a7f3d0}.fee-off{background:#f1f5f9;color:#475569;border:1px solid #cbd5e1}
   .fee-form{display:grid;grid-template-columns:repeat(12,1fr);gap:10px;align-items:end;min-width:760px}
-  .fee-form .field-label{font-size:11px}
+  .fee-form .field-label{font-size:11px} .fee-percent-preview{direction:rtl;text-align:right}
 </style>
 <?php if (!$schemaReady): ?>
   <div class="alert error">جدول‌های کارمزد خدمات پیدا نشد. فایل migration شماره 013 را اجرا کنید.</div>
@@ -91,7 +91,7 @@ render_page_start('مدیریت کارمزد خدمات', 'service_fees');
               <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
               <input type="hidden" name="id" value="<?= e((string)$row['id']) ?>">
               <div class="col-2"><label class="field-label">نوع</label><select class="select" name="fee_type"><option value="fixed" <?= $row['fee_type'] === 'fixed' ? 'selected' : '' ?>>ثابت</option><option value="percentage" <?= $row['fee_type'] === 'percentage' ? 'selected' : '' ?>>درصدی</option></select></div>
-              <div class="col-2"><label class="field-label">مقدار</label><input class="input" name="fee_value" value="<?= e((string)$row['fee_value']) ?>" dir="ltr" <?= (string)$row['fee_type'] === 'fixed' ? 'data-money-input data-money-words-target="feeValueWords' . (int)$row['id'] . '"' : '' ?> required><div class="money-amount-words" id="feeValueWords<?= (int)$row['id'] ?>"></div></div>
+              <div class="col-2"><label class="field-label">مقدار <span class="fee-unit"><?= (string)$row['fee_type'] === 'percentage' ? ' (درصد)' : ' (تومان)' ?></span></label><input class="input" name="fee_value" value="<?= e((string)$row['fee_value']) ?>" dir="ltr" <?= (string)$row['fee_type'] === 'fixed' ? 'data-money-input data-money-words-target="feeValueWords' . (int)$row['id'] . '"' : '' ?> required><div class="money-amount-words" id="feeValueWords<?= (int)$row['id'] ?>"></div><div class="fee-percent-preview" style="font-size:11px;color:#047857;margin-top:3px"></div></div>
               <div class="col-2"><label class="field-label">حداقل (تومان)</label><input class="input" name="min_fee" value="<?= $row['min_fee'] === null ? '' : e((string)$row['min_fee']) ?>" dir="ltr" data-money-input data-money-words-target="minFeeWords<?= (int)$row['id'] ?>"><div class="money-amount-words" id="minFeeWords<?= (int)$row['id'] ?>"></div></div>
               <div class="col-2"><label class="field-label">حداکثر (تومان)</label><input class="input" name="max_fee" value="<?= $row['max_fee'] === null ? '' : e((string)$row['max_fee']) ?>" dir="ltr" data-money-input data-money-words-target="maxFeeWords<?= (int)$row['id'] ?>"><div class="money-amount-words" id="maxFeeWords<?= (int)$row['id'] ?>"></div></div>
               <div class="col-2"><label class="field-label">فعال</label><label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="is_active" <?= (int)$row['is_active'] === 1 ? 'checked' : '' ?>> فعال</label></div>
@@ -113,6 +113,15 @@ document.querySelectorAll('.fee-form').forEach(function (form) {
   const type = form.querySelector('[name="fee_type"]');
   const input = form.querySelector('[name="fee_value"]');
   const words = form.querySelector('.money-amount-words[id^="feeValueWords"]');
+  const unit = form.querySelector('.fee-unit');
+  const preview = form.querySelector('.fee-percent-preview');
+  function showUnit(){
+    const percentage = type.value === 'percentage';
+    if(unit) unit.textContent = percentage ? ' (درصد)' : ' (تومان)';
+    if(preview) preview.textContent = percentage ? (input.value.trim() ? input.value.trim() + ' درصد' : 'مقدار درصد را وارد کنید') : '';
+  }
+  input.addEventListener('input', showUnit);
+  showUnit();
   if (!type || !input) return;
   type.addEventListener('change', function () {
     if (type.value === 'fixed') {
@@ -124,6 +133,7 @@ document.querySelectorAll('.fee-form').forEach(function (form) {
       input.removeAttribute('data-money-input');
       if (words) words.textContent = '';
     }
+    showUnit();
   });
 });
 </script>

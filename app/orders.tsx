@@ -2,7 +2,7 @@ import { appColors } from '@/lib/theme';
 import { Ionicons } from '@expo/vector-icons';
 import { Stack, useRouter } from 'expo-router';
 import React, { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { fetchJson, isAuthenticationResponseError } from '@/lib/api';
 import { useAuth } from '@/lib/auth-context';
@@ -27,10 +27,11 @@ const statusLabels: Record<string, { label: string; color: string; background: s
   processing: { label: 'در حال بررسی', color: '#a46a20', background: '#fff4df' },
   failed: { label: 'ناموفق', color: '#b34343', background: '#fff0ef' },
   rejected: { label: 'ناموفق', color: '#b34343', background: '#fff0ef' },
+  refunded: { label: 'مستردشده', color: '#475569', background: '#e2e8f0' },
 };
 
 const iconByType: Record<string, keyof typeof Ionicons.glyphMap> = {
-  remittance: 'send-outline', deposit: 'wallet-outline', withdrawal: 'arrow-down-circle-outline', exchange: 'swap-horizontal-outline',
+  remittance: 'send-outline', deposit: 'wallet-outline', withdrawal: 'arrow-down-circle-outline', exchange: 'swap-horizontal-outline', internet_package: 'wifi-outline',
 };
 
 const formatAmount = (value: number) => `${Math.trunc(Number(value || 0)).toLocaleString('fa-IR')} تومان`;
@@ -112,7 +113,7 @@ function ActivityRow({ order, last }: { order: ActivityOrder; last: boolean }) {
   return <View style={[styles.activityRow, last && styles.lastActivityRow]}>
     <View style={styles.activityIcon}><Ionicons name={icon} size={21} color="#0e9270" /></View>
     <View style={styles.activityMain}><View style={styles.activityHeading}><Text style={styles.activityTitle}>{order.title}</Text><View style={[styles.statusBadge, { backgroundColor: status.background }]}><Text style={[styles.statusText, { color: status.color }]}>{status.label}</Text></View></View><Text style={styles.activityDescription}>{order.description}</Text><Text style={styles.activityDate}>{formatDate(order.created_at)}</Text></View>
-    <View style={styles.amountBox}><Text style={styles.amount}>{formatAmount(order.amount)}</Text><Text style={styles.currency}>{order.currency || 'تومان'}</Text>{order.type === 'remittance' && <TouchableOpacity style={styles.receiptButton} onPress={() => router.push({ pathname: '/remittance-receipt', params: { order: order.id } } as any)} accessibilityRole="button"><Text style={styles.receiptButtonText}>مشاهده رسید</Text></TouchableOpacity>}</View>
+    <View style={styles.amountBox}><Text style={styles.amount}>{formatAmount(order.amount)}</Text><Text style={styles.currency}>{order.currency || 'تومان'}</Text>{order.type === 'internet_package' && <TouchableOpacity style={styles.receiptButton} onPress={() => Alert.alert('رسید خرید اینترنت', [order.description, `شناسه سفارش: ${String(order.metadata?.order_id || '—')}`, `شماره مقصد: ${String(order.metadata?.mobile || '—')}`, `کارمزد: ${formatAmount(Number(order.metadata?.fee_amount || 0))}`, `مبلغ کل: ${formatAmount(Number(order.metadata?.total_amount || order.amount))}`, `کد پیگیری: ${String(order.metadata?.tracking_code || 'در انتظار')}`].join('\n'))} accessibilityRole="button"><Text style={styles.receiptButtonText}>مشاهده رسید</Text></TouchableOpacity>}{order.type === 'remittance' && <TouchableOpacity style={styles.receiptButton} onPress={() => router.push({ pathname: '/remittance-receipt', params: { order: order.id } } as any)} accessibilityRole="button"><Text style={styles.receiptButtonText}>مشاهده رسید</Text></TouchableOpacity>}</View>
   </View>;
 }
 

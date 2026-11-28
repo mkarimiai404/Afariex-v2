@@ -223,6 +223,13 @@ export default function DashboardScreen() {
                 <Text style={styles.serviceText}>خرید شارژ</Text>
               </TouchableOpacity>
 
+              <TouchableOpacity style={styles.serviceItem} onPress={() => openFinancialFeature('/internet')}>
+                <View style={[styles.iconWrapper, { backgroundColor: appColors.surfaceRaised }]}>
+                  <Ionicons name="wifi" size={24} color={appColors.primary} />
+                </View>
+                <Text style={styles.serviceText}>خرید اینترنت</Text>
+              </TouchableOpacity>
+
               <TouchableOpacity style={styles.serviceItem} onPress={() => openFinancialFeature('/add-balance')}>
                 <View style={[styles.iconWrapper, { backgroundColor: appColors.surfaceRaised }]}>
                   <Ionicons name="wallet" size={24} color={appColors.primary} />

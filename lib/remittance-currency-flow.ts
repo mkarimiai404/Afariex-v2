@@ -2,7 +2,7 @@ export const WHATSAPP_SUPPORT_URL = 'https://wa.me/989194998020';
 
 /**
  * `exchange_rate` is normalized by the API as destination currency units per
- * one source unit. Amounts are rounded once to the destination's two decimals.
+ * one source unit. Recipient amounts are always truncated to whole units.
  */
 export const calculateDestinationAmount = (
   amountSource: string | number,
@@ -34,13 +34,10 @@ export const calculateDestinationAmount = (
     const hundredPercent = 100n * (10n ** BigInt(commissionScale));
     if (amountMinor <= 0n || rateDigits <= 0n || commissionDigits > hundredPercent) return '';
 
-    const numerator = amountMinor * rateDigits * 100n
+    const numerator = amountMinor * rateDigits
       * (hundredPercent - commissionDigits);
     const denominator = (10n ** BigInt(rateScale + amountScale)) * hundredPercent;
-    const wholeCents = numerator / denominator;
-    const remainder = numerator % denominator;
-    const roundedCents = wholeCents + (remainder * 2n >= denominator ? 1n : 0n);
-    return `${roundedCents / 100n}.${String(roundedCents % 100n).padStart(2, '0')}`;
+    return String(numerator / denominator);
   } catch {
     return '';
   }
