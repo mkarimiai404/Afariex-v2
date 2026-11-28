@@ -4,7 +4,7 @@ import React from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { appColors } from '@/lib/theme';
 
-type NavKey = 'remittance' | 'wallet' | 'topup' | 'support';
+type NavKey = 'remittance' | 'wallet' | 'internet' | 'topup' | 'support';
 
 const items: Array<{
   key: NavKey;
@@ -14,6 +14,7 @@ const items: Array<{
 }> = [
   { key: 'remittance', label: 'حواله', icon: 'swap-horizontal', route: '/add-remittance' },
   { key: 'wallet', label: 'کیف پول', icon: 'wallet', route: '/add-balance' },
+  { key: 'internet', label: 'خرید اینترنت', icon: 'wifi', route: '/internet' },
   { key: 'topup', label: 'خرید شارژ', icon: 'phone-portrait', route: '/topup' },
   { key: 'support', label: 'پشتیبانی', icon: 'headset', route: '/profile' },
 ];
@@ -26,6 +27,8 @@ export function AppBottomNav() {
     ? 'remittance'
     : pathname?.includes('add-balance')
       ? 'wallet'
+      : pathname?.includes('internet')
+        ? 'internet'
       : pathname?.includes('topup')
         ? 'topup'
         : pathname?.includes('profile')
@@ -78,7 +81,7 @@ const styles = StyleSheet.create({
     backgroundColor: appColors.surface,
   },
   label: {
-    fontSize: 10,
+    fontSize: 9,
     fontFamily: 'Vazirmatn',
     color: appColors.textMuted,
   },
